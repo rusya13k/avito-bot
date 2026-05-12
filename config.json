@@ -1,0 +1,13 @@
+{
+  "adspower_api_url": "http://local.adspower.net:50325",
+  "threads": 0,
+  "target_url": "https://www.avito.ru",
+  "keywords_file": "keywords.txt",
+  "telegram_bot_token": "",
+  "telegram_admin_id": 0,
+  "openai_api_key": "",
+  "openai_model": "gpt-3.5-turbo",
+  "openai_api_base": "https://api.openai.com/v1",
+  "adspower_api_key": "",
+  "captcha_cooldown_minutes": 30
+}

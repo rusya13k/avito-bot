@@ -3,10 +3,8 @@
 .env.local
 .env.*.local
 
-# Сам config.json содержит секреты в текущем виде проекта (TG token,
-# Avito password, AdsPower API key, OpenAI/Replicate key). Когда секреты
-# будут полностью переведены на .env — можно удалить эту строку.
-config.json
+# config.json теперь без секретов (плейсхолдеры). Реальные значения
+# подкладываются через .env (apply_env_overrides). Поэтому коммитим.
 
 # Куки и логин-данные аккаунтов
 cookies.json
