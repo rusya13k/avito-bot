@@ -1,0 +1,64 @@
+# H3: секреты и пользовательские данные не уходят в git
+.env
+.env.local
+.env.*.local
+
+# Сам config.json содержит секреты в текущем виде проекта (TG token,
+# Avito password, AdsPower API key, OpenAI/Replicate key). Когда секреты
+# будут полностью переведены на .env — можно удалить эту строку.
+config.json
+
+# Куки и логин-данные аккаунтов
+cookies.json
+accounts/
+# G2: per-account конфиг (содержит phone/password/adspower_id —
+# по факту секрет, не должен уезжать в git)
+accounts.json
+
+# SQLite база
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Логи
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# venv
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AI tooling (локальные кэши, аналог .vscode/.idea)
+.claude/
+.omc/
+
+# Устаревший анализ кода (описывает архитектуру до Sprint 1-5/G1/G2)
+codebase_analysis.md
+
+# Страховочный патч от ruff format — временный, можно удалить вручную
+.ruff-format.undo.patch
+
+# Случайный мусор на диске (Windows reserved name + пустой шаблонный файл)
+nul
+Новый текстовый документ.txt

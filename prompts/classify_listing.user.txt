@@ -1,0 +1,6 @@
+Listing data:
+- Title: {title}
+- Seller name: {seller_name}
+- Phone: {phone}
+- Profile id: {profile_id}
+- Description: {description}

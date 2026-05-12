@@ -1,0 +1,61 @@
+# F2: ruff — лёгкий линтер + форматтер. Заменяет flake8/isort/black,
+# работает без отдельной virtualenv-настройки.
+#
+# Установка:    pip install ruff
+# Проверка:     ruff check .
+# Автофикс:     ruff check --fix .
+# Форматирование: ruff format .
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    ".claude",
+    ".omc",
+]
+
+[tool.ruff.lint]
+# Изначальный набор правил — небольшой, чтобы baseline-фикс не утопил в ошибках.
+# По мере улучшения кода можно добавлять: B (bugbear), SIM (simplify),
+# RET (return), C90 (complexity).
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort
+    "UP",  # pyupgrade
+    "ERA", # commented-out code
+]
+ignore = [
+    # bare except в существующем коде селениум-flow — сознательная защита
+    # от непредсказуемых WebDriverException; чинить отдельной задачей.
+    "E722",
+    # длинные строки в xpath/SQL — оставим до отдельного refactor pass.
+    "E501",
+    # `if x: y` в одну строку — существующий стиль ранних guard-clause
+    # в bot.py / tg_bot.py; чистка — отдельной задачей косметики.
+    "E701",
+    # commented-out-code: бот активно эволюционирует, временные блоки
+    # часто комментируются для quick A/B; полная чистка ERA001 — позже.
+    "ERA001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Тесты могут импортировать unused fixtures и иметь длинные хвосты.
+"tests/**/*.py" = ["E501", "F401"]
+# Промпт-загрузчик отбрасывает unused vars в template — это ок.
+"prompts/**/*.py" = ["F401"]
+# Snippet-планировщик: содержит закомментированные подсказки по интеграции
+# в TelegramController. ERA001 здесь — фича, не баг.
+"tg_bot_classification_extension.py" = ["ERA001", "E501", "E402"]
+# database_migration.py — одноразовый скрипт миграции; компактные
+# конструкции с if/else в одну строку допустимы.
+"database_migration.py" = ["E701"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

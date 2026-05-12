@@ -1,0 +1,19 @@
+[
+  {
+    "name": "мой тест",
+    "adspower_id": "k1c2utgb",
+    "phone": "+79991234567",
+    "password": "REPLACE_WITH_PASSWORD",
+    "cookies_path": "accounts/мой_тест/cookies.json",
+    "enabled": true,
+    "captcha_cooldown_minutes": 30
+  },
+  {
+    "name": "second account (disabled пример)",
+    "adspower_id": "another_id",
+    "phone": "+79992223344",
+    "password": "REPLACE_WITH_PASSWORD",
+    "cookies_path": "accounts/second_account/cookies.json",
+    "enabled": false
+  }
+]

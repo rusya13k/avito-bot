@@ -1,0 +1,8 @@
+# F5: пины версий из рабочего окружения (python -m pip freeze).
+# Меняй явно, не плавающими диапазонами — selenium и openai регулярно
+# ломают совместимость в minor-релизах.
+selenium==4.41.0
+webdriver-manager==4.0.2
+requests==2.33.1
+pyTelegramBotAPI==4.32.0
+openai==2.33.0
