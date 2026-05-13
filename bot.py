@@ -408,6 +408,12 @@ def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.
     F1: call_rate    — вероятность нажать «Позвонить»       (default 5%).
     Оба параметра конфигурируются через config.json / accounts.json
     (ключи view_listing_favorite_rate / view_listing_call_rate).
+
+    F9: dwell_time распределён по lognormal (5-120 секунд, пик ~20-30s).
+    Дополнительно interest-score:
+      • 15% листингов «очень интересные» — +60..300s дополнительного чтения.
+      • 20% «совсем неинтересные» — закрываем рано (return True), без
+        scroll/favorite/call. Имитирует «открыл, не моё, закрыл».
     """
     if check_block(driver, account_name):
         return False
@@ -419,10 +425,22 @@ def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.
     except Exception:
         return True
 
-    # Random dwell time on page start (5-15s)
-    dwell_time = random.uniform(5, 15)
+    # F9: lognormal dwell — реалистичный «прочитать заголовок и фото».
+    # mean ~ 20-30s, длинный хвост до 2 мин (заинтересованный пользователь).
+    dwell_time = hp(5, 120, distribution="lognormal")
     log(account_name, f"  Viewing listing (dwell time: {dwell_time:.1f}s)...")
-    hp(dwell_time / 2, dwell_time)
+
+    # F9: interest score — после первого взгляда решаем, насколько интересно.
+    if random.random() < 0.15:
+        # 15% — очень интересный листинг: дополнительные 1-5 минут чтения.
+        extra = random.uniform(60, 300)
+        log(account_name, f"  F9: интересный листинг — читаем ещё ~{extra:.0f}s")
+        hp(extra, extra)
+    elif random.random() < 0.20:
+        # 20% — закрываем рано (без scroll/photos/favorite/call).
+        # return True — не считаем это ошибкой, просто «не моё».
+        log(account_name, "  F9: неинтересно, закрываем")
+        return True
 
     # Natural behavior: scroll, maybe check photos, scroll more
     scroll_gallery(driver, wait)
@@ -442,7 +460,9 @@ def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.
             try:
                 desc = driver.find_element(By.XPATH, "//div[@data-marker='item-description']")
                 slow_scroll_to(driver, desc)
-                hp(3, 7)  # Reading description
+                # F9: чтение описания — lognormal 15-90s. Объект на 5-15 млн
+                # рублей читается дольше, чем uniform 3-7s.
+                hp(15, 90, distribution="lognormal")
             except:
                 pass
         hp(1, 3)

@@ -55,7 +55,10 @@ def _run_view_listing(favorite_rate=0.08, call_rate=0.05, random_return=0.01, **
     state_mock.should_skip_phone.return_value = state_overrides.get("should_skip_phone", False)
 
     with (
-        patch("bot.hp"),
+        # F9: hp возвращает число (потраченные секунды) — нужно для f-string
+        # `dwell time: {dwell_time:.1f}s`. Без return_value MagicMock не
+        # умеет :.1f и тест падает с TypeError.
+        patch("bot.hp", return_value=5.0),
         patch("bot.scroll_gallery"),
         patch("bot.human_scroll"),
         patch("bot.random_mouse_move"),
