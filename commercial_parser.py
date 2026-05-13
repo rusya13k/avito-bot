@@ -129,215 +129,285 @@ def normalize_listing_url(url: str) -> str:
         return url
 
 
-def extract_listing_data(driver, wait, account_name, log_func):
+# ─────────────────────────────────────────────────────────────────────────────
+# S3: extract_listing_data декомпозиция. Раньше функция занимала 213 строк
+# одним блоком, в котором перепутаны pure-data, Selenium-парсинг, A3-флоу
+# с кликом телефона и пост-обработка. Сейчас она — ~35-строчный оркестратор;
+# каждая ответственность вынесена в свой helper. Логика идентична оригиналу.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _extract_title(wait) -> str:
+    """Заголовок объявления из <h1>. Sentinel "Неизвестно" если не нашли —
+    save_listing_to_db потом замаппит его обратно в None через _nil_if.
     """
-    Extract data from a commercial real estate listing page
+    try:
+        title_elem = wait.until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//h1[@data-marker='item-view/title-info']")
+            )
+        )
+        return title_elem.text
+    except TimeoutException:
+        return "Неизвестно"
+
+
+def _extract_price(driver) -> float:
+    """Цена из item-view/price. C5: до 3s ждём, страница может догружаться.
+    Возвращаем 0.0 sentinel — _nil_if маппит в None при сохранении в БД.
     """
-    listing_data = {}
+    try:
+        price_elem = _wf(driver, "//span[@data-marker='item-view/price']")
+        price_text = price_elem.text.replace("₽", "").replace(" ", "").replace("\n", "")
+        return float(re.sub(r"[^\d,]", "", price_text).replace(",", "."))
+    except Exception:
+        return 0.0
+
+
+def _extract_description(driver) -> str:
+    """Текст описания из item-description. Пустая строка если нет."""
+    try:
+        desc_elem = _wf(driver, "//div[@data-marker='item-description']")
+        return desc_elem.text
+    except Exception:
+        return ""
+
+
+def _extract_location(driver) -> str:
+    """Локация из item-view/item-location//span. Sentinel "Неизвестно"."""
+    try:
+        location_elem = _wf(driver, "//div[@data-marker='item-view/item-location']//span")
+        return location_elem.text
+    except Exception:
+        return "Неизвестно"
+
+
+def _extract_area(title: str, description: str) -> float:
+    """Площадь в кв.м из заголовка/описания (regex). Pure function — не
+    лезет в Selenium. Возвращает 0.0 если не найдено.
+    """
+    try:
+        full_text = title.lower() + " " + description.lower()
+        area_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:кв\.?\s*м|м2)", full_text)
+        if area_match:
+            return float(area_match.group(1))
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def _extract_category(driver, title: str) -> str:
+    """Категория объявления — определяется по URL или тексту title.
+    Маппинг: офис/торгов/склад/производств/бизнес → конкретная категория,
+    иначе общий "коммерческая недвижимость".
+    """
+    try:
+        url = driver.current_url
+        title_lower = title.lower()
+        if "офис" in url or "офис" in title_lower:
+            return "офисные помещения"
+        if "торгов" in url or "торгов" in title_lower:
+            return "торговые помещения"
+        if "склад" in url or "склад" in title_lower:
+            return "склады"
+        if "производств" in url or "производств" in title_lower:
+            return "производственные помещения"
+        if "бизнес" in url or "бизнес" in title_lower:
+            return "готовый бизнес"
+        return "коммерческая недвижимость"
+    except Exception:
+        return "коммерческая недвижимость"
+
+
+def _extract_seller_info(driver) -> dict:
+    """Информация о продавце: seller_name + profile_url + profile_id +
+    active_listings_count. Возвращает dict, готовый для merge в listing_data.
+    """
+    try:
+        seller_name_elem = _wf(driver, "//div[@data-marker='seller-info/username']//a")
+        seller_name = seller_name_elem.text
+        profile_url = seller_name_elem.get_attribute("href")
+
+        profile_id_match = re.search(r"/user/([^/]+)", profile_url or "")
+        profile_id = profile_id_match.group(1) if profile_id_match else "unknown"
+
+        try:
+            active_elem = _wf(
+                driver, "//div[@data-marker='seller-info/active-ads-count']", timeout=1
+            )
+            count_match = re.search(r"\d+", active_elem.text)
+            active_count = int(count_match.group()) if count_match else 0
+        except Exception:
+            active_count = 0
+
+        return {
+            "seller_name": seller_name,
+            "profile_url": profile_url,
+            "profile_id": profile_id,
+            "active_listings_count": active_count,
+        }
+    except Exception:
+        return {
+            "seller_name": "Неизвестно",
+            "profile_url": "",
+            "profile_id": "unknown",
+            "active_listings_count": 0,
+        }
+
+
+def _extract_publication_date(driver) -> str:
+    """Дата публикации из item-view/date. Пустая строка если нет."""
+    try:
+        date_elem = _wf(driver, "//div[@data-marker='item-view/date']", timeout=1)
+        return date_elem.text
+    except Exception:
+        return ""
+
+
+def _extract_photos(driver, max_n: int = 3) -> list[str]:
+    """Первые `max_n` URL фото из image-frame/image. [] если нет."""
+    try:
+        photo_elements = driver.find_elements(
+            By.XPATH, "//img[@data-marker='image-frame/image']"
+        )
+        return [p.get_attribute("src") for p in photo_elements[:max_n]]
+    except Exception:
+        return []
+
+
+def _try_show_phone(driver, account_name: str, log_func, listing_data: dict) -> None:
+    """A3: попытка клика «Показать телефон» с многоуровневыми проверками.
+
+    Этапы (в порядке гарантированной строгости):
+      1. captcha-cooldown — аккаунт «остывает» после прошлой капчи
+      2. Дневной in-memory лимит (should_skip_phone — hard limit + prev session >5)
+      3. Session soft-limit: random.random() < 0.3 (кликаем только в 30% случаев)
+      4. Pre-click captcha check
+      5. Сам клик + 30-90s human_delay
+      6. Post-click captcha check / попытка прочесть номер
+
+    Мутирует listing_data:
+      listing_data["phone"]            -> str | None
+      listing_data[_CAPTCHA_FLAG]      -> True если поймали капчу
+      listing_data[_PHONE_CLICKED_FLAG] -> True если успешно прочли номер
+    """
+    listing_data["phone"] = None
+
+    if account_state.is_cooled_down(account_name):
+        log_func(
+            account_name,
+            f"Skip 'Показать телефон' — аккаунт в cooldown ещё "
+            f"{account_state.cooldown_remaining_seconds(account_name)}s",
+        )
+        return
+    if account_state.should_skip_phone(account_name):
+        # A3: дневной hard-limit достигнут ИЛИ предыдущая сессия >5 кликов
+        log_func(account_name, "A3: Пропуск 'Показать телефон' — дневной/сессионный лимит")
+        return
+    if random.random() >= 0.3:
+        # A3: session soft-limit — кликаем только в ~30% случаев
+        log_func(account_name, "A3: Пропуск 'Показать телефон' — session soft-limit (30%)")
+        return
+    if detect_phone_captcha(driver, log_func=log_func, account_name=account_name):
+        log_func(account_name, "Капча обнаружена ДО клика 'Показать телефон' — пропускаем")
+        listing_data[_CAPTCHA_FLAG] = True
+        account_state.mark_captcha(account_name)
+        return
 
     try:
-        # Extract basic listing information
-        try:
-            title_elem = wait.until(
-                EC.presence_of_element_located(
-                    (By.XPATH, "//h1[@data-marker='item-view/title-info']")
-                )
+        phone_btn = driver.find_element(
+            By.XPATH, "//button[@data-marker='item-contact-bar/call-button']"
+        )
+        phone_btn.click()
+        # A3: cooldown 30-90 сек после клика (ранее было 0.8-1.6с).
+        # Реальный пользователь не кликает "Показать телефон" каждые 2 секунды.
+        # uniform (более равномерный), чтобы не быть предсказуемым.
+        human_delay(30, 90, stop_event=_tg.stop_event, distribution="uniform")
+    except Exception as e:
+        log_func(account_name, f"Ошибка клика 'Показать телефон': {e}")
+        return
+
+    # Post-click captcha check
+    if detect_phone_captcha(driver, log_func=log_func, account_name=account_name):
+        log_func(
+            account_name,
+            "!!! Капча после клика 'Показать телефон' — аккаунт уйдёт в cooldown",
+        )
+        listing_data[_CAPTCHA_FLAG] = True
+        account_state.mark_captcha(account_name)
+        return
+
+    try:
+        phone_elem = WebDriverWait(driver, 5).until(
+            EC.visibility_of_element_located(
+                (By.XPATH, "//span[@data-marker='item-contact-bar/phone']")
             )
-            listing_data["title"] = title_elem.text
-        except TimeoutException:
-            listing_data["title"] = "Неизвестно"
+        )
+        listing_data["phone"] = normalize_phone(phone_elem.text)
+        # A3: успешный клик — обновляем in-memory счётчики.
+        # Метрика phone_clicks в БД инкрементируется в save_listing_to_db
+        # через флаг _PHONE_CLICKED_FLAG.
+        account_state.record_phone_click(account_name)
+        listing_data[_PHONE_CLICKED_FLAG] = True
+    except TimeoutException:
+        # Телефон не появился, но и капчи нет -> просто не показали номер.
+        log_func(account_name, "Номер не появился после клика (без капчи)")
+    except Exception as inner:
+        log_func(account_name, f"Ошибка чтения номера: {inner}")
 
-        try:
-            # Extract price (C5: ждём до 3s, страница может догружаться)
-            price_elem = _wf(driver, "//span[@data-marker='item-view/price']")
-            price_text = price_elem.text.replace("₽", "").replace(" ", "").replace("\n", "")
-            listing_data["price"] = float(re.sub(r"[^\d,]", "", price_text).replace(",", "."))
-        except Exception:
-            listing_data["price"] = 0.0
 
-        try:
-            # Extract description
-            desc_elem = _wf(driver, "//div[@data-marker='item-description']")
-            listing_data["description"] = desc_elem.text
-        except Exception:
-            listing_data["description"] = ""
+def _enrich_phones_from_description(listing_data: dict) -> None:
+    """D3: собираем все номера, упомянутые в описании. Продавцы часто
+    дублируют контакт прямо в тексте. Объединяем с phone из «Показать
+    телефон». Дедуп через set + сортировка. Если основное phone пустое —
+    подставляем первый из описания.
 
-        try:
-            # Extract location
-            location_elem = _wf(driver, "//div[@data-marker='item-view/item-location']//span")
-            listing_data["location"] = location_elem.text
-        except Exception:
-            listing_data["location"] = "Неизвестно"
+    Мутирует listing_data["phones"] и listing_data["phone"].
+    """
+    phones_from_desc = extract_phones_from_text(listing_data.get("description"))
+    all_phones = set(phones_from_desc)
+    if listing_data.get("phone"):
+        all_phones.add(listing_data["phone"])
+    listing_data["phones"] = sorted(all_phones)
+    # Если основное поле phone не заполнено (кнопка не сработала /
+    # был cooldown), но в описании нашли номер — используем его.
+    if not listing_data.get("phone") and listing_data["phones"]:
+        listing_data["phone"] = listing_data["phones"][0]
 
-        try:
-            # Extract area
-            # Look for area in the title or description
-            title_text = listing_data["title"].lower()
-            desc_text = listing_data["description"].lower()
-            full_text = title_text + " " + desc_text
 
-            # Try to find area in square meters
-            area_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:кв\.?\s*м|м2)", full_text)
-            if area_match:
-                listing_data["area"] = float(area_match.group(1))
-            else:
-                listing_data["area"] = 0.0
-        except Exception:
-            listing_data["area"] = 0.0
+def extract_listing_data(driver, wait, account_name, log_func):
+    """Извлечь данные с открытой страницы листинга в dict.
 
-        # Extract category and type
-        try:
-            # Try to determine category from URL or breadcrumbs
-            url = driver.current_url
-            if "офис" in url or "офис" in listing_data["title"].lower():
-                listing_data["category"] = "офисные помещения"
-            elif "торгов" in url or "торгов" in listing_data["title"].lower():
-                listing_data["category"] = "торговые помещения"
-            elif "склад" in url or "склад" in listing_data["title"].lower():
-                listing_data["category"] = "склады"
-            elif "производств" in url or "производств" in listing_data["title"].lower():
-                listing_data["category"] = "производственные помещения"
-            elif "бизнес" in url or "бизнес" in listing_data["title"].lower():
-                listing_data["category"] = "готовый бизнес"
-            else:
-                listing_data["category"] = "коммерческая недвижимость"
-        except Exception:
-            listing_data["category"] = "коммерческая недвижимость"
+    Тонкий оркестратор поверх _extract_*-helpers + _try_show_phone +
+    _enrich_phones_from_description. Каждое поле — отдельный try/except
+    внутри своего helper, чтобы один сбойный селектор не положил весь
+    парс. Возвращает None только при критической ошибке (Exception
+    наружу из любого helper'а), иначе — dict со всеми полями.
+    """
+    listing_data = {}
+    try:
+        listing_data["title"] = _extract_title(wait)
+        listing_data["price"] = _extract_price(driver)
+        listing_data["description"] = _extract_description(driver)
+        listing_data["location"] = _extract_location(driver)
+        listing_data["area"] = _extract_area(listing_data["title"], listing_data["description"])
+        listing_data["category"] = _extract_category(driver, listing_data["title"])
+        listing_data.update(_extract_seller_info(driver))
+        listing_data["date_published"] = _extract_publication_date(driver)
+        listing_data["photo_urls"] = _extract_photos(driver)
 
-        # Extract seller information (C5: short waits)
-        try:
-            seller_name_elem = _wf(driver, "//div[@data-marker='seller-info/username']//a")
-            listing_data["seller_name"] = seller_name_elem.text
-            listing_data["profile_url"] = seller_name_elem.get_attribute("href")
+        # A3: попытка клика «Показать телефон» (мутирует listing_data).
+        _try_show_phone(driver, account_name, log_func, listing_data)
 
-            profile_id_match = re.search(r"/user/([^/]+)", listing_data["profile_url"] or "")
-            if profile_id_match:
-                listing_data["profile_id"] = profile_id_match.group(1)
-            else:
-                listing_data["profile_id"] = "unknown"
-
-            try:
-                active_listings_elem = _wf(
-                    driver, "//div[@data-marker='seller-info/active-ads-count']", timeout=1
-                )
-                count_match = re.search(r"\d+", active_listings_elem.text)
-                listing_data["active_listings_count"] = (
-                    int(count_match.group()) if count_match else 0
-                )
-            except Exception:
-                listing_data["active_listings_count"] = 0
-        except Exception:
-            listing_data["seller_name"] = "Неизвестно"
-            listing_data["profile_url"] = ""
-            listing_data["profile_id"] = "unknown"
-            listing_data["active_listings_count"] = 0
-
-        # Extract publication date (короткий wait — поле необязательное)
-        try:
-            date_elem = _wf(driver, "//div[@data-marker='item-view/date']", timeout=1)
-            listing_data["date_published"] = date_elem.text
-        except Exception:
-            listing_data["date_published"] = ""
-
-        # Extract photos
-        try:
-            photo_urls = []
-            photo_elements = driver.find_elements(
-                By.XPATH, "//img[@data-marker='image-frame/image']"
-            )
-            for photo_elem in photo_elements[:3]:  # Get first 3 photos
-                photo_urls.append(photo_elem.get_attribute("src"))
-            listing_data["photo_urls"] = photo_urls
-        except Exception:
-            listing_data["photo_urls"] = []
-
-        # Extract phone number if available
-        # A3: многоуровневые проверки перед кликом "Показать телефон":
-        #   1. captcha-cooldown (уже был ранее)
-        #   2. Дневной in-memory лимит (should_skip_phone — hard limit + prev session >5)
-        #   3. Session soft-limit: random.random() < 0.3 (кликаем только в 30% случаев)
-        #   4. Pre-click captcha check
-        #   5. Post-click captcha check
-        listing_data["phone"] = None
-
-        if account_state.is_cooled_down(account_name):
-            log_func(
-                account_name,
-                f"Skip 'Показать телефон' — аккаунт в cooldown ещё "
-                f"{account_state.cooldown_remaining_seconds(account_name)}s",
-            )
-        elif account_state.should_skip_phone(account_name):
-            # A3: дневной hard-limit достигнут ИЛИ предыдущая сессия >5 кликов
-            log_func(account_name, "A3: Пропуск 'Показать телефон' — дневной/сессионный лимит")
-        elif random.random() >= 0.3:
-            # A3: session soft-limit — кликаем только в ~30% случаев
-            log_func(account_name, "A3: Пропуск 'Показать телефон' — session soft-limit (30%)")
-        elif detect_phone_captcha(driver, log_func=log_func, account_name=account_name):
-            log_func(account_name, "Капча обнаружена ДО клика 'Показать телефон' — пропускаем")
-            listing_data[_CAPTCHA_FLAG] = True
-            account_state.mark_captcha(account_name)
-        else:
-            try:
-                phone_btn = driver.find_element(
-                    By.XPATH, "//button[@data-marker='item-contact-bar/call-button']"
-                )
-                phone_btn.click()
-                # A3: cooldown 30-90 сек после клика (ранее было 0.8-1.6с).
-                # Реальный пользователь не кликает "Показать телефон" каждые 2 секунды.
-                # Используем uniform (более равномерный), чтобы не быть предсказуемым.
-                human_delay(30, 90, stop_event=_tg.stop_event, distribution="uniform")
-
-                # Post-click captcha check.
-                if detect_phone_captcha(driver, log_func=log_func, account_name=account_name):
-                    log_func(
-                        account_name,
-                        "!!! Капча после клика 'Показать телефон' — аккаунт уйдёт в cooldown",
-                    )
-                    listing_data[_CAPTCHA_FLAG] = True
-                    account_state.mark_captcha(account_name)
-                else:
-                    try:
-                        phone_elem = WebDriverWait(driver, 5).until(
-                            EC.visibility_of_element_located(
-                                (By.XPATH, "//span[@data-marker='item-contact-bar/phone']")
-                            )
-                        )
-                        listing_data["phone"] = normalize_phone(phone_elem.text)
-                        # A3: успешный клик — обновляем in-memory счётчики.
-                        # Метрика phone_clicks в БД инкрементируется в save_listing_to_db
-                        # через флаг _PHONE_CLICKED_FLAG.
-                        account_state.record_phone_click(account_name)
-                        listing_data[_PHONE_CLICKED_FLAG] = True
-                    except TimeoutException:
-                        # Телефон не появился, но и капчи нет -> просто не показали номер.
-                        log_func(account_name, "Номер не появился после клика (без капчи)")
-                    except Exception as inner:
-                        log_func(account_name, f"Ошибка чтения номера: {inner}")
-            except Exception as e:
-                log_func(account_name, f"Ошибка клика 'Показать телефон': {e}")
-
-        # Add URL and current date.
-        # D4: нормализуем URL до канонического вида сразу — иначе
-        # один и тот же листинг с разными UTM создаст дубль в БД.
+        # D4: нормализуем URL до канонического вида — иначе один и тот же
+        # листинг с разными UTM создаст дубль в БД.
         listing_data["url"] = normalize_listing_url(driver.current_url)
         listing_data["date_scraped"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
-        # D3: соберём ВСЕ номера, упомянутые в описании (продавцы часто
-        # дублируют контакт прямо в тексте). Объединяем с phone, который
-        # достали через "Показать телефон". Дедуп — set + сортировка.
-        phones_from_desc = extract_phones_from_text(listing_data.get("description"))
-        all_phones = set(phones_from_desc)
-        if listing_data.get("phone"):
-            all_phones.add(listing_data["phone"])
-        listing_data["phones"] = sorted(all_phones)
-        # Если основное поле phone не заполнено (кнопка не сработала /
-        # был cooldown), но в описании нашли номер — используем его.
-        if not listing_data.get("phone") and listing_data["phones"]:
-            listing_data["phone"] = listing_data["phones"][0]
+        # D3: обогащаем phones номерами из описания (мутирует listing_data).
+        _enrich_phones_from_description(listing_data)
 
-        # Log the extracted data
         log_func(account_name, f"Извлечены данные: {listing_data['title']}")
-
     except Exception as e:
         log_func(account_name, f"Ошибка извлечения данных: {str(e)}")
         return None
@@ -360,71 +430,141 @@ def _nil_if(value, *sentinels):
     return value
 
 
-def save_listing_to_db(listing_data, db_manager, log_func, account_name):
+# ─────────────────────────────────────────────────────────────────────────────
+# S3: save_listing_to_db декомпозиция. Раньше функция была 154 строки одним
+# куском (sentinel-нормализация + upsert + phones + статус + 4-5 метрик).
+# Сейчас — оркестратор ~40 строк + три helper'а ниже. Поведение/гарантии
+# (атомарная транзакция, set sentinel-полей в None, метрики) идентичны.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _normalize_for_db(listing_data: dict) -> dict:
+    """Sentinel-стрипинг для upsert_listing. Возвращает dict с теми же
+    ключами, что и listing_data, но "Неизвестно"/"unknown"/0.0 → None.
+
+    Это нужно, чтобы upsert_listing'у было что COALESCE'нуть с уже
+    сохранёнными в БД полями, а не затереть их sentinel-ами от парсера.
     """
-    Save listing data to database.
+    return {
+        "title": _nil_if(listing_data.get("title"), "Неизвестно"),
+        "seller_name": _nil_if(listing_data.get("seller_name"), "Неизвестно"),
+        "location": _nil_if(listing_data.get("location"), "Неизвестно"),
+        "price": _nil_if(listing_data.get("price"), 0.0, 0),
+        "area": _nil_if(listing_data.get("area"), 0.0, 0),
+        "profile_id": _nil_if(listing_data.get("profile_id"), "unknown"),
+        "profile_url": _nil_if(listing_data.get("profile_url")),
+        "description": _nil_if(listing_data.get("description")),
+        "date_published": _nil_if(listing_data.get("date_published")),
+        # active_listings_count: 0 — валидное значение (у продавца может быть
+        # 0 активных, если он только что снял листинг), поэтому 0 НЕ считаем
+        # sentinel. Null только если парсер явно не достал.
+        "active_listings_count": listing_data.get("active_listings_count"),
+        # photo_urls: пустой список валиден — это "фото нет". None оставляем
+        # если ключа нет. list превратится в JSON в upsert_listing.
+        "photo_urls": listing_data.get("photo_urls"),
+    }
 
-    Возвращает listing_id при успешной записи, иначе None.
-    Сохраняет ВСЕ поля из extract_listing_data: title, seller_name, profile_id,
-    profile_url, photo_urls, phone, active_listings_count (раньше терялись).
 
-    Sentinel-значения (напр. "Неизвестно", "unknown", 0.0 для цены/площади)
-    нормализуются в None, чтобы не перезаписывать в БД реально спарсенные
-    ранее данные.
+def _save_phones_for_listing(db_manager, cur, listing_data: dict) -> None:
+    """D3: пишем ВСЕ найденные номера (через «Показать телефон» + из
+    описания), не только основной. Критично для phone_frequency_signal
+    в HeuristicScorer — если у одного агента 5 объявлений с одним номером
+    в описании, мы должны видеть phone_count=5, иначе все они выглядят
+    как owner.
+
+    Идёт в общей транзакции (cur передаётся снаружи).
+    """
+    phones_to_save = list(listing_data.get("phones") or [])
+    if not phones_to_save and listing_data.get("phone"):
+        phones_to_save = [listing_data["phone"]]
+    for ph in phones_to_save:
+        db_manager.upsert_phone(
+            phone_normalized=ph,
+            listing_count=1,
+            score=0.0,
+            cursor=cur,
+        )
+
+
+def _record_listing_outcome_metrics(
+    db_manager, cur, account_name: str, listing_data: dict, status: str
+) -> None:
+    """E2/A3/C3: счётчики и журнал для уже сохранённого листинга.
+
+    listings_parsed/<status> — общая статистика и разбивка по исходу.
+    captcha_hits + log_captcha — отдельно при status='captcha' (не каждый
+    captcha-инцидент привязан к листингу, например login captcha).
+    phone_clicks — если был успешный клик «Показать телефон»
+    (флаг _PHONE_CLICKED_FLAG из extract_listing_data).
+
+    Лежит в той же транзакции, что и сам листинг — если что-то упадёт,
+    откатятся и метрики, и сохранение.
+    """
+    db_manager.incr_metric(account_name, "listings_parsed", cursor=cur)
+    db_manager.incr_metric(account_name, f"listings_{status}", cursor=cur)
+
+    if status == "captcha":
+        # captcha_hits отдельно от listings_captcha — не каждый
+        # captcha-инцидент привязан к листингу (например, login captcha).
+        db_manager.incr_metric(account_name, "captcha_hits", cursor=cur)
+        # C3: журнал инцидента для /lastcaptcha
+        db_manager.log_captcha(
+            account_name=account_name,
+            page_url=listing_data.get("url", ""),
+            action="phone_click",
+            captcha_type="phone_captcha",
+            cursor=cur,
+        )
+
+    # A3: метрика phone_clicks — для аналитики кликов «Показать телефон».
+    # Флаг выставляется в _try_show_phone после успешного получения номера.
+    if listing_data.get(_PHONE_CLICKED_FLAG):
+        db_manager.incr_metric(account_name, "phone_clicks", cursor=cur)
+
+
+def save_listing_to_db(listing_data, db_manager, log_func, account_name):
+    """Сохраняем листинг в БД одной атомарной транзакцией (C4).
+
+    Тонкий оркестратор поверх _normalize_for_db (sentinel-стрипинг),
+    _save_phones_for_listing (D3) и _record_listing_outcome_metrics (E2/C3).
+    Возвращает listing_id при успехе, None при ошибке. На ошибку
+    дополнительно инкрементит listings_error метрику ВНЕ транзакции
+    (она уже откатилась).
     """
     if not listing_data:
         return None
 
     try:
-        # --- Нормализуем sentinel-значения из extract_listing_data в None ---
-        title = _nil_if(listing_data.get("title"), "Неизвестно")
-        seller_name = _nil_if(listing_data.get("seller_name"), "Неизвестно")
-        location = _nil_if(listing_data.get("location"), "Неизвестно")
-        price = _nil_if(listing_data.get("price"), 0.0, 0)
-        area = _nil_if(listing_data.get("area"), 0.0, 0)
-        profile_id = _nil_if(listing_data.get("profile_id"), "unknown")
-        profile_url = _nil_if(listing_data.get("profile_url"))
-        description = _nil_if(listing_data.get("description"))
-        date_published = _nil_if(listing_data.get("date_published"))
-        # active_listings_count: 0 — валидное значение (у продавца может быть 0
-        # активных объявлений, если он только что снял листинг), поэтому
-        # ноль НЕ считаем sentinel. Null только если парсер явно не достал.
-        active_listings_count = listing_data.get("active_listings_count")
-        # photo_urls: пустой список валиден — это "фото нет". None оставляем,
-        # если ключа нет. list превратится в JSON в upsert_listing.
-        photo_urls = listing_data.get("photo_urls")
+        norm = _normalize_for_db(listing_data)
 
-        # C4: одна атомарная транзакция на весь листинг.
-        # Раньше каждый upsert/mark_status открывал своё соединение, и краш
-        # между ними оставлял БД в полу-записанном состоянии (например,
-        # листинг записан, но phone/parse_status — нет). Теперь либо все
-        # четыре операции коммитятся вместе, либо все откатываются.
+        # C4: одна атомарная транзакция на весь листинг. Раньше каждый
+        # upsert/mark_status открывал своё соединение, и краш между ними
+        # оставлял БД в полу-записанном состоянии. Теперь либо все шаги
+        # коммитятся вместе, либо все откатываются.
         with db_manager.transaction() as cur:
-            # Save listing (все поля разом — раньше терялись)
             listing_id = db_manager.upsert_listing(
                 url=listing_data["url"],
-                title=title,
+                title=norm["title"],
                 category=listing_data.get("category"),
-                area=area,
-                price=price,
-                location=location,
-                description=description,
-                seller_name=seller_name,
-                profile_id=profile_id,
-                profile_url=profile_url,
+                area=norm["area"],
+                price=norm["price"],
+                location=norm["location"],
+                description=norm["description"],
+                seller_name=norm["seller_name"],
+                profile_id=norm["profile_id"],
+                profile_url=norm["profile_url"],
                 phone=listing_data.get("phone"),
-                active_listings_count=active_listings_count,
-                photo_urls=photo_urls,
+                active_listings_count=norm["active_listings_count"],
+                photo_urls=norm["photo_urls"],
                 date_parsed=listing_data.get("date_scraped"),
-                date_published=date_published,
+                date_published=norm["date_published"],
                 date_scraped=listing_data.get("date_scraped"),
                 cursor=cur,
             )
 
-            # Save account if exists
-            if profile_id:
+            if norm["profile_id"]:
                 db_manager.upsert_account(
-                    profile_id=profile_id,
+                    profile_id=norm["profile_id"],
                     name=listing_data.get("seller_name", ""),
                     active_listings_count=listing_data.get("active_listings_count", 0),
                     registration_date="",
@@ -432,27 +572,9 @@ def save_listing_to_db(listing_data, db_manager, log_func, account_name):
                     cursor=cur,
                 )
 
-            # Save phones if exist.
-            # D3: пишем ВСЕ найденные номера (через "Показать телефон" +
-            # из текста описания), не только основной. Это критично для
-            # phone_frequency_signal в HeuristicScorer — если у одного
-            # агента 5 объявлений с одним номером в описании, мы должны
-            # видеть phone_count=5, иначе все они выглядят как owner.
-            phones_to_save = list(listing_data.get("phones") or [])
-            if not phones_to_save and listing_data.get("phone"):
-                phones_to_save = [listing_data["phone"]]
-            for ph in phones_to_save:
-                db_manager.upsert_phone(
-                    phone_normalized=ph,
-                    listing_count=1,
-                    score=0.0,
-                    cursor=cur,
-                )
+            _save_phones_for_listing(db_manager, cur, listing_data)
 
-            # A3: проставляем parse_status. По умолчанию 'ok'; если был детект
-            # капчи на этапе extract_listing_data — пишем 'captcha'.
-            # В рамках общей транзакции — если эта запись упадёт, откатятся
-            # и предыдущие шаги тоже (атомарность).
+            # A3: parse_status — 'ok' или 'captcha' (если поймали капчу).
             if listing_id is not None:
                 status = "captcha" if listing_data.get(_CAPTCHA_FLAG) else "ok"
                 db_manager.mark_listing_parse_status(
@@ -461,46 +583,9 @@ def save_listing_to_db(listing_data, db_manager, log_func, account_name):
                     listing_id=listing_id,
                     cursor=cur,
                 )
-                # E2: счётчики per account / per hour. listings_parsed —
-                # общая сумма прошедших через парсер; listings_<status> —
-                # разбивка по исходу. Лежит в той же транзакции — если
-                # commit'нется листинг, commit'нется и метрика.
-                db_manager.incr_metric(
-                    account_name,
-                    "listings_parsed",
-                    cursor=cur,
+                _record_listing_outcome_metrics(
+                    db_manager, cur, account_name, listing_data, status
                 )
-                db_manager.incr_metric(
-                    account_name,
-                    f"listings_{status}",
-                    cursor=cur,
-                )
-                if status == "captcha":
-                    # captcha_hits отдельно от listings_captcha —
-                    # потому что не каждый captcha-инцидент привязан к
-                    # листингу (login captcha, например).
-                    db_manager.incr_metric(
-                        account_name,
-                        "captcha_hits",
-                        cursor=cur,
-                    )
-                    # C3: журнал инцидента для /lastcaptcha
-                    db_manager.log_captcha(
-                        account_name=account_name,
-                        page_url=listing_data.get("url", ""),
-                        action="phone_click",
-                        captcha_type="phone_captcha",
-                        cursor=cur,
-                    )
-                # A3: метрика phone_clicks — новая E2-метрика для аналитики
-                # кликов "Показать телефон". Флаг выставляется в extract_listing_data
-                # после успешного получения номера.
-                if listing_data.get(_PHONE_CLICKED_FLAG):
-                    db_manager.incr_metric(
-                        account_name,
-                        "phone_clicks",
-                        cursor=cur,
-                    )
 
         log_func(account_name, f"Сохранено в БД (id={listing_id}): {listing_data['url']}")
         return listing_id
