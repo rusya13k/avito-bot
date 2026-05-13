@@ -1293,6 +1293,61 @@ def _seconds_until_active_hours(account: dict, cfg: dict) -> float:
     return float(86400 - current_secs + target_secs)
 
 
+# F6: probabilistic active hours — заменяет бинарный B2 на вероятностную
+# модель. Реальный пользователь:
+#   утро (9-11)  ~95%, обед (12-14)  ~50%, день (15-17) ~85%,
+#   вечер (18-21) ~90%, поздно (22-23) ~30%, ночь (0-8) ~5%.
+# Бот, который ровно в 22:30 работает, а ровно в 23:01 спит — тоже паттерн.
+# Теперь каждый цикл бросаем монетку с вероятностью _active_probability(hour);
+# выпало > prob — пропускаем один цикл (длинная пауза 30-90 мин).
+_ACTIVITY_BY_HOUR: dict[int, float] = {
+    0: 0.02, 1: 0.01, 2: 0.01, 3: 0.005, 4: 0.005,
+    5: 0.01, 6: 0.05, 7: 0.20, 8: 0.40,
+    9: 0.85, 10: 0.95, 11: 0.95,
+    12: 0.55, 13: 0.45, 14: 0.55,
+    15: 0.85, 16: 0.85, 17: 0.80,
+    18: 0.90, 19: 0.90, 20: 0.85,
+    21: 0.70, 22: 0.45, 23: 0.20,
+}
+
+
+def _active_probability(account: dict, cfg: dict, hour: int | None = None) -> float:
+    """F6: вероятность того, что аккаунт «активен» в указанный час.
+
+    Источники паттерна (по убыванию приоритета):
+      1. account["activity_pattern"] — dict {hour: prob}, per-account.
+      2. cfg["activity_pattern"]      — глобальный.
+      3. _ACTIVITY_BY_HOUR            — default-распределение.
+
+    Совместимость с B2: если у аккаунта/конфига заданы
+    `active_hours_start`/`active_hours_end`, ВНЕ этого окна возвращаем 0
+    (бот строго спит). Это для пользователей, которые хотят жёсткое 9-23
+    без вероятностной модели — задают окно, и вероятностная модель
+    превращается в бинарную.
+
+    `hour` — для тестов; в проде передаём None и берём текущий локальный час.
+    """
+    if hour is None:
+        hour = time.localtime().tm_hour
+
+    # Совместимость с B2: жёсткое окно перебивает probabilistic-модель.
+    start = account.get("active_hours_start", cfg.get("active_hours_start"))
+    end = account.get("active_hours_end", cfg.get("active_hours_end"))
+    if start is not None and end is not None:
+        if not (int(start) <= hour < int(end)):
+            return 0.0
+
+    pattern = (
+        account.get("activity_pattern")
+        or cfg.get("activity_pattern")
+        or _ACTIVITY_BY_HOUR
+    )
+    # Ключи в JSON всегда строки — нормализуем оба варианта.
+    if isinstance(pattern, dict):
+        return float(pattern.get(hour, pattern.get(str(hour), 0.5)))
+    return 0.5
+
+
 def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: DatabaseManager):
     account_name = account["name"]
     user_id = account.get("user_id")
@@ -1532,24 +1587,31 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
                     _slept += _chunk
                 continue
 
-            # ── B2: Активное окно времени ─────────────────────────────────
-            # Если текущий час вне [active_hours_start, active_hours_end)
-            # — ждём до начала окна, проверяя stop_event каждые 30 сек.
-            if not _is_in_active_hours(account, cfg):
-                _active_start = int(
-                    account.get("active_hours_start", cfg.get("active_hours_start", 9))
+            # ── F6: Probabilistic active hours ────────────────────────────
+            # Каждый цикл бросаем монетку с вероятностью _active_probability:
+            # ночью ~2-5%, утром/вечером ~85-95%. Если выпало больше prob —
+            # пропускаем цикл с обычной session-паузой 30-90 мин. Так и не
+            # видны резкие переходы «работаю в 22:30 / сплю в 23:01».
+            # Совместимость с B2: если active_hours_start/end заданы, ВНЕ
+            # окна prob=0 — поведение строго бинарное, как раньше.
+            _prob = _active_probability(account, cfg)
+            if random.random() > _prob:
+                _hour = time.localtime().tm_hour
+                _sleep_min = random.uniform(_pause_min, _pause_max)
+                _wake_time = time.strftime(
+                    "%H:%M", time.localtime(time.time() + _sleep_min * 60)
                 )
-                _wait_secs = _seconds_until_active_hours(account, cfg)
-                _wake_time = time.strftime("%H:%M", time.localtime(time.time() + _wait_secs))
                 log(
                     account_name,
-                    f"B2: вне активного окна — сплю до {_active_start:02d}:00 (~{_wake_time}).",
+                    f"F6: пропуск цикла (час={_hour:02d}, prob={_prob:.2f}). "
+                    f"Следующая попытка через {_sleep_min:.0f} мин (~{_wake_time}).",
                 )
-                _slept = 0.0
-                while _slept < _wait_secs and not _tg.stop_event.is_set():
-                    _chunk = min(30.0, _wait_secs - _slept)
-                    time.sleep(_chunk)
-                    _slept += _chunk
+                _human_delay(
+                    _sleep_min * 60,
+                    _sleep_min * 60,
+                    stop_event=_tg.stop_event,
+                    distribution="uniform",
+                )
                 continue
 
             # A3/A4: сбрасываем сессионные phone-счётчики в начале цикла.
