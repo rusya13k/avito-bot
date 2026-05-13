@@ -1348,13 +1348,24 @@ def _active_probability(account: dict, cfg: dict, hour: int | None = None) -> fl
     return 0.5
 
 
-def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: DatabaseManager):
-    account_name = account["name"]
-    user_id = account.get("user_id")
-    driver = None
+# ─────────────────────────────────────────────────────────────────────────────
+# S1: run_thread декомпозиция. Раньше run_thread весил ~370 строк после
+# F5/F6/F7/F8/F9 и был сложен для дальнейших правок. Сейчас он — оркестратор
+# 50-60 строк, а основные секции вынесены в private helpers _ниже_.
+# Все helpers идут в порядке вызова из run_thread.
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # G2: применяем per-account override captcha_cooldown_minutes из accounts.json.
-    # None -> глобальный DEFAULT (см. account_state.configure_from_cfg).
+
+def _apply_per_account_overrides(account: dict) -> None:
+    """G2/F7/A2: применяем per-account настройки из accounts.json.
+
+    Объединяет три вида overrides: captcha-cooldown (G2), базовая вероятность
+    dead-day (F7), дневные бюджеты на listings/messages/phone (A2). Значение
+    None в accounts.json для любого ключа = «оставить глобальный дефолт».
+    """
+    account_name = account["name"]
+
+    # G2: per-account override captcha_cooldown_minutes из accounts.json.
     account_state.set_account_cooldown_minutes(
         account_name, account.get("captcha_cooldown_minutes")
     )
@@ -1364,72 +1375,350 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
     # accounts.json ключ "dead_day_rate" (или 0 чтобы выключить).
     account_state.set_account_dead_day_rate(account_name, account.get("dead_day_rate"))
 
-    # A2: применяем per-account дневные бюджеты из accounts.json.
-    # Ключи: daily_budget_listings / daily_budget_messages / daily_budget_phone.
-    # Значение None → не переопределяем (используем глобальный дефолт).
-    _budget_overrides = {
-        "listings": account.get("daily_budget_listings"),
-        "messages": account.get("daily_budget_messages"),
-        "phone": account.get("daily_budget_phone"),
-    }
-    account_state.set_daily_budget_limits(account_name, _budget_overrides)
+    # A2: per-account дневные бюджеты. Ключи: daily_budget_listings /
+    # daily_budget_messages / daily_budget_phone.
+    account_state.set_daily_budget_limits(
+        account_name,
+        {
+            "listings": account.get("daily_budget_listings"),
+            "messages": account.get("daily_budget_messages"),
+            "phone": account.get("daily_budget_phone"),
+        },
+    )
 
-    # ── B1: Warmup-режим для нового аккаунта ──────────────────────────────
-    # Если в accounts.json задано "created_at": "YYYY-MM-DD", то первые
-    # warmup_days дней (default 3) аккаунт работает в щадящем режиме:
-    # нет кликов телефона, нет LLM-сообщений, меньше листингов.
-    _created_at_str = account.get("created_at")
-    if _created_at_str:
-        try:
-            import datetime as _dt
 
-            _created_dt = _dt.datetime.strptime(_created_at_str, "%Y-%m-%d")
-            _warmup_days = int(account.get("warmup_days", 3))
-            _warmup_end_ts = _created_dt.timestamp() + _warmup_days * 86400
-            account_state.set_warmup_until(account_name, _warmup_end_ts)
-            if account_state.is_in_warmup(account_name):
-                _warmup_listing_limit = int(account.get("warmup_daily_listings", 20))
-                account_state.set_daily_budget_limits(
-                    account_name, {"listings": _warmup_listing_limit}
-                )
-                log(
-                    account_name,
-                    f"B1: warmup-режим до {_dt.datetime.fromtimestamp(_warmup_end_ts).strftime('%Y-%m-%d')} "
-                    f"(+{_warmup_days} дн. с created_at). "
-                    f"Листингов/день: {_warmup_listing_limit}. Телефон и сообщения — выкл.",
-                )
-        except (ValueError, OSError):
-            _bot_logger.warning(
-                "[%s] B1: некорректный created_at=%r — warmup пропускаем",
-                account_name,
-                _created_at_str,
+def _apply_warmup_if_new(account: dict, account_name: str) -> None:
+    """B1: warmup-режим для нового аккаунта.
+
+    Если в accounts.json задано "created_at": "YYYY-MM-DD", первые
+    warmup_days дней (default 3) аккаунт работает в щадящем режиме:
+    нет кликов телефона, нет LLM-сообщений, меньше листингов.
+    Тихо игнорируется если created_at невалидный (только лог-warning).
+    """
+    created_at_str = account.get("created_at")
+    if not created_at_str:
+        return
+
+    try:
+        import datetime as _dt
+
+        created_dt = _dt.datetime.strptime(created_at_str, "%Y-%m-%d")
+        warmup_days = int(account.get("warmup_days", 3))
+        warmup_end_ts = created_dt.timestamp() + warmup_days * 86400
+        account_state.set_warmup_until(account_name, warmup_end_ts)
+        if account_state.is_in_warmup(account_name):
+            warmup_listing_limit = int(account.get("warmup_daily_listings", 20))
+            account_state.set_daily_budget_limits(
+                account_name, {"listings": warmup_listing_limit}
             )
+            log(
+                account_name,
+                f"B1: warmup-режим до {_dt.datetime.fromtimestamp(warmup_end_ts).strftime('%Y-%m-%d')} "
+                f"(+{warmup_days} дн. с created_at). "
+                f"Листингов/день: {warmup_listing_limit}. Телефон и сообщения — выкл.",
+            )
+    except (ValueError, OSError):
+        _bot_logger.warning(
+            "[%s] B1: некорректный created_at=%r — warmup пропускаем",
+            account_name,
+            created_at_str,
+        )
 
-    # ── C1: Health score — применяем ограничения если нужно ──────────────
-    # Вычисляем captcha_rate за 7 дней ПОСЛЕ применения per-account бюджетов
-    # (B1/A2), чтобы health-ограничения были дополнительным слоем поверх.
+
+def _check_health_and_log(account_name: str, db_manager: DatabaseManager) -> None:
+    """C1: вычисляем captcha_rate за 7 дней и применяем degraded/critical
+    ограничения, если health-score плохой. C1 не должен блокировать запуск,
+    поэтому ловим Exception и игнорируем — стартуем как обычно при ошибках
+    в health-расчётах.
+    """
     try:
         from account_state import apply_health_restrictions, compute_account_health
 
-        _health = compute_account_health(account_name, db_manager)
-        if _health["mode"] in ("degraded", "critical"):
-            apply_health_restrictions(account_name, _health)
+        health = compute_account_health(account_name, db_manager)
+        if health["mode"] in ("degraded", "critical"):
+            apply_health_restrictions(account_name, health)
             log(
                 account_name,
-                f"C1: режим {_health['mode']} (captcha_rate={_health['score']:.3f}, "
-                f"капч={_health['captchas_7d']}, листингов={_health['listings_7d']} за 7д). "
+                f"C1: режим {health['mode']} (captcha_rate={health['score']:.3f}, "
+                f"капч={health['captchas_7d']}, листингов={health['listings_7d']} за 7д). "
                 "Бюджет снижен, телефон заблокирован.",
             )
         else:
             log(
                 account_name,
-                f"C1: аккаунт здоров (captcha_rate={_health['score']:.3f}, "
-                f"капч={_health['captchas_7d']} за 7д).",
+                f"C1: аккаунт здоров (captcha_rate={health['score']:.3f}, "
+                f"капч={health['captchas_7d']} за 7д).",
             )
     except Exception:
         pass  # C1 не должен блокировать запуск
 
-    # ── A1: Per-account proxy setup ────────────────────────────────────────
+
+def _connect_with_retry(
+    adspower: "AdsPowerAPI", user_id: str, account_name: str
+) -> tuple | None:
+    """Запуск AdsPower-профиля + WebDriver-подключение с попытками.
+
+    На каждом провале — ротируем прокси из общего пула proxies.txt и
+    останавливаем профиль перед следующей попыткой. Возвращает
+    (driver, wait) при успехе, либо None если все попытки исчерпаны
+    (вызывающий должен сделать early return).
+    """
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            log(account_name, f"Starting profile (Attempt {attempt + 1})...")
+            debug_port = adspower.start_profile(user_id)
+            time.sleep(5)
+            driver = connect_to_sphere(debug_port)
+            wait = WebDriverWait(driver, 15)
+
+            # Test connection
+            if safe_get(driver, "https://ya.ru", account_name, retries=1):
+                return driver, wait
+            raise Exception("Connection failed")
+        except Exception as e:
+            log(account_name, f"Connection fail: {e}. Rotating proxy...")
+            new_proxy = get_random_proxy()
+            if new_proxy and update_profile_proxy(adspower, user_id, new_proxy):
+                log(account_name, f"Proxy updated to {new_proxy[:15]}...")
+            adspower.stop_profile(user_id)
+            if attempt == max_retries:
+                return None
+            hp(5, 10)
+    return None
+
+
+def _build_avito_client(driver, wait, account: dict, cfg: dict, db_manager: DatabaseManager):
+    """Конструируем AvitoClient с per-account overrides для F1/F2/F5/E2.
+
+    Все «волшебные числа» (favorite_rate, call_rate, max_listings_per_*,
+    messenger_*) собираются здесь по приоритету: account → cfg → дефолт.
+    Возвращает готовый AvitoClient.
+    """
+    # G1: AvitoClient — единый фасад над selenium-flow. Lazy import чтобы
+    # не плодить циклические зависимости (avito_client тоже использует bot).
+    from avito_client import AvitoClient
+
+    account_name = account["name"]
+
+    llm_config = {
+        "api_key": cfg.get("openai_api_key", ""),
+        "model": cfg.get("openai_model", "gpt-3.5-turbo"),
+        "api_base": cfg.get("openai_api_base", "https://api.openai.com/v1"),
+    }
+    llm = LLMClassifier(llm_config, db_manager=db_manager)
+
+    # F1: вероятности кликов «Избранное»/«Позвонить» в view_listing.
+    fav_rate = float(
+        account.get(
+            "view_listing_favorite_rate",
+            cfg.get("view_listing_favorite_rate", 0.08),
+        )
+    )
+    call_rate = float(
+        account.get(
+            "view_listing_call_rate",
+            cfg.get("view_listing_call_rate", 0.05),
+        )
+    )
+
+    # F2: верхние границы числа листингов/категорий за цикл.
+    max_listings = int(
+        account.get("max_listings_per_search", cfg.get("max_listings_per_search", 7))
+    )
+    max_cats = int(
+        account.get("max_categories_per_browse", cfg.get("max_categories_per_browse", 4))
+    )
+    max_browse_listings = int(
+        account.get("max_listings_per_browse", cfg.get("max_listings_per_browse", 4))
+    )
+
+    # F5: реалистичные задержки ответа в мессенджере. Любой ключ можно
+    # опустить — соответствующий дефолт подхватится в AvitoMessenger.__init__.
+    messenger_cfg: dict = {}
+    for key in (
+        "min_reply_age_min",
+        "max_reply_age_min",
+        "reply_delay_mu",
+        "reply_delay_sigma",
+        "ignore_new_dialog_chance",
+    ):
+        full_key = f"messenger_{key}"
+        val = account.get(full_key, cfg.get(full_key))
+        if val is not None:
+            messenger_cfg[key] = float(val)
+
+    return AvitoClient(
+        driver,
+        wait,
+        account_name,
+        log_func=log,
+        db_manager=db_manager,
+        llm_classifier=llm,
+        search_filters=account.get("search_filters"),
+        favorite_rate=fav_rate,
+        call_rate=call_rate,
+        max_listings_per_search=max_listings,
+        max_categories_per_browse=max_cats,
+        max_listings_per_browse=max_browse_listings,
+        messenger_config=messenger_cfg or None,
+    )
+
+
+def _sleep_until_tomorrow(account: dict, cfg: dict, account_name: str) -> None:
+    """F7: спим до завтрашнего active_hours_start (default 9:00).
+
+    Прерывается если выставлен stop_event (TG /stop). Используется
+    после положительного решения F7 dead-day — досыпаем до начала
+    следующего дня, чтобы не пропустить решение второй раз сегодня.
+    """
+    import datetime as _dt
+
+    start_hour = int(account.get("active_hours_start", cfg.get("active_hours_start", 9)))
+    now = _dt.datetime.now()
+    tomorrow = (now + _dt.timedelta(days=1)).replace(
+        hour=start_hour, minute=0, second=0, microsecond=0
+    )
+    wait_secs = max(0.0, (tomorrow - now).total_seconds())
+    log(
+        account_name,
+        f"F7: сегодня dead-day — спим {wait_secs / 3600:.1f} ч "
+        f"до завтра {start_hour:02d}:00.",
+    )
+    slept = 0.0
+    while slept < wait_secs and not _tg.stop_event.is_set():
+        chunk = min(60.0, wait_secs - slept)
+        time.sleep(chunk)
+        slept += chunk
+
+
+def _run_main_loop(
+    client, driver, account: dict, cfg: dict, account_name: str
+) -> None:
+    """Основной цикл: F7 dead-day → F6 prob → F8 cycle dispatch → A4 пауза.
+
+    Гоняем пока не выставлен _tg.stop_event. Каждый «цикл» — это либо
+    один из 4-х F8-вариантов (full/messenger_only/browse_only/profile_check),
+    либо пропуск (F7 dead-day / F6 неудачный бросок). После каждого цикла
+    — A4 пауза 30-90 мин (per-account overridable через session_pause_*).
+    """
+    pause_min = float(account.get("session_pause_min", cfg.get("session_pause_min", 30)))
+    pause_max = float(account.get("session_pause_max", cfg.get("session_pause_max", 90)))
+
+    while not _tg.stop_event.is_set():
+        # ── F7: dead-day — пропускаем сегодняшний день целиком ─────────
+        if account_state.is_dead_day(account_name):
+            _sleep_until_tomorrow(account, cfg, account_name)
+            continue
+
+        # ── F6: Probabilistic active hours ────────────────────────────
+        # Каждый цикл бросаем монетку с вероятностью _active_probability:
+        # ночью ~2-5%, утром/вечером ~85-95%. Если выпало больше prob —
+        # пропускаем цикл с обычной session-паузой 30-90 мин.
+        # Совместимость с B2: если active_hours_start/end заданы, ВНЕ
+        # окна prob=0 — поведение строго бинарное, как раньше.
+        prob = _active_probability(account, cfg)
+        if random.random() > prob:
+            hour = time.localtime().tm_hour
+            sleep_min = random.uniform(pause_min, pause_max)
+            wake_time = time.strftime(
+                "%H:%M", time.localtime(time.time() + sleep_min * 60)
+            )
+            log(
+                account_name,
+                f"F6: пропуск цикла (час={hour:02d}, prob={prob:.2f}). "
+                f"Следующая попытка через {sleep_min:.0f} мин (~{wake_time}).",
+            )
+            _human_delay(
+                sleep_min * 60,
+                sleep_min * 60,
+                stop_event=_tg.stop_event,
+                distribution="uniform",
+            )
+            continue
+
+        # A3/A4: сбрасываем сессионные phone-счётчики в начале цикла.
+        account_state.start_new_session(account_name)
+
+        # ── F8: выбор типа цикла ─────────────────────────────────────────
+        # Не каждый цикл должен быть «полным» (browse + parse + messenger).
+        # Реальный пользователь чаще заходит просто проверить мессенджер
+        # или полистать профиль. См. _pick_cycle_kind для деталей.
+        kind = _pick_cycle_kind(
+            account, cfg, is_warmup=account_state.is_in_warmup(account_name)
+        )
+        log(account_name, f"F8: cycle kind = {kind}")
+
+        if kind == "full":
+            log(account_name, "  Ready to work. Selecting categories...")
+            hp(4, 10)
+            client.browse_commercial_categories()
+            if _tg.stop_event.is_set():
+                break
+
+            processed, new_listings, errors = client.find_and_view_commercial_listings()
+            log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
+            if _tg.stop_event.is_set():
+                break
+
+            client.process_messages()
+            if _tg.stop_event.is_set():
+                break
+
+        elif kind == "messenger_only":
+            # F8: только мессенджер. Имитирует «зашёл с пуша/прочитать».
+            client.process_messages()
+            if _tg.stop_event.is_set():
+                break
+
+        elif kind == "browse_only":
+            # F8: browse + парс листингов, БЕЗ мессенджера.
+            log(account_name, "  Browse-only cycle...")
+            hp(4, 10)
+            client.browse_commercial_categories()
+            if _tg.stop_event.is_set():
+                break
+
+            processed, new_listings, errors = client.find_and_view_commercial_listings()
+            log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
+            if _tg.stop_event.is_set():
+                break
+
+        elif kind == "profile_check":
+            # F8: «зашёл просто посмотреть свой профиль». Без LLM/сообщений.
+            _do_profile_check(driver, account_name)
+            if _tg.stop_event.is_set():
+                break
+
+        # ── A4: Session pause ───────────────────────────────────────────
+        # После каждого цикла бот делает паузу. Прерывается на stop-сигнал.
+        pause_secs = random.uniform(pause_min * 60, pause_max * 60)
+        next_time = time.strftime("%H:%M", time.localtime(time.time() + pause_secs))
+        log(
+            account_name,
+            f"Цикл завершён. Следующий запуск в ~{next_time} "
+            f"(пауза {pause_secs / 60:.0f} мин).",
+        )
+        _human_delay(
+            pause_secs, pause_secs, stop_event=_tg.stop_event, distribution="uniform"
+        )
+
+
+def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: DatabaseManager):
+    """Точка входа потока-аккаунта. Оркестрирует setup → connect →
+    login → main-loop → cleanup. Каждая стадия вынесена в свой helper
+    выше — это упрощает чтение, тестирование и дальнейшие правки.
+    """
+    account_name = account["name"]
+    user_id = account.get("user_id")
+    driver = None
+
+    # ── Pre-cycle setup ───────────────────────────────────────────────────
+    _apply_per_account_overrides(account)
+    _apply_warmup_if_new(account, account_name)
+    _check_health_and_log(account_name, db_manager)
+
+    # ── A1: Per-account proxy setup ──────────────────────────────────────
     # Приоритет: 1) поле "proxy" в accounts.json, 2) случайный из proxies.txt.
     # Если прокси нет совсем — ERROR в TG (E4) и пропускаем аккаунт, чтобы
     # несколько аккаунтов с одного IP не склеились и не были забанены вместе.
@@ -1437,111 +1726,22 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
         return
 
     try:
-        # Initial connect attempt
-        max_retries = 2
-        for attempt in range(max_retries + 1):
-            try:
-                log(account_name, f"Starting profile (Attempt {attempt + 1})...")
-                debug_port = adspower.start_profile(user_id)
-                time.sleep(5)
-                driver = connect_to_sphere(debug_port)
-                wait = WebDriverWait(driver, 15)
+        # ── Connect (с retry + ротацией прокси) ─────────────────────────
+        connect_result = _connect_with_retry(adspower, user_id, account_name)
+        if connect_result is None:
+            return
+        driver, wait = connect_result
 
-                # Test connection
-                if safe_get(driver, "https://ya.ru", account_name, retries=1):
-                    break  # Success
-                else:
-                    raise Exception("Connection failed")
-            except Exception as e:
-                log(account_name, f"Connection fail: {e}. Rotating proxy...")
-                new_proxy = get_random_proxy()
-                if new_proxy and update_profile_proxy(adspower, user_id, new_proxy):
-                    log(account_name, f"Proxy updated to {new_proxy[:15]}...")
-                adspower.stop_profile(user_id)
-                if attempt == max_retries:
-                    return
-                hp(5, 10)
+        # ── Build AvitoClient (G1 фасад над selenium-flow) ──────────────
+        client = _build_avito_client(driver, wait, account, cfg, db_manager)
 
-        # G1: вся Selenium-логика идёт через AvitoClient. driver/wait
-        # передаём один раз — дальше клиент сам прокидывает их в нужные
-        # реализации. db_manager и llm_classifier нужны для save_listing
-        # и process_messages соответственно (для warmup/login достаточно
-        # только driver+wait).
-        from avito_client import AvitoClient
-
-        llm_config = {
-            "api_key": cfg.get("openai_api_key", ""),
-            "model": cfg.get("openai_model", "gpt-3.5-turbo"),
-            "api_base": cfg.get("openai_api_base", "https://api.openai.com/v1"),
-        }
-        llm = LLMClassifier(llm_config, db_manager=db_manager)
-
-        # F1: вероятности кликов «Избранное»/«Позвонить» в view_listing.
-        # Per-account override → глобальный cfg → дефолт (8% / 5%).
-        _fav_rate = float(
-            account.get("view_listing_favorite_rate",
-                         cfg.get("view_listing_favorite_rate", 0.08))
-        )
-        _call_rate = float(
-            account.get("view_listing_call_rate",
-                         cfg.get("view_listing_call_rate", 0.05))
-        )
-
-        # F2: верхние границы числа листингов/категорий за цикл.
-        # Per-account override → глобальный cfg → дефолт.
-        _max_listings = int(
-            account.get("max_listings_per_search",
-                         cfg.get("max_listings_per_search", 7))
-        )
-        _max_cats = int(
-            account.get("max_categories_per_browse",
-                         cfg.get("max_categories_per_browse", 4))
-        )
-        _max_browse_listings = int(
-            account.get("max_listings_per_browse",
-                         cfg.get("max_listings_per_browse", 4))
-        )
-
-        # F5: реалистичные задержки ответа в мессенджере. Параметры читаются
-        # с приоритетом per-account → cfg → дефолты в AvitoMessenger.__init__.
-        # Любой ключ можно опустить — соответствующий дефолт подхватится.
-        _messenger_cfg: dict = {}
-        for _key in (
-            "min_reply_age_min",
-            "max_reply_age_min",
-            "reply_delay_mu",
-            "reply_delay_sigma",
-            "ignore_new_dialog_chance",
-        ):
-            _full_key = f"messenger_{_key}"
-            _val = account.get(_full_key, cfg.get(_full_key))
-            if _val is not None:
-                _messenger_cfg[_key] = float(_val)
-
-        client = AvitoClient(
-            driver,
-            wait,
-            account_name,
-            log_func=log,
-            db_manager=db_manager,
-            llm_classifier=llm,
-            search_filters=account.get("search_filters"),
-            favorite_rate=_fav_rate,
-            call_rate=_call_rate,
-            max_listings_per_search=_max_listings,
-            max_categories_per_browse=_max_cats,
-            max_listings_per_browse=_max_browse_listings,
-            messenger_config=_messenger_cfg or None,
-        )
-
-        # ── Stage 0: Yandex warmup ──
+        # ── Stage 0: Yandex warmup ──────────────────────────────────────
         if not client.warmup_yandex(num_queries=2):
             log(account_name, "CRITICAL: Warmup failed. Check your IP/Proxy.")
             return
 
-        # ── Stage 1: Login (B4 native -> cookies -> manual phone/password) ──
-        # G1: эту 3-уровневую логику теперь содержит client.login(). См.
-        # avito_client.py:AvitoClient.login для деталей последовательности.
+        # ── Stage 1: Login (B4 native → cookies → manual phone/password) ──
+        # G1: 3-уровневая логика инкапсулирована в client.login().
         if not client.login(
             cookies_path=account.get("cookies_path"),
             phone=account.get("phone"),
@@ -1552,145 +1752,8 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
         if _tg.stop_event.is_set():
             return
 
-        # ── A4: Main cycle loop ─────────────────────────────────────────────
-        # Warmup и Login выполнены выше один раз; дальше гоняем цикл пока не
-        # придёт сигнал stop. После каждого цикла — пауза 30-90 мин (A4).
-        # Per-account параметры: session_pause_min / session_pause_max.
-        _pause_min = float(account.get("session_pause_min", cfg.get("session_pause_min", 30)))
-        _pause_max = float(account.get("session_pause_max", cfg.get("session_pause_max", 90)))
-
-        while not _tg.stop_event.is_set():
-            # ── F7: dead-day — пропускаем сегодняшний день целиком ─────────
-            # Реальный пользователь не работает каждый день: 5% дней пропуск
-            # (×3 в выходные). Решение принимается один раз в сутки
-            # (account_state кэширует ответ по дате).
-            if account_state.is_dead_day(account_name):
-                import datetime as _dt
-
-                _start_hour = int(
-                    account.get("active_hours_start", cfg.get("active_hours_start", 9))
-                )
-                _now = _dt.datetime.now()
-                _tomorrow = (_now + _dt.timedelta(days=1)).replace(
-                    hour=_start_hour, minute=0, second=0, microsecond=0
-                )
-                _wait_secs = max(0.0, (_tomorrow - _now).total_seconds())
-                log(
-                    account_name,
-                    f"F7: сегодня dead-day — спим {_wait_secs / 3600:.1f} ч "
-                    f"до завтра {_start_hour:02d}:00.",
-                )
-                _slept = 0.0
-                while _slept < _wait_secs and not _tg.stop_event.is_set():
-                    _chunk = min(60.0, _wait_secs - _slept)
-                    time.sleep(_chunk)
-                    _slept += _chunk
-                continue
-
-            # ── F6: Probabilistic active hours ────────────────────────────
-            # Каждый цикл бросаем монетку с вероятностью _active_probability:
-            # ночью ~2-5%, утром/вечером ~85-95%. Если выпало больше prob —
-            # пропускаем цикл с обычной session-паузой 30-90 мин. Так и не
-            # видны резкие переходы «работаю в 22:30 / сплю в 23:01».
-            # Совместимость с B2: если active_hours_start/end заданы, ВНЕ
-            # окна prob=0 — поведение строго бинарное, как раньше.
-            _prob = _active_probability(account, cfg)
-            if random.random() > _prob:
-                _hour = time.localtime().tm_hour
-                _sleep_min = random.uniform(_pause_min, _pause_max)
-                _wake_time = time.strftime(
-                    "%H:%M", time.localtime(time.time() + _sleep_min * 60)
-                )
-                log(
-                    account_name,
-                    f"F6: пропуск цикла (час={_hour:02d}, prob={_prob:.2f}). "
-                    f"Следующая попытка через {_sleep_min:.0f} мин (~{_wake_time}).",
-                )
-                _human_delay(
-                    _sleep_min * 60,
-                    _sleep_min * 60,
-                    stop_event=_tg.stop_event,
-                    distribution="uniform",
-                )
-                continue
-
-            # A3/A4: сбрасываем сессионные phone-счётчики в начале цикла.
-            account_state.start_new_session(account_name)
-
-            # ── F8: выбор типа цикла ─────────────────────────────────────────
-            # Не каждый цикл должен быть «полным» (browse + parse + messenger).
-            # Реальный пользователь чаще заходит просто проверить мессенджер
-            # или полистать профиль — и эту вариативность надо имитировать.
-            # См. _pick_cycle_kind для деталей распределения и warmup-mode.
-            kind = _pick_cycle_kind(
-                account, cfg, is_warmup=account_state.is_in_warmup(account_name)
-            )
-            log(account_name, f"F8: cycle kind = {kind}")
-
-            if kind == "full":
-                # ── Stage 2: Browse & Search ──
-                log(account_name, "  Ready to work. Selecting categories...")
-                hp(4, 10)  # Thinking time
-                client.browse_commercial_categories()
-
-                if _tg.stop_event.is_set():
-                    break
-
-                processed, new_listings, errors = client.find_and_view_commercial_listings()
-                log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
-
-                if _tg.stop_event.is_set():
-                    break
-
-                # ── Stage 3: Messages ──
-                client.process_messages()
-
-                if _tg.stop_event.is_set():
-                    break
-
-            elif kind == "messenger_only":
-                # F8: только мессенджер. Имитирует «зашёл с пуша/прочитать».
-                client.process_messages()
-                if _tg.stop_event.is_set():
-                    break
-
-            elif kind == "browse_only":
-                # F8: browse + парс листингов, но БЕЗ мессенджера. Часто бывает
-                # у людей: «Открыл — поискать что есть нового, мессенджер не
-                # лез смотреть».
-                log(account_name, "  Browse-only cycle...")
-                hp(4, 10)
-                client.browse_commercial_categories()
-
-                if _tg.stop_event.is_set():
-                    break
-
-                processed, new_listings, errors = client.find_and_view_commercial_listings()
-                log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
-
-                if _tg.stop_event.is_set():
-                    break
-
-            elif kind == "profile_check":
-                # F8: «зашёл просто посмотреть свой профиль». Никакого парсинга,
-                # никакого LLM, никаких сообщений — только активность сессии.
-                _do_profile_check(driver, account_name)
-                if _tg.stop_event.is_set():
-                    break
-
-            # ── A4: Session pause ───────────────────────────────────────────
-            # После каждого полного цикла бот делает паузу, как реальный пользователь.
-            # Пауза прерывается при получении stop-сигнала (команда /stop в TG).
-            _pause_secs = random.uniform(_pause_min * 60, _pause_max * 60)
-            _next_time = time.strftime("%H:%M", time.localtime(time.time() + _pause_secs))
-            log(
-                account_name,
-                f"Цикл завершён. Следующий запуск в ~{_next_time} "
-                f"(пауза {_pause_secs / 60:.0f} мин).",
-            )
-            _human_delay(
-                _pause_secs, _pause_secs, stop_event=_tg.stop_event, distribution="uniform"
-            )
+        # ── Main loop (F7/F6/F8 + A4 пауза) ─────────────────────────────
+        _run_main_loop(client, driver, account, cfg, account_name)
 
     except Exception:
         # L6: run_thread — top-level потока. Раньше теряли traceback (только
@@ -1704,9 +1767,9 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
             try:
                 driver.quit()
             except WebDriverException:
-                # L7: bare except → WebDriverException. driver.quit() может
-                # упасть при уже закрытом браузере / отвалившемся debug-port.
-                # Любые другие исключения тут — настоящие баги, не глотаем.
+                # L7: driver.quit() может упасть при уже закрытом браузере /
+                # отвалившемся debug-port. Любые другие исключения тут —
+                # настоящие баги, не глотаем.
                 pass
         adspower.stop_profile(user_id)
 
