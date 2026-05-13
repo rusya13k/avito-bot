@@ -685,10 +685,15 @@ class TelegramController:
                         bot.reply_to(message, f"Ошибка чтения файла: {e}")
                         return
                 else:
-                    # Текст JSON
+                    # Текст JSON.
+                    # L10: `or ""` защищает от non-text сообщений (фото без подписи
+                    # и т.п. → message.text=None → AttributeError при .strip()).
+                    # `json.loads("")` сам бросит JSONDecodeError, попадём в общий
+                    # error-path с понятным сообщением для пользователя.
+                    text = (message.text or "").strip()
                     try:
-                        cookies_json = json.loads(message.text.strip())
-                    except Exception:
+                        cookies_json = json.loads(text)
+                    except json.JSONDecodeError:
                         bot.reply_to(
                             message,
                             "Не удалось распознать JSON. "

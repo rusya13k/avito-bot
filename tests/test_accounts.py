@@ -391,6 +391,52 @@ def test_remove_account_returns_false_for_unknown(repo):
     assert (repo / ACCOUNTS_JSON_FILENAME).read_text(encoding="utf-8") != ""
 
 
+# ── L9: автоудаление cookies-файла при remove_account ────────────────────
+
+
+def test_remove_account_deletes_cookies_file(repo):
+    """L9: при удалении аккаунта связанный cookies.json тоже удаляется."""
+    from accounts import remove_account
+
+    cookies_rel = "accounts/acc_x/cookies.json"
+    cookies_abs = repo / cookies_rel
+    cookies_abs.parent.mkdir(parents=True)
+    cookies_abs.write_text("[]", encoding="utf-8")
+
+    _write_accounts(
+        repo,
+        [
+            {"name": "acc_x", "cookies_path": cookies_rel},
+            {"name": "acc_y"},  # без cookies_path — соседний аккаунт
+        ],
+    )
+
+    assert remove_account(repo, "acc_x") is True
+    assert not cookies_abs.exists(), "cookies-файл должен быть удалён вместе с аккаунтом"
+
+
+def test_remove_account_no_cookies_path_does_not_crash(repo):
+    """L9: аккаунт без cookies_path удаляется тихо, без обращения к ФС."""
+    from accounts import remove_account
+
+    _write_accounts(repo, [{"name": "no_cookies"}])
+    # Не должно поднять никаких исключений.
+    assert remove_account(repo, "no_cookies") is True
+
+
+def test_remove_account_missing_cookies_file_does_not_crash(repo):
+    """L9: cookies_path указан, но файла нет — remove_account не падает."""
+    from accounts import remove_account
+
+    _write_accounts(
+        repo,
+        [{"name": "ghost", "cookies_path": "accounts/ghost/cookies.json"}],
+    )
+    # Файла на диске нет — это нормальная ситуация (например, аккаунт
+    # был добавлен, но куки не успели загрузить).
+    assert remove_account(repo, "ghost") is True
+
+
 def test_atomic_write_does_not_leave_temp_files(repo):
     """
     K1: при штатной записи временные .accounts_*.json.tmp не остаются.

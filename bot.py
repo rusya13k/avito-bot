@@ -140,8 +140,53 @@ class AdsPowerAPI:
             requests.get(
                 self._url("/api/v1/browser/stop"), params=params, headers=headers, timeout=15
             )
-        except Exception:
+        except (requests.RequestException, ValueError):
+            # L12: bare → конкретные. RequestException — все сетевые/HTTP ошибки
+            # requests, ValueError — на случай invalid params/url. Stop — fire-and-
+            # forget, нам всё равно нечего делать с ошибкой; лог только в DEBUG.
             pass
+
+    def update_proxy(self, user_id: str, proxy_str: str) -> bool:
+        """L11: устанавливает прокси для AdsPower-профиля через REST API.
+
+        proxy_str format: ``host:port[:user:pass]`` (host:port минимум,
+        опционально логин/пароль). Кодирование в `user_proxy_config` —
+        как требует AdsPower (proxy_soft=other, proxy_type=socks5).
+
+        Returns:
+            True при успехе (`code == 0`), False иначе (включая сетевые
+            ошибки и невалидный JSON в ответе). Ошибки молча подавляются —
+            вызывающий код имеет fallback (см. `_apply_account_proxy`).
+        """
+        parts = proxy_str.split(":")
+        if len(parts) < 2:
+            return False
+
+        proxy_config = {
+            "proxy_soft": "other",
+            "proxy_type": "socks5",  # or http
+            "proxy_host": parts[0],
+            "proxy_port": parts[1],
+        }
+        if len(parts) >= 4:
+            proxy_config["proxy_user"] = parts[2]
+            proxy_config["proxy_password"] = parts[3]
+
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        payload = {"user_id": user_id, "user_proxy_config": proxy_config}
+
+        try:
+            r = requests.post(
+                self._url("/api/v1/user/update"),
+                json=payload,
+                headers=headers,
+                timeout=15,
+            )
+            return r.json().get("code") == 0
+        except (requests.RequestException, ValueError):
+            # RequestException — сетевые ошибки, ValueError — если AdsPower
+            # вернул не-JSON.
+            return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -569,34 +614,14 @@ def _pick_queries(num: int) -> list[str]:
 
 
 def update_profile_proxy(adspower_api, user_id, proxy_str):
-    """Updates the proxy for an AdsPower profile via API."""
-    # Expected proxy_str format: host:port:user:pass or host:port
-    parts = proxy_str.split(":")
-    if len(parts) < 2:
-        return False
+    """L11: тонкая обёртка над `AdsPowerAPI.update_proxy` (back-compat).
 
-    proxy_config = {
-        "proxy_soft": "other",
-        "proxy_type": "socks5",  # or http
-        "proxy_host": parts[0],
-        "proxy_port": parts[1],
-    }
-    if len(parts) >= 4:
-        proxy_config["proxy_user"] = parts[2]
-        proxy_config["proxy_password"] = parts[3]
-
-    # AdsPower API endpoint for updating profile
-    url = f"{adspower_api.base}/api/v1/user/update"
-    headers = {"Authorization": f"Bearer {adspower_api.api_key}"} if adspower_api.api_key else {}
-    payload = {"user_id": user_id, "user_proxy_config": proxy_config}
-
-    try:
-        r = requests.post(url, json=payload, headers=headers, timeout=15)
-        return r.json().get("code") == 0
-    except (requests.RequestException, ValueError):
-        # L2: bare except → конкретные. RequestException — сетевые ошибки,
-        # ValueError — если AdsPower вернул не-JSON.
-        return False
+    Раньше функция сама лезла в `adspower_api.base` / `adspower_api.api_key`,
+    дублируя URL-сборку. Теперь это инкапсулировано в методе. Wrapper
+    оставлен для обратной совместимости с существующими тестами
+    (`tests/test_proxy.py`), которые мокают `bot.update_profile_proxy`.
+    """
+    return adspower_api.update_proxy(user_id, proxy_str)
 
 
 def yandex_warmup(driver, wait, account_name, num_queries=2):

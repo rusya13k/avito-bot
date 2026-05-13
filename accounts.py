@@ -369,16 +369,38 @@ def remove_account(
     """
     K1: удалить аккаунт по имени.
 
+    L9: при удалении заодно чистим связанный cookies-файл
+    (`acc["cookies_path"]`, если задан и существует). Иначе при создании
+    одноимённого аккаунта в будущем мы бы автоматически подсосали старые
+    куки — путаница при дебаге и потенциальная утечка авторизации.
+
+    Файл удаляем ВНЕ лока на accounts.json: основная запись (удаление
+    из списка) уже зафиксирована, ошибка очистки куки ничего критичного
+    не ломает (только лог).
+
     Returns:
         True, если был удалён; False, если такого имени не было.
     """
     repo_dir = Path(repo_dir)
     with _WRITE_LOCK:
         all_accs = load_all_accounts(repo_dir, cfg)
-        new_accs = [a for a in all_accs if a["name"] != name]
-        if len(new_accs) == len(all_accs):
+        target = next((a for a in all_accs if a["name"] == name), None)
+        if target is None:
             return False
+        new_accs = [a for a in all_accs if a["name"] != name]
         _atomic_write(repo_dir, new_accs)
+
+    # L9: cleanup cookies-файла за пределами лока.
+    cookies_rel = target.get("cookies_path")
+    if isinstance(cookies_rel, str) and cookies_rel.strip():
+        cookies_abs = repo_dir / cookies_rel
+        try:
+            if cookies_abs.is_file():
+                cookies_abs.unlink()
+                logger.info("L9: удалён cookies-файл %s", cookies_abs)
+        except OSError as exc:
+            logger.warning("L9: не удалось удалить cookies-файл %s: %s", cookies_abs, exc)
+
     return True
 
 
