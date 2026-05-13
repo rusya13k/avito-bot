@@ -68,15 +68,21 @@ DEFAULT_CAPTCHA_COOLDOWN_MINUTES = 30
 # или per-account в accounts.json (те же ключи).
 DEFAULT_DAILY_BUDGET: dict[str, int] = {
     "listings": 80,  # листингов в день
-    "messages": 30,  # сообщений в день
+    "messages": 30,  # сообщений в день (reactive replies)
     "phone": 25,  # кликов "Показать телефон" в день
+    # H1: outbound — proactive контакты к собственникам. Отдельный лимит
+    # от messages (которые reactive). Дефолт 10 — реалистичная safe цифра
+    # для долгожительства аккаунта (см. HANDOFF.md). Можно повысить
+    # per-account через accounts.json["daily_budget_outbound"].
+    "outbound": 10,
 }
 
 # Метрики в БД, соответствующие действиям (для get_metrics-запроса).
 _BUDGET_METRIC_MAP: dict[str, str] = {
     "listings": "listings_parsed",
     "messages": "messages_sent",
-    "phone": "phone_clicks",  # новая метрика (A3)
+    "phone": "phone_clicks",  # A3
+    "outbound": "outbound_initiated",  # H1: бот пишет собственнику первым
 }
 
 
@@ -111,7 +117,7 @@ def configure_from_cfg(cfg: dict) -> None:
                 logger.info("captcha_cooldown_minutes = %s min", value)
 
     # A2: глобальные дефолты дневных бюджетов из config.json
-    for action in ("listings", "messages", "phone"):
+    for action in ("listings", "messages", "phone", "outbound"):
         key = f"daily_budget_{action}"
         raw_budget = cfg.get(key)
         if raw_budget is not None:
@@ -305,7 +311,7 @@ class AccountState:
                 long_until = tomorrow.timestamp()
                 entry.cooldown_until = max(entry.cooldown_until, long_until)
                 # Бюджеты вдвое — чтобы завтра не нагружать так же
-                for action in ("listings", "messages", "phone"):
+                for action in ("listings", "messages", "phone", "outbound"):
                     cur = entry.daily_budget_overrides.get(
                         action, DEFAULT_DAILY_BUDGET.get(action, 80)
                     )
@@ -873,7 +879,9 @@ class AccountState:
         )
         with self._lock:
             entry = self._get(account_name)
-            for action in ("listings", "messages", "phone"):
+            # H1: outbound тоже урезаем — это самый рискованный канал, при
+            # ухудшении здоровья режем агрессивно (×0.5).
+            for action in ("listings", "messages", "phone", "outbound"):
                 cur_limit = self._get_limit(account_name, action)
                 entry.daily_budget_overrides[action] = max(
                     1, int(cur_limit * _HEALTH_DEGRADED_BUDGET_FACTOR)

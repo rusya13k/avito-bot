@@ -656,20 +656,26 @@ def update_profile_proxy(adspower_api, user_id, proxy_str):
 # в профиль. Бот не должен ВСЕГДА делать «полный цикл» (browse + parse +
 # messenger) — это сильнейший behavioral fingerprint.
 _CYCLE_KINDS_DEFAULT: dict[str, float] = {
-    "full": 0.55,            # warmup → browse → find_and_view → messenger (как сейчас)
-    "messenger_only": 0.20,  # только мессенджер
-    "browse_only": 0.15,     # browse + find_and_view, без messenger
-    "profile_check": 0.10,   # просто заходим в /profile, никаких действий
+    "full": 0.40,            # warmup → browse → find_and_view → messenger
+    "messenger_only": 0.15,  # только мессенджер (reactive replies)
+    "browse_only": 0.10,     # browse + find_and_view, без messenger
+    "profile_check": 0.05,   # просто заходим в /profile
+    # H1: outbound — proactive контакты к собственникам по уже распарсенным
+    # листингам. Самый «продуктовый» режим — даёт основные leads. Доля 30%
+    # обеспечивает ~3-4 outbound-цикла в день (см. F7/F6 reduction); при
+    # max_per_cycle=2-3 это дает 6-12 outbound/день в нормальном режиме.
+    "outbound_only": 0.30,
 }
 
 # Распределение для warmup-режима (B1): аккаунт пока не должен слать
 # сообщений (messenger_only=0) и стараемся НЕ парсить много — больше
-# спокойных profile_check / browse_only.
+# спокойных profile_check / browse_only. outbound тоже выключен.
 _CYCLE_KINDS_WARMUP: dict[str, float] = {
     "full": 0.20,
     "messenger_only": 0.0,
     "browse_only": 0.40,
     "profile_check": 0.40,
+    "outbound_only": 0.0,  # H1: в warmup-режим outbound заблокирован
 }
 
 
@@ -1687,6 +1693,16 @@ def _run_main_loop(
         elif kind == "profile_check":
             # F8: «зашёл просто посмотреть свой профиль». Без LLM/сообщений.
             _do_profile_check(driver, account_name)
+            if _tg.stop_event.is_set():
+                break
+
+        elif kind == "outbound_only":
+            # H1: proactive контакты — пишем 1-3 собственникам по их листингам.
+            # Свой класс OutboundMessenger (см. outbound_messenger.py),
+            # max_per_cycle, min_listing_age и паузы конфигурируются
+            # per-account через accounts.json. В warmup outbound_only
+            # никогда не выпадает (вес 0 в _CYCLE_KINDS_WARMUP).
+            client.run_outbound_cycle(account=account)
             if _tg.stop_event.is_set():
                 break
 

@@ -222,6 +222,27 @@ class DatabaseManager:
                 )
             """)
 
+            # H1: журнал outbound-контактов (бот пишет первым собственнику).
+            # Главное: GLOBAL dedup по profile_id — никогда не пишем одному
+            # собственнику ДВАЖДЫ, даже разными аккаунтами. Это критично для
+            # "стелс" — собственник видит спам только если 2+ аккаунтов
+            # пишут ему одно и то же предложение. UNIQUE(profile_id) делает
+            # это защитой на уровне БД, а не только на уровне приложения.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS outbound_contacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_id TEXT NOT NULL UNIQUE,
+                    account_name TEXT NOT NULL,
+                    listing_id INTEGER,
+                    listing_url TEXT,
+                    contacted_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'sent',
+                    persona TEXT,
+                    message_text TEXT,
+                    FOREIGN KEY(listing_id) REFERENCES listings(id)
+                )
+            """)
+
             # Create indexes for better performance.
             # ВАЖНО: индексы по "новым" колонкам (profile_id, phone) создаются
             # в _migrate_database() ПОСЛЕ ALTER TABLE, чтобы не падать на
@@ -309,6 +330,30 @@ class DatabaseManager:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_metrics_bucket "
                 "ON metrics(bucket_hour, account_name, metric)"
+            )
+
+            # H1: для старых БД создаём outbound_contacts через миграцию.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS outbound_contacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_id TEXT NOT NULL UNIQUE,
+                    account_name TEXT NOT NULL,
+                    listing_id INTEGER,
+                    listing_url TEXT,
+                    contacted_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'sent',
+                    persona TEXT,
+                    message_text TEXT,
+                    FOREIGN KEY(listing_id) REFERENCES listings(id)
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outbound_account "
+                "ON outbound_contacts(account_name, contacted_at)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outbound_listing "
+                "ON outbound_contacts(listing_id)"
             )
 
             # C3: captcha_log — идемпотентно для старых БД
@@ -1141,3 +1186,132 @@ class DatabaseManager:
             columns = [d[0] for d in cursor.description]
             results = [dict(zip(columns, row)) for row in rows]
             return results[::-1]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # H1: Outbound contacts (proactive: бот пишет собственнику первым)
+    # ──────────────────────────────────────────────────────────────────────
+    # Главное правило: НИКОГДА не пишем одному profile_id дважды, даже
+    # с разных аккаунтов. UNIQUE(profile_id) в схеме делает это hard
+    # constraint на уровне БД — нельзя случайно «забыть» проверить.
+
+    def was_owner_contacted(self, profile_id: str) -> bool:
+        """H1: проверка глобального dedup. True если К ЛЮБОМУ из наших
+        аккаунтов уже отправляли первое сообщение этому собственнику.
+        Используется в outbound_messenger перед попыткой написать.
+        """
+        if not profile_id:
+            return False
+        with self._cursor() as cursor:
+            cursor.execute(
+                "SELECT 1 FROM outbound_contacts WHERE profile_id = ? LIMIT 1",
+                (profile_id,),
+            )
+            return cursor.fetchone() is not None
+
+    def record_outbound(
+        self,
+        account_name: str,
+        profile_id: str,
+        listing_id: int | None = None,
+        listing_url: str | None = None,
+        status: str = "sent",
+        persona: str | None = None,
+        message_text: str | None = None,
+        cursor=None,
+    ) -> bool:
+        """H1: записать факт outbound-контакта. Возвращает True если
+        запись создана, False если profile_id уже был контактирован
+        (UNIQUE constraint hit — race condition между потоками).
+
+        Хранится: какой аккаунт писал, по какому листингу, когда, какой
+        текст и от какой персоны (для пост-анализа эффективности).
+
+        message_text сохраняется для аналитики/анти-спама — если потом
+        захотим увидеть какие шаблоны имеют наилучший response rate.
+        Содержит реальный отправленный текст (не sanitized — sanitizer
+        отрезает запрещённые поля но не меняет «smell»).
+        """
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        sql = """
+            INSERT OR IGNORE INTO outbound_contacts
+                (profile_id, account_name, listing_id, listing_url,
+                 contacted_at, status, persona, message_text)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        params = (
+            profile_id,
+            account_name,
+            listing_id,
+            listing_url,
+            timestamp,
+            status,
+            persona,
+            message_text,
+        )
+        if cursor is not None:
+            cursor.execute(sql, params)
+            return cursor.rowcount > 0
+        with self._cursor(write=True) as cur:
+            cur.execute(sql, params)
+            return cur.rowcount > 0
+
+    def get_owners_to_contact(
+        self, account_name: str, limit: int = 10, *, min_age_hours: float = 0.0
+    ) -> list:
+        """H1: вернуть кандидатов для outbound от этого аккаунта.
+
+        Критерии:
+          - listing.classification = 'owner'
+          - listing.profile_id NOT NULL и НЕ в outbound_contacts
+          - listing.parse_status = 'ok' (исключаем captcha/error)
+          - Опционально: листинг старше min_age_hours (свежие листинги
+            подождать чтобы не выглядеть как «бот, сразу пишущий»).
+
+        Сортировка по date_scraped DESC: сначала более свежие (но не
+        слишком — фильтр min_age_hours отрежет «только что распарсенные»).
+
+        Возвращает list[dict] с полями: id, url, title, profile_id,
+        seller_name, location, area, price, description, category.
+        """
+        cutoff = None
+        if min_age_hours > 0:
+            cutoff = time.strftime(
+                "%Y-%m-%d %H:%M:%S",
+                time.localtime(time.time() - min_age_hours * 3600),
+            )
+        with self._cursor() as cursor:
+            sql = """
+                SELECT id, url, title, profile_id, seller_name, location,
+                       area, price, description, category
+                FROM listings
+                WHERE classification = 'owner'
+                  AND profile_id IS NOT NULL
+                  AND profile_id != ''
+                  AND profile_id != 'unknown'
+                  AND (parse_status IS NULL OR parse_status = 'ok')
+                  AND profile_id NOT IN (SELECT profile_id FROM outbound_contacts)
+            """
+            params: list = []
+            if cutoff is not None:
+                sql += " AND date_scraped <= ?"
+                params.append(cutoff)
+            sql += " ORDER BY date_scraped DESC LIMIT ?"
+            params.append(limit)
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            columns = [d[0] for d in cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+
+    def get_outbound_count_today(self, account_name: str) -> int:
+        """H1: сколько outbound-контактов аккаунт сделал сегодня.
+        Используется для проверки дневного бюджета перед каждым новым
+        контактом (доп. защита помимо metrics).
+        """
+        today = time.strftime("%Y-%m-%d")
+        with self._cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) FROM outbound_contacts "
+                "WHERE account_name = ? AND contacted_at LIKE ?",
+                (account_name, f"{today}%"),
+            )
+            return int(cursor.fetchone()[0])

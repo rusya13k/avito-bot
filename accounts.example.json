@@ -41,6 +41,13 @@
     "messenger_reply_delay_sigma": 1.0,
     "messenger_ignore_new_dialog_chance": 0.05,
     "dead_day_rate": 0.05,
+    "_comment_h1": "H1: outbound (proactive — пишем собственникам коммерческой недвижимости первыми)",
+    "persona": "small_business_office",
+    "daily_budget_outbound": 10,
+    "outbound_max_per_cycle": 2,
+    "outbound_listing_min_age_hours": 1.0,
+    "outbound_between_messages_min_sec": 90.0,
+    "outbound_between_messages_max_sec": 240.0,
     "activity_pattern": {
       "0": 0.02, "1": 0.01, "2": 0.01, "3": 0.005, "4": 0.005,
       "5": 0.01, "6": 0.05, "7": 0.20, "8": 0.40,

@@ -13,6 +13,7 @@
   "daily_budget_listings": 80,
   "daily_budget_messages": 30,
   "daily_budget_phone": 25,
+  "daily_budget_outbound": 10,
   "session_pause_min": 30,
   "session_pause_max": 90,
   "active_hours_start": 9,

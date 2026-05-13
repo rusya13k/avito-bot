@@ -501,3 +501,76 @@ class AvitoClient:
             **self.messenger_config,
         )
         messenger.process_messages(self.log)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # H1: Outbound (proactive контакты к собственникам)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def run_outbound_cycle(self, account: dict | None = None) -> int:
+        """H1: один цикл proactive-outreach по собственникам коммерческой
+        недвижимости. Бот сам идёт по уже-распарсенным листингам класса
+        'owner' и пишет ИХ собственникам первое сообщение (LLM-сгенерированное
+        с учётом персоны аккаунта).
+
+        Защиты:
+        - Глобальный dedup в БД (UNIQUE profile_id в outbound_contacts):
+          никогда не пишем одному собственнику дважды, даже разными аккаунтами.
+        - В warmup outbound отключён (cycle_dispatch не выпадает + budget=0).
+        - При degraded/critical health бюджет режется ×0.5 (как messages).
+        - LLM-sanitizer вырезает phone/email/url/messenger перед отправкой.
+        - Pre/post-click captcha checks → mark_captcha при попадании.
+
+        Параметры outbound (per-account через accounts.json, fallback config):
+            outbound_max_per_cycle (default 2)
+            outbound_listing_min_age_hours (default 1.0)
+            outbound_between_messages_min_sec / max_sec
+        """
+        if self.db is None:
+            self.log(self.account_name, "H1: outbound пропущен — нет db_manager.")
+            return 0
+
+        from account_state import account_state as _astate
+
+        if _astate.is_in_warmup(self.account_name):
+            self.log(self.account_name, "B1: warmup — outbound пропускаем.")
+            return 0
+
+        # A2 budget на outbound (отдельный от messages).
+        used = self.db.get_outbound_count_today(self.account_name)
+        try:
+            limit = _astate.get_effective_limit(self.account_name, "outbound")
+        except Exception:
+            limit = 10
+        # C2-алерт через стандартный механизм
+        try:
+            _astate.check_budget_alert(self.account_name, "outbound", used)
+        except Exception:
+            pass
+        if used >= limit:
+            self.log(
+                self.account_name,
+                f"A2/H1: outbound {used}/{limit} — лимит исчерпан, пропускаем.",
+            )
+            return 0
+
+        from outbound_messenger import OutboundMessenger
+
+        acc = account or {"name": self.account_name}
+        max_per_cycle = int(acc.get("outbound_max_per_cycle", 2))
+        listing_min_age_hours = float(acc.get("outbound_listing_min_age_hours", 1.0))
+        between_min = float(acc.get("outbound_between_messages_min_sec", 90.0))
+        between_max = float(acc.get("outbound_between_messages_max_sec", 240.0))
+
+        m = OutboundMessenger(
+            self.driver,
+            self.wait,
+            self.account_name,
+            account=acc,
+            db_manager=self.db,
+            llm_classifier=self.llm,
+            max_per_cycle=max_per_cycle,
+            listing_min_age_hours=listing_min_age_hours,
+            between_messages_min_sec=between_min,
+            between_messages_max_sec=between_max,
+        )
+        return m.run_one_cycle(self.log)
