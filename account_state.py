@@ -192,6 +192,16 @@ class _Entry:
     # рестарта максимум один раз ответим «сразу», что не страшно.
     ignored_dialogs: set = field(default_factory=set)
 
+    # ── F7: random «dead days» ────────────────────────────────────────────
+    # Per-account override базовой вероятности dead-day. None ⇒ глобальный
+    # дефолт 0.05 (плюс ×3 boost в выходные). Задаётся через accounts.json
+    # ключ "dead_day_rate" (см. bot.run_thread).
+    dead_day_rate: float | None = None
+    # Кэш решения "сегодня — выходной?" — формат {"date": "YYYY-MM-DD",
+    # "is_dead": bool}. Бросок монетки делается ОДИН раз в день при первом
+    # вызове is_dead_day; все последующие вызовы возвращают то же решение.
+    dead_day_decision: dict = field(default_factory=dict)
+
 
 class AccountState:
     """
@@ -400,6 +410,62 @@ class AccountState:
             if entry is None:
                 return False
             return time.time() < entry.warmup_until
+
+    # ──────────────────────────────────────────────────────────────────────
+    # F7: random «dead days»
+    # ──────────────────────────────────────────────────────────────────────
+
+    def set_account_dead_day_rate(self, account_name: str, rate: float | None) -> None:
+        """
+        F7: per-account override базовой вероятности dead-day. None ⇒
+        используется глобальный дефолт 0.05.
+        """
+        with self._lock:
+            self._get(account_name).dead_day_rate = (
+                None if rate is None else float(rate)
+            )
+
+    def is_dead_day(self, account_name: str) -> bool:
+        """
+        F7: True, если сегодня объявлен «выходным» для аккаунта.
+
+        Реальный пользователь не работает каждый день: иногда отпуск,
+        иногда забыл зайти, иногда выходной. Бот, работающий 365 дней
+        без пропуска, — палевный паттерн.
+
+        Решение принимается один раз в день (по local-date) при первом
+        обращении и кэшируется до смены даты. Так все последующие вызовы
+        в течение суток вернут то же решение, а run_thread сможет уверенно
+        пропустить день без риска оживить аккаунт через несколько часов.
+
+        Веса:
+          - base = entry.dead_day_rate (per-account) или 0.05 (default).
+          - В выходные (Sat/Sun по локальному времени) base × 3 — у
+            риелторов суббота/воскресенье часто полностью пустые.
+        """
+        today = time.strftime("%Y-%m-%d")
+        with self._lock:
+            entry = self._get(account_name)
+            cached = entry.dead_day_decision
+            if cached and cached.get("date") == today:
+                return bool(cached.get("is_dead", False))
+
+            base = entry.dead_day_rate if entry.dead_day_rate is not None else 0.05
+            weekday = time.localtime().tm_wday  # 0=Mon … 5=Sat, 6=Sun
+            rate = base * 3 if weekday in (5, 6) else base
+            is_dead = random.random() < rate
+            entry.dead_day_decision = {"date": today, "is_dead": is_dead}
+            return is_dead
+
+    def force_dead_day(self, account_name: str) -> None:
+        """
+        F7: TG /skipday — принудительно ставит сегодняшний день как dead
+        для аккаунта. Полезно когда админ видит, что аккаунт нагружен/нагрелся,
+        и хочет дать ему день отдыха без перезапуска.
+        """
+        today = time.strftime("%Y-%m-%d")
+        with self._lock:
+            self._get(account_name).dead_day_decision = {"date": today, "is_dead": True}
 
     # ──────────────────────────────────────────────────────────────────────
     # F5b: «навсегда игнорированные» диалоги (5% от новых)

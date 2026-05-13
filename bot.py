@@ -1298,6 +1298,11 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
         account_name, account.get("captcha_cooldown_minutes")
     )
 
+    # F7: per-account override базовой вероятности dead-day. None — глобальный
+    # default (5% базы, ×3 в выходные). Может быть переопределён через
+    # accounts.json ключ "dead_day_rate" (или 0 чтобы выключить).
+    account_state.set_account_dead_day_rate(account_name, account.get("dead_day_rate"))
+
     # A2: применяем per-account дневные бюджеты из accounts.json.
     # Ключи: daily_budget_listings / daily_budget_messages / daily_budget_phone.
     # Значение None → не переопределяем (используем глобальный дефолт).
@@ -1494,6 +1499,33 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
         _pause_max = float(account.get("session_pause_max", cfg.get("session_pause_max", 90)))
 
         while not _tg.stop_event.is_set():
+            # ── F7: dead-day — пропускаем сегодняшний день целиком ─────────
+            # Реальный пользователь не работает каждый день: 5% дней пропуск
+            # (×3 в выходные). Решение принимается один раз в сутки
+            # (account_state кэширует ответ по дате).
+            if account_state.is_dead_day(account_name):
+                import datetime as _dt
+
+                _start_hour = int(
+                    account.get("active_hours_start", cfg.get("active_hours_start", 9))
+                )
+                _now = _dt.datetime.now()
+                _tomorrow = (_now + _dt.timedelta(days=1)).replace(
+                    hour=_start_hour, minute=0, second=0, microsecond=0
+                )
+                _wait_secs = max(0.0, (_tomorrow - _now).total_seconds())
+                log(
+                    account_name,
+                    f"F7: сегодня dead-day — спим {_wait_secs / 3600:.1f} ч "
+                    f"до завтра {_start_hour:02d}:00.",
+                )
+                _slept = 0.0
+                while _slept < _wait_secs and not _tg.stop_event.is_set():
+                    _chunk = min(60.0, _wait_secs - _slept)
+                    time.sleep(_chunk)
+                    _slept += _chunk
+                continue
+
             # ── B2: Активное окно времени ─────────────────────────────────
             # Если текущий час вне [active_hours_start, active_hours_end)
             # — ждём до начала окна, проверяя stop_event каждые 30 сек.

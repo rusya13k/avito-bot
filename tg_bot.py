@@ -639,6 +639,37 @@ class TelegramController:
                 logger.exception("cmd_warmup failed")
                 bot.reply_to(message, f"Ошибка: {exc}")
 
+        # F7: пропуск дня для аккаунта.
+        # Синтаксис: /skipday <account_name>
+        # Пометит сегодняшний день как dead → следующая итерация цикла
+        # увидит is_dead_day=True и проспит до завтрашнего active_hours_start.
+        @bot.message_handler(commands=["skipday"])
+        def cmd_skipday(message):
+            if not self._allowed(message.from_user.id):
+                bot.reply_to(message, "Нет доступа.")
+                return
+            try:
+                from account_state import account_state as _astate
+
+                parts = (message.text or "").split()
+                if len(parts) < 2:
+                    bot.reply_to(
+                        message,
+                        "Использование: /skipday <имя_аккаунта>\n"
+                        "Помечает сегодняшний день как «выходной» — аккаунт "
+                        "проспит до завтрашнего active_hours_start.",
+                    )
+                    return
+                name = parts[1]
+                _astate.force_dead_day(name)
+                bot.reply_to(
+                    message,
+                    f"😴 '{name}': сегодня dead-day. Пропуск до завтра.",
+                )
+            except Exception as exc:
+                logger.exception("cmd_skipday failed")
+                bot.reply_to(message, f"Ошибка: {exc}")
+
         # ── Текстовый ввод (диалоговые состояния) ────────────────────────────
         @bot.message_handler(
             content_types=["text", "document"], func=lambda m: m.chat.id in self._state
