@@ -346,7 +346,11 @@ def scroll_gallery(driver, wait):
     except Exception:
         return
     hp(3, 7)
-    for _ in range(20):
+    # F10: число пролистываний — случайное (1..12) вместо фикс 20. Реальный
+    # пользователь часто смотрит первые 1-3 фото и закрывает; иногда листает
+    # все. Фиксированные 20 — паттерн.
+    iters = random.randint(1, 12)
+    for _ in range(iters):
         btns = driver.find_elements(
             By.XPATH,
             "//*[@data-marker='image-frame/next'] | "
@@ -442,8 +446,10 @@ def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.
         log(account_name, "  F9: неинтересно, закрываем")
         return True
 
-    # Natural behavior: scroll, maybe check photos, scroll more
-    scroll_gallery(driver, wait)
+    # F10: галерея смотрится не каждый раз (60% probability). Реальный
+    # пользователь часто смотрит только первое фото и идёт дальше.
+    if random.random() < 0.60:
+        scroll_gallery(driver, wait)
 
     # Random sequence of interactions
     actions = ["scroll", "mouse_move", "pause", "scroll_to_desc"]

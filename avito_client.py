@@ -314,7 +314,24 @@ class AvitoClient:
         E2: search_filters (self.search_filters) прокидывается автоматически,
         если явно не передан через kwargs.
         F1: favorite_rate / call_rate из self прокидываются автоматически.
+        F12: дневной бюджет на "listings" проверяется ДО входа в browse —
+        раньше браузер открывал 3 категории × 3 листинга = 9 листингов
+        мимо A2-счётчика, и реальное превышение лимита было ~10-15%.
         """
+        # F12: budget guard — если на сегодня лимит листингов исчерпан,
+        # пропускаем browse (он всё равно листает листинги). find_and_view
+        # уже умеет это проверять — здесь повторяем для browse, иначе цикл
+        # «browse → find_and_view» превышает лимит за счёт browse-листингов.
+        if self.db is not None:
+            from account_state import account_state as _astate
+
+            if not _astate.check_daily_budget(self.account_name, "listings", self.db):
+                self.log(
+                    self.account_name,
+                    "F12: Дневной лимит листингов исчерпан — пропускаем browse.",
+                )
+                return None
+
         from bot import browse_commercial_categories
 
         kwargs.setdefault("search_filters", self.search_filters or None)

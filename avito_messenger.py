@@ -147,6 +147,31 @@ def human_type(element, text):
     return True
 
 
+# F11: Variable number of dialogs to process per messenger-cycle.
+# Веса смещены к 1-3 (короткие сессии), редко 5-7 (зашёл «прочитать всё»).
+# Индекс = число диалогов; weights[0] = 0 (никогда не «0 диалогов» —
+# в этой ветке мы уже знаем что хотя бы один диалог найден).
+_DIALOG_COUNT_WEIGHTS = [0, 0.30, 0.25, 0.20, 0.10, 0.08, 0.05, 0.02]  # idx 0..7
+
+
+def _pick_dialog_count(available: int) -> int:
+    """F11: возвращает число диалогов для обработки в этой сессии.
+
+    available — сколько диалогов реально найдено на странице мессенджера.
+    Возвращаемое значение всегда ≥ 1 (если available ≥ 1) и ≤ available.
+
+    Распределение из _DIALOG_COUNT_WEIGHTS, обрезанное до доступного
+    диапазона. Если available > 7 — обрабатываем максимум 7 за цикл (длинный
+    хвост распределения отсекаем; на следующем цикле снова бросок).
+    """
+    if available <= 0:
+        return 0
+    effective_max = min(available, len(_DIALOG_COUNT_WEIGHTS) - 1)
+    weights = _DIALOG_COUNT_WEIGHTS[: effective_max + 1]
+    n = random.choices(range(len(weights)), weights=weights)[0]
+    return max(1, n)  # гарантируем ≥ 1
+
+
 class AvitoMessenger:
     def __init__(
         self,
@@ -205,8 +230,14 @@ class AvitoMessenger:
             dialogs = self.driver.find_elements(By.XPATH, "//*[@data-marker='messenger/chat-item']")
             log_func(self.account_name, f"Found {len(dialogs)} dialogs.")
 
-            # For simplicity, we'll process the first 5 dialogs
-            for i in range(min(5, len(dialogs))):
+            # F11: Variable number of dialogs to process per cycle.
+            # Реальный пользователь не всегда читает первые 5 подряд: часто
+            # 1-3 (короткая сессия) и редко 5-7 (зашёл «прочитать всё»).
+            # Веса: пик на 1-3, длинный хвост до 7.
+            n_dialogs = _pick_dialog_count(len(dialogs))
+            log_func(self.account_name, f"F11: planning to process {n_dialogs} dialog(s).")
+
+            for i in range(n_dialogs):
                 if _stopping():
                     log_func(self.account_name, "Stop requested — aborting messenger loop.")
                     return
