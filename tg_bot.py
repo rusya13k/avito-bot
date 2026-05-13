@@ -303,6 +303,22 @@ class TelegramController:
             text = "...\n" + text[-3997:]
         self.bot.send_message(chat_id, text, **kwargs)
 
+    def _edit_or_send(self, chat_id, message_id, text, kb=None) -> None:
+        """S2: пытается edit_message_text для inline-кнопок (обновляет
+        существующее сообщение); при провале — _send нового сообщения.
+
+        Telegram падает при попытке edit'а старого сообщения (старше 48ч),
+        чужого сообщения, или при отсутствии permissions. В этих случаях
+        просто отправляем новое — пользователь увидит ту же информацию.
+
+        Используется в callback-handler'ах (после клика inline-кнопки)
+        и в _show_*-методах (когда edit_msg передан).
+        """
+        try:
+            self.bot.edit_message_text(text, chat_id, message_id, reply_markup=kb)
+        except Exception:
+            self._send(chat_id, text, kb)
+
     # ── Экраны-меню (вызываются из команд и callback) ─────────────────────────
 
     def _show_main(self, chat_id, edit_msg=None):
@@ -313,13 +329,8 @@ class TelegramController:
             f"Потоков: {sum(1 for t in active_threads if t.is_alive())}"
         )
         if edit_msg:
-            try:
-                self.bot.edit_message_text(
-                    text, edit_msg.chat.id, edit_msg.message_id, reply_markup=kb_main()
-                )
-                return
-            except Exception:
-                pass
+            self._edit_or_send(edit_msg.chat.id, edit_msg.message_id, text, kb_main())
+            return
         self._send(chat_id, text, kb_main())
 
     def _accounts(self) -> list:
@@ -342,26 +353,20 @@ class TelegramController:
         accs = self._accounts()
         text = f"Аккаунты ({len(accs)}):"
         if edit_msg:
-            try:
-                self.bot.edit_message_text(
-                    text, edit_msg.chat.id, edit_msg.message_id, reply_markup=kb_accounts(accs)
-                )
-                return
-            except Exception:
-                pass
+            self._edit_or_send(
+                edit_msg.chat.id, edit_msg.message_id, text, kb_accounts(accs)
+            )
+            return
         self._send(chat_id, text, kb_accounts(accs))
 
     def _show_proxies(self, chat_id, edit_msg=None):
         proxies = self._proxies()
         text = f"Прокси ({len(proxies)}):\n(нажми на прокси чтобы удалить)"
         if edit_msg:
-            try:
-                self.bot.edit_message_text(
-                    text, edit_msg.chat.id, edit_msg.message_id, reply_markup=kb_proxies(proxies)
-                )
-                return
-            except Exception:
-                pass
+            self._edit_or_send(
+                edit_msg.chat.id, edit_msg.message_id, text, kb_proxies(proxies)
+            )
+            return
         self._send(chat_id, text, kb_proxies(proxies))
 
     def _show_settings(self, chat_id, edit_msg=None):
@@ -377,25 +382,19 @@ class TelegramController:
             f"AdsPower Key: {'✅ задан' if cfg.get('adspower_api_key', '') else '❌ не задан'}"
         )
         if edit_msg:
-            try:
-                self.bot.edit_message_text(
-                    text, edit_msg.chat.id, edit_msg.message_id, reply_markup=kb_settings()
-                )
-                return
-            except Exception:
-                pass
+            self._edit_or_send(
+                edit_msg.chat.id, edit_msg.message_id, text, kb_settings()
+            )
+            return
         self._send(chat_id, text, kb_settings())
 
     def _show_classification(self, chat_id, edit_msg=None):
         text = "🔍 Классификация объявлений"
         if edit_msg:
-            try:
-                self.bot.edit_message_text(
-                    text, edit_msg.chat.id, edit_msg.message_id, reply_markup=kb_classification()
-                )
-                return
-            except Exception:
-                pass
+            self._edit_or_send(
+                edit_msg.chat.id, edit_msg.message_id, text, kb_classification()
+            )
+            return
         self._send(chat_id, text, kb_classification())
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1001,15 +1000,12 @@ class TelegramController:
                 ok = _astate.notify_user_resumed(req.account_name, request_id, response)
                 if ok:
                     add_log(f"[{req.account_name}] admin -> {response} (id={request_id})")
-                    try:
-                        bot.edit_message_text(
-                            f"✅ Ответ принят: {response}\n"
-                            f"Аккаунт «{req.account_name}», kind={req.kind}",
-                            cid,
-                            call.message.message_id,
-                        )
-                    except Exception:
-                        self._send(cid, f"Ответ принят: {response}")
+                    self._edit_or_send(
+                        cid,
+                        call.message.message_id,
+                        f"✅ Ответ принят: {response}\n"
+                        f"Аккаунт «{req.account_name}», kind={req.kind}",
+                    )
                 else:
                     self._send(cid, f"Не удалось закрыть запрос {request_id}.")
                 return
@@ -1099,23 +1095,13 @@ class TelegramController:
                         for t in active_threads
                     ]
                     text = "\n".join(lines)
-                try:
-                    bot.edit_message_text(
-                        text, cid, call.message.message_id, reply_markup=kb_back()
-                    )
-                except Exception:
-                    self._send(cid, text, kb_back())
+                self._edit_or_send(cid, call.message.message_id, text, kb_back())
 
             # ── Логи ──────────────────────────────────────────────────────────
             elif d == "logs":
                 recent = list(log_buffer)[-30:]
                 text = "\n".join(recent) if recent else "Лог пуст."
-                try:
-                    bot.edit_message_text(
-                        text, cid, call.message.message_id, reply_markup=kb_back()
-                    )
-                except Exception:
-                    self._send(cid, text, kb_back())
+                self._edit_or_send(cid, call.message.message_id, text, kb_back())
 
             # ── Аккаунты: детали ──────────────────────────────────────────────
             # K1: все handler'ы используют self._accounts() (читает accounts.json),
@@ -1136,12 +1122,9 @@ class TelegramController:
                     f"Путь: {acc.get('cookies_path', '—')}\n"
                     f"Enabled: {'✅' if acc.get('enabled', True) else '💤 (disabled)'}"
                 )
-                try:
-                    bot.edit_message_text(
-                        text, cid, call.message.message_id, reply_markup=kb_account_detail(idx)
-                    )
-                except Exception:
-                    self._send(cid, text, kb_account_detail(idx))
+                self._edit_or_send(
+                    cid, call.message.message_id, text, kb_account_detail(idx)
+                )
 
             elif d == "acc_add":
                 self._set_dialog(cid, "acc_add_name")
@@ -1171,19 +1154,12 @@ class TelegramController:
                 if idx >= len(accs):
                     self._send(cid, "Аккаунт не найден.")
                     return
-                try:
-                    bot.edit_message_text(
-                        f"Удалить аккаунт '{accs[idx]['name']}'?",
-                        cid,
-                        call.message.message_id,
-                        reply_markup=kb_confirm(f"acc_del_ok_{idx}", "accounts_menu"),
-                    )
-                except Exception:
-                    self._send(
-                        cid,
-                        f"Удалить '{accs[idx]['name']}'?",
-                        kb_confirm(f"acc_del_ok_{idx}", "accounts_menu"),
-                    )
+                self._edit_or_send(
+                    cid,
+                    call.message.message_id,
+                    f"Удалить аккаунт '{accs[idx]['name']}'?",
+                    kb_confirm(f"acc_del_ok_{idx}", "accounts_menu"),
+                )
 
             elif d.startswith("acc_del_ok_"):
                 idx = int(d.split("_")[-1])
@@ -1232,19 +1208,12 @@ class TelegramController:
                 if idx >= len(proxies):
                     self._send(cid, "Прокси не найден.")
                     return
-                try:
-                    bot.edit_message_text(
-                        f"Удалить прокси?\n{proxies[idx]}",
-                        cid,
-                        call.message.message_id,
-                        reply_markup=kb_confirm(f"proxy_del_ok_{idx}", "proxies_menu"),
-                    )
-                except Exception:
-                    self._send(
-                        cid,
-                        f"Удалить?\n{proxies[idx]}",
-                        kb_confirm(f"proxy_del_ok_{idx}", "proxies_menu"),
-                    )
+                self._edit_or_send(
+                    cid,
+                    call.message.message_id,
+                    f"Удалить прокси?\n{proxies[idx]}",
+                    kb_confirm(f"proxy_del_ok_{idx}", "proxies_menu"),
+                )
 
             elif d.startswith("proxy_del_ok_"):
                 idx = int(d.split("_")[-1])
