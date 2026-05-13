@@ -34,7 +34,12 @@
       "messenger_only": 0.20,
       "browse_only": 0.15,
       "profile_check": 0.10
-    }
+    },
+    "messenger_min_reply_age_min": 15,
+    "messenger_max_reply_age_min": 600,
+    "messenger_reply_delay_mu": 2.5,
+    "messenger_reply_delay_sigma": 1.0,
+    "messenger_ignore_new_dialog_chance": 0.05
   },
   {
     "name": "second account (disabled пример)",

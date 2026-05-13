@@ -248,6 +248,92 @@ def test_add_message_is_idempotent(db):
     assert len(msgs) == 2
 
 
+# ── F5: get_first_in_message_age_seconds ──────────────────────────────────
+
+
+def test_get_first_in_message_age_returns_none_without_message(db):
+    """F5: если в диалоге нет in-сообщения с таким текстом → None."""
+    did = db.upsert_dialog(
+        our_account="acc",
+        visitor_id="v1",
+        listing_id=None,
+        status="active",
+        last_message_text="x",
+        last_message_time="2024-01-01 12:00:00",
+    )
+    assert db.get_first_in_message_age_seconds(did, "missing") is None
+
+
+def test_get_first_in_message_age_uses_min_timestamp(db):
+    """F5: при дубликатах одного сообщения с разными timestamp возвращаем
+    возраст самого раннего (когда мы ВПЕРВЫЕ его увидели)."""
+    import datetime
+
+    did = db.upsert_dialog(
+        our_account="acc",
+        visitor_id="v1",
+        listing_id=None,
+        status="active",
+        last_message_text="hi",
+        last_message_time="2024-01-01 12:00:00",
+    )
+    # Считаем возраст относительно «сейчас» — поэтому используем
+    # детерминированные относительные timestamp'ы.
+    now = datetime.datetime.now()
+    long_ago = (now - datetime.timedelta(minutes=120)).strftime("%Y-%m-%d %H:%M:%S")
+    recent = (now - datetime.timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
+
+    db.add_message(did, "in", "hello", long_ago)
+    db.add_message(did, "in", "hello", recent)  # дубль с другим ts
+
+    age_seconds = db.get_first_in_message_age_seconds(did, "hello")
+    assert age_seconds is not None
+    # Возраст ≈ 120 мин = 7200 секунд (с погрешностью на test latency).
+    assert 7100 < age_seconds < 7300
+
+
+def test_get_first_in_message_age_ignores_out_messages(db):
+    """F5: считаем возраст только in-сообщений; out не учитываем."""
+    import datetime
+
+    did = db.upsert_dialog(
+        our_account="acc",
+        visitor_id="v1",
+        listing_id=None,
+        status="active",
+        last_message_text="x",
+        last_message_time="2024-01-01 12:00:00",
+    )
+    long_ago = (datetime.datetime.now() - datetime.timedelta(hours=1)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+    db.add_message(did, "out", "hello", long_ago)  # это OUT — игнорируем
+    assert db.get_first_in_message_age_seconds(did, "hello") is None
+
+
+def test_get_first_in_message_age_handles_corrupt_timestamp(db):
+    """F5: невалидный timestamp в БД (например, миграционная грязь) —
+    возвращаем None, не падаем."""
+    import sqlite3
+
+    did = db.upsert_dialog(
+        our_account="acc",
+        visitor_id="v1",
+        listing_id=None,
+        status="active",
+        last_message_text="x",
+        last_message_time="2024-01-01 12:00:00",
+    )
+    # add_message парсит/валидирует только при чтении, поэтому пишем напрямую.
+    with sqlite3.connect(db.db_path) as conn:
+        conn.execute(
+            "INSERT INTO messages (dialog_id, direction, text, timestamp) VALUES (?, 'in', 'hello', 'NOT-A-DATE')",
+            (did,),
+        )
+        conn.commit()
+    assert db.get_first_in_message_age_seconds(did, "hello") is None
+
+
 # ── E2: metrics ────────────────────────────────────────────────
 
 

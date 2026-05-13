@@ -10,6 +10,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 import tg_bot as _tg
+from account_state import account_state as _astate
 from human_delay import human_delay as _human_delay
 from llm_sanitizer import sanitize_llm_reply
 
@@ -147,12 +148,38 @@ def human_type(element, text):
 
 
 class AvitoMessenger:
-    def __init__(self, driver, wait, db_manager, llm_classifier, account_name):
+    def __init__(
+        self,
+        driver,
+        wait,
+        db_manager,
+        llm_classifier,
+        account_name,
+        *,
+        # F5: реалистичные задержки ответа. По умолчанию: НИЖНИЙ порог 15 мин,
+        # верхний 600 мин (10 часов), lognormal(2.5, 1.0) — mean ~30 мин,
+        # тяжёлый правый хвост. Если все нули — F5 эффективно выключен.
+        min_reply_age_min: float = 15.0,
+        max_reply_age_min: float = 600.0,
+        reply_delay_mu: float = 2.5,
+        reply_delay_sigma: float = 1.0,
+        # F5b: 5% шанс «никогда не отвечать» — только для НОВЫХ диалогов
+        # (где у нас ещё нет ни одного out-сообщения). Имитирует «увидел,
+        # неинтересно, проигнорил». State хранится in-memory в account_state
+        # и сбрасывается при рестарте — это допустимо.
+        ignore_new_dialog_chance: float = 0.05,
+    ):
         self.driver = driver
         self.wait = wait
         self.db = db_manager
         self.llm = llm_classifier
         self.account_name = account_name
+
+        self.min_reply_age_min = float(min_reply_age_min)
+        self.max_reply_age_min = float(max_reply_age_min)
+        self.reply_delay_mu = float(reply_delay_mu)
+        self.reply_delay_sigma = float(reply_delay_sigma)
+        self.ignore_new_dialog_chance = float(ignore_new_dialog_chance)
 
     def process_messages(self, log_func):
         """Main entry point for processing new messages"""
@@ -348,6 +375,15 @@ class AvitoMessenger:
                     f"Last message from {visitor_name} is: {chat_history[-1]['text']}",
                 )
 
+                # ── F5: реалистичная задержка ответа ─────────────────────
+                # Реальный пользователь не отвечает мгновенно после прихода
+                # пуша (5-30 мин — увидел; 1-4 ч — частая задержка). Бот же
+                # сейчас отвечает в том же messenger-цикле — это паттерн.
+                # Откладываем отправку до следующего цикла, если возраст
+                # in-сообщения не превысил случайно выбранный target.
+                if not self._should_reply_now(dialog_id, chat_history, log_func):
+                    return
+
                 # Use LLM to generate response
                 context = {
                     "title": listing_title,
@@ -443,6 +479,70 @@ class AvitoMessenger:
 
         except Exception as e:
             log_func(self.account_name, f"Error in _handle_current_chat: {str(e)}")
+
+    def _should_reply_now(self, dialog_id, chat_history, log_func) -> bool:
+        """
+        F5: решает, отвечать ли в ТЕКУЩЕМ messenger-цикле или отложить.
+
+        Логика:
+          1. Если диалог в `account_state.ignored_dialogs` (5% от новых) —
+             никогда не отвечаем.
+          2. Если это «новый диалог» (нет наших out-сообщений в chat_history)
+             и выпал ignore-rоlл (`ignore_new_dialog_chance`, default 5%) —
+             помечаем как ignored и не отвечаем (+будущие циклы тоже).
+          3. Иначе считаем возраст последнего in-сообщения. Бросаем lognormal
+             target_age (clamped к [min_reply_age_min, max_reply_age_min]).
+             Если возраст меньше target — пропускаем цикл (на следующем
+             бросок будет другой; статистически среднее задержки ≈ mean
+             lognormal'a).
+
+        Returns:
+            True — отвечать сейчас. False — отложить (return из caller'а).
+        """
+        # 1) Persistent ignore из предыдущих циклов.
+        if _astate.is_dialog_ignored(self.account_name, dialog_id):
+            log_func(
+                self.account_name,
+                f"F5b: dialog#{dialog_id} помечен как ignored — пропускаю.",
+            )
+            return False
+
+        # 2) 5% chance проигнорить НОВЫЙ диалог (без наших out-сообщений).
+        out_count = sum(1 for m in chat_history if m["direction"] == "out")
+        if out_count == 0 and random.random() < self.ignore_new_dialog_chance:
+            _astate.mark_dialog_ignored(self.account_name, dialog_id)
+            log_func(
+                self.account_name,
+                f"F5b: dialog#{dialog_id} помечаю ignored "
+                f"({self.ignore_new_dialog_chance * 100:.0f}% chance — «увидел, не интересно»).",
+            )
+            return False
+
+        # 3) Реалистичная lognormal-задержка для всех остальных.
+        last_in_text = chat_history[-1]["text"]
+        age_seconds = self.db.get_first_in_message_age_seconds(dialog_id, last_in_text)
+        if age_seconds is None:
+            # Если БД не знает первого появления — отвечаем (fallback к старому
+            # поведению, не блокируем коммуникацию).
+            return True
+        age_min = age_seconds / 60.0
+
+        target_min = max(
+            self.min_reply_age_min,
+            min(
+                self.max_reply_age_min,
+                random.lognormvariate(self.reply_delay_mu, self.reply_delay_sigma),
+            ),
+        )
+
+        if age_min < target_min:
+            log_func(
+                self.account_name,
+                f"F5: in-сообщение {age_min:.1f} мин назад "
+                f"(target={target_min:.1f} мин) — отложено до следующего цикла.",
+            )
+            return False
+        return True
 
     def _send_message(self, text, log_func=None):
         """Types and sends a message in the current chat. Returns True on success."""

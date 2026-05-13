@@ -186,6 +186,12 @@ class _Entry:
     # maps "action_pct" ("listings_80") → "YYYY-MM-DD"
     budget_alert_sent: dict = field(default_factory=dict)
 
+    # ── F5b: dialog_id'ы, которые бот решил никогда не отвечать ──────────
+    # Bросок 5% при первом просмотре нового диалога (см. AvitoMessenger).
+    # State in-memory, сбрасывается при рестарте — это допустимо: после
+    # рестарта максимум один раз ответим «сразу», что не страшно.
+    ignored_dialogs: set = field(default_factory=set)
+
 
 class AccountState:
     """
@@ -394,6 +400,26 @@ class AccountState:
             if entry is None:
                 return False
             return time.time() < entry.warmup_until
+
+    # ──────────────────────────────────────────────────────────────────────
+    # F5b: «навсегда игнорированные» диалоги (5% от новых)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def mark_dialog_ignored(self, account_name: str, dialog_id: int) -> None:
+        """
+        F5b: пометить диалог как «никогда не отвечаем». Решение принимается
+        AvitoMessenger при первом просмотре нового диалога (5% chance).
+        """
+        with self._lock:
+            self._get(account_name).ignored_dialogs.add(int(dialog_id))
+
+    def is_dialog_ignored(self, account_name: str, dialog_id: int) -> bool:
+        """F5b: True если данный диалог в этом процессе уже помечен как ignored."""
+        with self._lock:
+            entry = self._entries.get(account_name)
+            if entry is None:
+                return False
+            return int(dialog_id) in entry.ignored_dialogs
 
     # ──────────────────────────────────────────────────────────────────────
     # User-resume (SMS / login captcha)

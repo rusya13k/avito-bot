@@ -1416,6 +1416,22 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
                          cfg.get("max_listings_per_browse", 4))
         )
 
+        # F5: реалистичные задержки ответа в мессенджере. Параметры читаются
+        # с приоритетом per-account → cfg → дефолты в AvitoMessenger.__init__.
+        # Любой ключ можно опустить — соответствующий дефолт подхватится.
+        _messenger_cfg: dict = {}
+        for _key in (
+            "min_reply_age_min",
+            "max_reply_age_min",
+            "reply_delay_mu",
+            "reply_delay_sigma",
+            "ignore_new_dialog_chance",
+        ):
+            _full_key = f"messenger_{_key}"
+            _val = account.get(_full_key, cfg.get(_full_key))
+            if _val is not None:
+                _messenger_cfg[_key] = float(_val)
+
         client = AvitoClient(
             driver,
             wait,
@@ -1429,6 +1445,7 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
             max_listings_per_search=_max_listings,
             max_categories_per_browse=_max_cats,
             max_listings_per_browse=_max_browse_listings,
+            messenger_config=_messenger_cfg or None,
         )
 
         # ── Stage 0: Yandex warmup ──

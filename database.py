@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 import sqlite3
@@ -1089,6 +1090,38 @@ class DatabaseManager:
             """,
                 (dialog_id, direction, text, timestamp, classification),
             )
+
+    def get_first_in_message_age_seconds(self, dialog_id: int, text: str) -> float | None:
+        """
+        F5: возраст в секундах самой ранней записи in-сообщения с указанным
+        text в диалоге `dialog_id`. None — если такого in-сообщения нет.
+
+        Используется для определения «когда мы ВПЕРВЫЕ увидели это сообщение»
+        чтобы отвечать с реалистичной задержкой (не сразу после прихода).
+
+        Использование MIN(timestamp) принципиально: `add_message` дедуплицирует
+        только по полному кортежу `(dialog_id, direction, text, timestamp)`,
+        поэтому при повторном перепарсивании одного и того же in-сообщения
+        в разных циклах оно записывается заново с новым timestamp. Брать
+        MAX дало бы «возраст последнего повторного просмотра» (≈ now),
+        а нам нужно — самое раннее появление.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT MIN(timestamp) FROM messages "
+                "WHERE dialog_id = ? AND direction = 'in' AND text = ?",
+                (dialog_id, text),
+            )
+            row = cur.fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            first_seen = datetime.datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+        except (ValueError, TypeError):
+            # Старые/повреждённые записи с нестандартным форматом — лучше
+            # «не знаем, отвечаем сразу», чем падать.
+            return None
+        return (datetime.datetime.now() - first_seen).total_seconds()
 
     def get_messages(self, dialog_id, limit=20):
         """

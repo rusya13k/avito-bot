@@ -87,6 +87,7 @@ class AvitoClient:
         max_listings_per_search: int = 7,
         max_categories_per_browse: int = 4,
         max_listings_per_browse: int = 4,
+        messenger_config: dict | None = None,
     ):
         """
         Args:
@@ -113,6 +114,11 @@ class AvitoClient:
                 за browse. Default: 4.
             max_listings_per_browse: F2 — верхняя граница числа листингов
                 за одну категорию в browse. Default: 4.
+            messenger_config: F5 — kwargs для AvitoMessenger (min_reply_age_min,
+                max_reply_age_min, reply_delay_mu, reply_delay_sigma,
+                ignore_new_dialog_chance). Прокидывается через **dict в
+                process_messages → AvitoMessenger.__init__. None / {} —
+                использовать дефолты AvitoMessenger.
         """
         self.driver = driver
         self.wait = wait
@@ -126,6 +132,7 @@ class AvitoClient:
         self.max_listings_per_search: int = max_listings_per_search
         self.max_categories_per_browse: int = max_categories_per_browse
         self.max_listings_per_browse: int = max_listings_per_browse
+        self.messenger_config: dict = messenger_config or {}
 
     # ──────────────────────────────────────────────────────────────────────
     # Navigation
@@ -465,11 +472,15 @@ class AvitoClient:
 
         from avito_messenger import AvitoMessenger
 
+        # F5: messenger_config (dict) прокидывает kwargs реалистичных
+        # задержек ответа в AvitoMessenger. Если конфиг пустой — используются
+        # дефолты внутри __init__ AvitoMessenger.
         messenger = AvitoMessenger(
             self.driver,
             self.wait,
             self.db,
             self.llm,
             self.account_name,
+            **self.messenger_config,
         )
         messenger.process_messages(self.log)
