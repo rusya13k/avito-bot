@@ -32,12 +32,21 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 ACCOUNTS_JSON_FILENAME = "accounts.json"
+
+# K1: сериализуем запись в accounts.json.
+# pyTelegramBotAPI обрабатывает callback'и в ThreadPool, так что два TG-handler'а
+# могут одновременно дёрнуть add_account/remove_account. Без локa один из них
+# затрёт изменения другого (классический lost-update).
+_WRITE_LOCK = threading.Lock()
 
 
 def load_accounts(
@@ -189,3 +198,212 @@ def get_account_overrides(account: dict[str, Any], key: str, default: Any = None
     captcha_cooldown_minutes на конкретный аккаунт.
     """
     return account.get(key, default)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# K1: CRUD операции для TG-бота (запись в accounts.json)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def load_all_accounts(
+    repo_dir: Path | str,
+    cfg: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    K1: как load_accounts, но БЕЗ фильтра disabled-аккаунтов.
+
+    TG-бот рендерит полный список (✅ enabled / 💤 disabled), чтобы можно было
+    редактировать аккаунты, временно отключённые через `enabled=false`.
+    bot.py при старте использует обычный `load_accounts`, который такие
+    аккаунты сам отфильтрует.
+
+    Дубли по имени по-прежнему отбрасываются (первое вхождение остаётся).
+    """
+    repo_dir = Path(repo_dir)
+    accounts_path = repo_dir / ACCOUNTS_JSON_FILENAME
+
+    if accounts_path.exists():
+        raw = _load_json_list(accounts_path)
+        return _normalize_only(raw, source=str(accounts_path))
+
+    if cfg and isinstance(cfg.get("accounts"), list):
+        return _normalize_only(cfg["accounts"], source="config.json")
+
+    return []
+
+
+def _normalize_only(raw: list[Any], source: str) -> list[dict[str, Any]]:
+    """
+    Как _normalize_and_filter, но НЕ выбрасывает disabled.
+    Сохраняет фактическое значение `enabled` (True/False), не насильно True.
+    """
+    out: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            logger.warning(
+                "K1: %s: account #%d не dict (%s) — пропускаю", source, i, type(item).__name__
+            )
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            logger.warning("K1: %s: account #%d без 'name' — пропускаю", source, i)
+            continue
+        if name in seen_names:
+            logger.warning(
+                "K1: %s: дубль имени %r — оставляю первое вхождение", source, name
+            )
+            continue
+        seen_names.add(name)
+
+        normalized = dict(item)
+        if normalized.get("adspower_id") and not normalized.get("user_id"):
+            normalized["user_id"] = normalized["adspower_id"]
+        elif normalized.get("user_id") and not normalized.get("adspower_id"):
+            normalized["adspower_id"] = normalized["user_id"]
+        # enabled: по умолчанию True, если явно False — оставляем False.
+        normalized["enabled"] = normalized.get("enabled", True) is not False
+        out.append(normalized)
+    return out
+
+
+def save_accounts(repo_dir: Path | str, accounts: list[dict[str, Any]]) -> Path:
+    """
+    K1: атомарно записывает список аккаунтов в `accounts.json`.
+
+    Атомарность — через tempfile в той же директории + os.replace
+    (стандартная практика, чтобы не получить пустой/недоразрешённый JSON
+    при сбое процесса посередине записи).
+
+    Returns: путь к accounts.json (для логов).
+    """
+    repo_dir = Path(repo_dir)
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    target = repo_dir / ACCOUNTS_JSON_FILENAME
+
+    # Сначала валидация: каждый элемент — dict с непустым name.
+    for i, acc in enumerate(accounts):
+        if not isinstance(acc, dict):
+            raise TypeError(f"save_accounts: item #{i} не dict ({type(acc).__name__})")
+        if not isinstance(acc.get("name"), str) or not acc["name"].strip():
+            raise ValueError(f"save_accounts: item #{i} без валидного 'name'")
+
+    payload = json.dumps(accounts, ensure_ascii=False, indent=2)
+    with _WRITE_LOCK:
+        # tempfile в той же директории, чтобы os.replace был атомарным
+        # (cross-device replace не атомарен на некоторых FS).
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".accounts_", suffix=".json.tmp", dir=str(repo_dir)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp_path, target)
+        except Exception:
+            # Подчищаем temp при крахе записи (на os.replace его уже нет).
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    return target
+
+
+def add_account(
+    repo_dir: Path | str,
+    account: dict[str, Any],
+    cfg: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    K1: добавить аккаунт в accounts.json.
+
+    Raises:
+        ValueError, если имя пустое или такой `name` уже есть.
+    """
+    repo_dir = Path(repo_dir)
+    name = (account or {}).get("name", "")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("add_account: 'name' обязателен и не может быть пустым")
+
+    with _WRITE_LOCK:
+        # Внутри лока: re-read, mutate, write — чтобы не потерять параллельные
+        # изменения. _WRITE_LOCK реентрантным НЕ является, поэтому save_accounts
+        # тоже не должен брать его — он берёт свой; но мы пишем БЕЗ помощи
+        # save_accounts, чтобы избежать двойного захвата.
+        all_accs = load_all_accounts(repo_dir, cfg)
+        if any(a["name"] == name for a in all_accs):
+            raise ValueError(f"add_account: аккаунт {name!r} уже существует")
+        all_accs.append(dict(account))
+        _atomic_write(repo_dir, all_accs)
+    return all_accs
+
+
+def update_account(
+    repo_dir: Path | str,
+    name: str,
+    updates: dict[str, Any],
+    cfg: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """
+    K1: применить partial update к аккаунту по имени.
+
+    Returns:
+        Обновлённый dict аккаунта или None, если такого `name` нет.
+    """
+    repo_dir = Path(repo_dir)
+    with _WRITE_LOCK:
+        all_accs = load_all_accounts(repo_dir, cfg)
+        for acc in all_accs:
+            if acc["name"] == name:
+                acc.update(updates)
+                _atomic_write(repo_dir, all_accs)
+                return acc
+    return None
+
+
+def remove_account(
+    repo_dir: Path | str,
+    name: str,
+    cfg: dict[str, Any] | None = None,
+) -> bool:
+    """
+    K1: удалить аккаунт по имени.
+
+    Returns:
+        True, если был удалён; False, если такого имени не было.
+    """
+    repo_dir = Path(repo_dir)
+    with _WRITE_LOCK:
+        all_accs = load_all_accounts(repo_dir, cfg)
+        new_accs = [a for a in all_accs if a["name"] != name]
+        if len(new_accs) == len(all_accs):
+            return False
+        _atomic_write(repo_dir, new_accs)
+    return True
+
+
+def _atomic_write(repo_dir: Path, accounts: list[dict[str, Any]]) -> Path:
+    """
+    Внутренний хелпер: атомарная запись БЕЗ повторного взятия _WRITE_LOCK
+    (вызывается из add/update/remove, которые уже его держат).
+
+    Логически дублирует save_accounts — но save_accounts берёт лок сам,
+    что приводило бы к deadlock при вызове из add/update/remove.
+    """
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    target = repo_dir / ACCOUNTS_JSON_FILENAME
+    payload = json.dumps(accounts, ensure_ascii=False, indent=2)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".accounts_", suffix=".json.tmp", dir=str(repo_dir)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return target

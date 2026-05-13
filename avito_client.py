@@ -81,6 +81,12 @@ class AvitoClient:
         log_func=None,
         db_manager=None,
         llm_classifier=None,
+        search_filters=None,
+        favorite_rate: float = 0.08,
+        call_rate: float = 0.05,
+        max_listings_per_search: int = 7,
+        max_categories_per_browse: int = 4,
+        max_listings_per_browse: int = 4,
     ):
         """
         Args:
@@ -92,6 +98,21 @@ class AvitoClient:
             db_manager: DatabaseManager (нужен для save_listing /
                 process_messages; для login / warmup можно не передавать).
             llm_classifier: LLMClassifier (нужен для process_messages).
+            search_filters: dict с per-account фильтрами поиска (E2).
+                Допустимые ключи: cities (list[str]), deal_type (str),
+                deal_types (list[str]), price_min (int), price_max (int).
+                None / {} → глобальные defaults (random-поведение).
+            favorite_rate: F1 — вероятность «Добавить в избранное» при просмотре
+                листинга в browse. Конфигурируется через config.json /
+                accounts.json (ключ view_listing_favorite_rate). Default: 0.08.
+            call_rate: F1 — вероятность нажать «Позвонить» при просмотре.
+                Конфигурируется через view_listing_call_rate. Default: 0.05.
+            max_listings_per_search: F2 — верхняя граница весового распределения
+                числа листингов за find_and_view. Default: 7.
+            max_categories_per_browse: F2 — верхняя граница числа категорий
+                за browse. Default: 4.
+            max_listings_per_browse: F2 — верхняя граница числа листингов
+                за одну категорию в browse. Default: 4.
         """
         self.driver = driver
         self.wait = wait
@@ -99,6 +120,12 @@ class AvitoClient:
         self.log = log_func or (lambda *_args, **_kwargs: None)
         self.db = db_manager
         self.llm = llm_classifier
+        self.search_filters: dict = search_filters or {}
+        self.favorite_rate: float = favorite_rate
+        self.call_rate: float = call_rate
+        self.max_listings_per_search: int = max_listings_per_search
+        self.max_categories_per_browse: int = max_categories_per_browse
+        self.max_listings_per_browse: int = max_listings_per_browse
 
     # ──────────────────────────────────────────────────────────────────────
     # Navigation
@@ -277,9 +304,17 @@ class AvitoClient:
         """
         Открытие коммерческих категорий + ввод keyword'а.
         Wrapper над bot.browse_commercial_categories.
+        E2: search_filters (self.search_filters) прокидывается автоматически,
+        если явно не передан через kwargs.
+        F1: favorite_rate / call_rate из self прокидываются автоматически.
         """
         from bot import browse_commercial_categories
 
+        kwargs.setdefault("search_filters", self.search_filters or None)
+        kwargs.setdefault("favorite_rate", self.favorite_rate)
+        kwargs.setdefault("call_rate", self.call_rate)
+        kwargs.setdefault("max_categories_per_browse", self.max_categories_per_browse)
+        kwargs.setdefault("max_listings_per_browse", self.max_listings_per_browse)
         return browse_commercial_categories(
             self.driver,
             self.wait,
@@ -292,10 +327,42 @@ class AvitoClient:
         """
         Главный scraping-loop: листает листинги в SERP, парсит каждый.
         Возвращает (processed, new_listings, errors).
-        Wrapper над bot.find_and_view_commercial_listings.
+
+        A2: перед стартом проверяет дневной бюджет на "listings". Если лимит
+        исчерпан — возвращает (0, 0, 0) и логирует INFO.
         """
         if self.db is None:
             raise RuntimeError("AvitoClient.find_and_view_commercial_listings requires db_manager")
+
+        # A2 + C2: проверяем дневной бюджет листингов и шлём алерты при 80%/100%
+        from account_state import account_state as _astate
+
+        _used_listings = _astate._get_daily_total_from_db(self.account_name, "listings", self.db)
+        _alert = _astate.check_budget_alert(self.account_name, "listings", _used_listings)
+        _lim = _astate.get_effective_limit(self.account_name, "listings")
+        if _alert == "80":
+            self.log(
+                self.account_name,
+                f"C2: листинги {_used_listings}/{_lim} (≥80%) — скоро лимит.",
+            )
+        elif _alert == "100":
+            # C2: лимит только что исчерпан — однократный WARNING (de-dup по дате).
+            logger.warning(
+                "[%s] C2: дневной лимит листингов исчерпан (%d/%d). "
+                "Поиск остановлен до завтра.",
+                self.account_name,
+                _used_listings,
+                _lim,
+            )
+        if not _astate.check_daily_budget(self.account_name, "listings", self.db):
+            remaining = _astate.remaining_budget(self.account_name, "listings", self.db)
+            self.log(
+                self.account_name,
+                f"A2: Дневной лимит листингов исчерпан (осталось {remaining}). "
+                "Пропускаем поиск до завтра.",
+            )
+            return 0, 0, 0
+
         from bot import find_and_view_commercial_listings
 
         return find_and_view_commercial_listings(
@@ -303,6 +370,8 @@ class AvitoClient:
             self.wait,
             self.account_name,
             self.db,
+            search_filters=self.search_filters or None,
+            max_listings_per_search=self.max_listings_per_search,
         )
 
     def extract_listing_data(self) -> dict[str, Any]:
@@ -346,11 +415,54 @@ class AvitoClient:
         Главный messenger-loop: открывает /profile/messenger, проходит по
         диалогам, отвечает через LLM на необработанные in-сообщения.
 
+        B1: в warmup-режиме (первые N дней нового аккаунта) — пропускаем
+        отправку сообщений полностью (только просмотр листингов без LLM).
+        A2: перед стартом проверяет дневной бюджет на "messages". Если лимит
+        исчерпан — логирует INFO и выходит без работы.
+
         Внутренне создаёт AvitoMessenger — он держит cohesive state на время
         одной итерации обхода.
         """
         if self.db is None or self.llm is None:
             raise RuntimeError("AvitoClient.process_messages requires db_manager и llm_classifier")
+
+        from account_state import account_state as _astate
+
+        # B1: warmup — не отправляем сообщения (только browse)
+        if _astate.is_in_warmup(self.account_name):
+            self.log(
+                self.account_name,
+                "B1: warmup-режим — пропускаем отправку сообщений.",
+            )
+            return
+
+        # A2 + C2: дневной лимит сообщений + 80%/100%-алерт
+        _used_msgs = _astate._get_daily_total_from_db(self.account_name, "messages", self.db)
+        _msg_alert = _astate.check_budget_alert(self.account_name, "messages", _used_msgs)
+        _msg_lim = _astate.get_effective_limit(self.account_name, "messages")
+        if _msg_alert == "80":
+            self.log(
+                self.account_name,
+                f"C2: сообщения {_used_msgs}/{_msg_lim} (≥80%) — скоро лимит.",
+            )
+        elif _msg_alert == "100":
+            # C2: лимит только что исчерпан — однократный WARNING (de-dup по дате).
+            logger.warning(
+                "[%s] C2: дневной лимит сообщений исчерпан (%d/%d). "
+                "Мессенджер остановлен до завтра.",
+                self.account_name,
+                _used_msgs,
+                _msg_lim,
+            )
+        if not _astate.check_daily_budget(self.account_name, "messages", self.db):
+            remaining = _astate.remaining_budget(self.account_name, "messages", self.db)
+            self.log(
+                self.account_name,
+                f"A2: Дневной лимит сообщений исчерпан (осталось {remaining}). "
+                "Пропускаем мессенджер до завтра.",
+            )
+            return
+
         from avito_messenger import AvitoMessenger
 
         messenger = AvitoMessenger(

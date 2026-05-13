@@ -209,6 +209,18 @@ class DatabaseManager:
                 )
             """)
 
+            # C3: лог капча-инцидентов (url, action, тип капчи, момент).
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS captcha_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_name TEXT NOT NULL,
+                    ts TEXT NOT NULL,
+                    page_url TEXT,
+                    action TEXT,
+                    captcha_type TEXT
+                )
+            """)
+
             # Create indexes for better performance.
             # ВАЖНО: индексы по "новым" колонкам (profile_id, phone) создаются
             # в _migrate_database() ПОСЛЕ ALTER TABLE, чтобы не падать на
@@ -296,6 +308,22 @@ class DatabaseManager:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_metrics_bucket "
                 "ON metrics(bucket_hour, account_name, metric)"
+            )
+
+            # C3: captcha_log — идемпотентно для старых БД
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS captcha_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_name TEXT NOT NULL,
+                    ts TEXT NOT NULL,
+                    page_url TEXT,
+                    action TEXT,
+                    captcha_type TEXT
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_captcha_log_account "
+                "ON captcha_log(account_name, ts)"
             )
 
     # ──────────────────────────────────────────────────────────────────────
@@ -502,6 +530,12 @@ class DatabaseManager:
     METRIC_MESSAGES_SENT = "messages_sent"
     METRIC_LLM_ERRORS = "llm_errors"
     METRIC_CAPTCHA_HITS = "captcha_hits"
+    METRIC_PHONE_CLICKS = "phone_clicks"  # A3: клики "Показать телефон"
+    # K2: ответы LLM, заблокированные sanitize_llm_reply (телефон / @telegram /
+    # wa.me / email / слишком длинно/коротко). Высокое значение этой метрики
+    # ⇒ LLM регулярно тянет в чат опасный контент (либо jailbreak, либо
+    # prompt-injection из листингов) — повод понизить temperature/менять промпт.
+    METRIC_LLM_RESPONSE_BLOCKED = "llm_response_blocked"
 
     @staticmethod
     def _bucket_hour(ts: float | None = None) -> str:
@@ -627,6 +661,53 @@ class DatabaseManager:
 
         with self._cursor() as cur:
             cur.execute(sql, params)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # C3: Captcha log — журнал инцидентов для пост-mortem анализа
+    # ──────────────────────────────────────────────────────────────────────
+
+    def log_captcha(
+        self,
+        account_name: str,
+        page_url: str = "",
+        action: str = "",
+        captcha_type: str = "",
+        ts: float | None = None,
+        cursor=None,
+    ) -> None:
+        """
+        C3: записать капча-инцидент в captcha_log.
+
+        Args:
+            account_name: имя аккаунта.
+            page_url: URL страницы, где была капча.
+            action: что делал бот ("phone_click", "login", ...).
+            captcha_type: тип капчи ("phone_captcha", "login_captcha", ...).
+            ts: unix-time инцидента (по умолчанию сейчас).
+            cursor: для участия в общей транзакции.
+        """
+        ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts or time.time()))
+        with self._with_cursor(write=True, cursor=cursor) as cur:
+            cur.execute(
+                "INSERT INTO captcha_log (account_name, ts, page_url, action, captcha_type) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (account_name or "", ts_str, page_url or "", action or "", captcha_type or ""),
+            )
+
+    def get_captcha_log(self, account_name: str, limit: int = 5) -> list[dict]:
+        """
+        C3: последние N капча-инцидентов для аккаунта (для /lastcaptcha).
+        Возвращает list[dict] с ключами: id, account_name, ts, page_url, action, captcha_type.
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT id, account_name, ts, page_url, action, captcha_type "
+                "FROM captcha_log WHERE account_name = ? "
+                "ORDER BY ts DESC LIMIT ?",
+                (account_name or "", int(limit)),
+            )
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, row)) for row in cur.fetchall()]
 
@@ -770,6 +851,29 @@ class DatabaseManager:
             """,
                 (classification, confidence, source, classified_at, listing_id),
             )
+
+    def get_classification_stats(self) -> dict:
+        """
+        K3: агрегированная статистика по полю `classification` для всех листингов.
+
+        Возвращает:
+            {"by_label": {"owner": N, "agent": M, "uncertain": K}, "total": N+M+K}
+
+        Используется в TG-боте (callback `classification_stats`). Раньше TG-бот
+        обходил DatabaseManager и открывал `sqlite3.connect(db.db_path)` сам, что
+        нарушало AGENTS.md и теряло WAL/busy_timeout/write_lock.
+
+        NULL и пустые `classification` исключаются (это «ещё не классифицировано»).
+        """
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT classification, COUNT(*) AS cnt FROM listings "
+                "WHERE classification IS NOT NULL AND classification != '' "
+                "GROUP BY classification"
+            )
+            rows = cur.fetchall()
+        by_label: dict[str, int] = {row[0]: int(row[1]) for row in rows}
+        return {"by_label": by_label, "total": sum(by_label.values())}
 
     # ──────────────────────────────────────────────────────────────────────
     # Accounts

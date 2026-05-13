@@ -1,4 +1,5 @@
 import logging
+import random
 import re
 import time
 
@@ -23,6 +24,9 @@ logger = logging.getLogger(__name__)
 # проставим parse_status='captcha'. Не часть schema и не предназначен
 # для внешних потребителей.
 _CAPTCHA_FLAG = "_a3_captcha_hit"
+
+# A3: флаг в listing_data: True -> при сохранении инкрементируем метрику phone_clicks.
+_PHONE_CLICKED_FLAG = "_a3_phone_clicked"
 
 
 def _wf(driver, xpath, timeout=3):
@@ -248,15 +252,26 @@ def extract_listing_data(driver, wait, account_name, log_func):
             listing_data["photo_urls"] = []
 
         # Extract phone number if available
-        # A3: pre-click captcha check -> avoid clicking on a captcha screen.
-        #     post-click captcha check -> Avito показал SmartCaptcha вместо номера.
+        # A3: многоуровневые проверки перед кликом "Показать телефон":
+        #   1. captcha-cooldown (уже был ранее)
+        #   2. Дневной in-memory лимит (should_skip_phone — hard limit + prev session >5)
+        #   3. Session soft-limit: random.random() < 0.3 (кликаем только в 30% случаев)
+        #   4. Pre-click captcha check
+        #   5. Post-click captcha check
         listing_data["phone"] = None
+
         if account_state.is_cooled_down(account_name):
             log_func(
                 account_name,
                 f"Skip 'Показать телефон' — аккаунт в cooldown ещё "
                 f"{account_state.cooldown_remaining_seconds(account_name)}s",
             )
+        elif account_state.should_skip_phone(account_name):
+            # A3: дневной hard-limit достигнут ИЛИ предыдущая сессия >5 кликов
+            log_func(account_name, "A3: Пропуск 'Показать телефон' — дневной/сессионный лимит")
+        elif random.random() >= 0.3:
+            # A3: session soft-limit — кликаем только в ~30% случаев
+            log_func(account_name, "A3: Пропуск 'Показать телефон' — session soft-limit (30%)")
         elif detect_phone_captcha(driver, log_func=log_func, account_name=account_name):
             log_func(account_name, "Капча обнаружена ДО клика 'Показать телефон' — пропускаем")
             listing_data[_CAPTCHA_FLAG] = True
@@ -267,9 +282,10 @@ def extract_listing_data(driver, wait, account_name, log_func):
                     By.XPATH, "//button[@data-marker='item-contact-bar/call-button']"
                 )
                 phone_btn.click()
-                # B2: human-like ожидание после клика. WebDriverWait ниже
-                # доберёт оставшееся, если номер появится позже.
-                human_delay(0.8, 1.6, stop_event=_tg.stop_event)
+                # A3: cooldown 30-90 сек после клика (ранее было 0.8-1.6с).
+                # Реальный пользователь не кликает "Показать телефон" каждые 2 секунды.
+                # Используем uniform (более равномерный), чтобы не быть предсказуемым.
+                human_delay(30, 90, stop_event=_tg.stop_event, distribution="uniform")
 
                 # Post-click captcha check.
                 if detect_phone_captcha(driver, log_func=log_func, account_name=account_name):
@@ -287,6 +303,11 @@ def extract_listing_data(driver, wait, account_name, log_func):
                             )
                         )
                         listing_data["phone"] = normalize_phone(phone_elem.text)
+                        # A3: успешный клик — обновляем in-memory счётчики.
+                        # Метрика phone_clicks в БД инкрементируется в save_listing_to_db
+                        # через флаг _PHONE_CLICKED_FLAG.
+                        account_state.record_phone_click(account_name)
+                        listing_data[_PHONE_CLICKED_FLAG] = True
                     except TimeoutException:
                         # Телефон не появился, но и капчи нет -> просто не показали номер.
                         log_func(account_name, "Номер не появился после клика (без капчи)")
@@ -461,6 +482,23 @@ def save_listing_to_db(listing_data, db_manager, log_func, account_name):
                     db_manager.incr_metric(
                         account_name,
                         "captcha_hits",
+                        cursor=cur,
+                    )
+                    # C3: журнал инцидента для /lastcaptcha
+                    db_manager.log_captcha(
+                        account_name=account_name,
+                        page_url=listing_data.get("url", ""),
+                        action="phone_click",
+                        captcha_type="phone_captcha",
+                        cursor=cur,
+                    )
+                # A3: метрика phone_clicks — новая E2-метрика для аналитики
+                # кликов "Показать телефон". Флаг выставляется в extract_listing_data
+                # после успешного получения номера.
+                if listing_data.get(_PHONE_CLICKED_FLAG):
+                    db_manager.incr_metric(
+                        account_name,
+                        "phone_clicks",
                         cursor=cur,
                     )
 

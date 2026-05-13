@@ -11,6 +11,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 import tg_bot as _tg
 from human_delay import human_delay as _human_delay
+from llm_sanitizer import sanitize_llm_reply
 
 logger = logging.getLogger(__name__)
 
@@ -356,9 +357,34 @@ class AvitoMessenger:
                 }
 
                 response_text = self.llm.generate_response(context, chat_history)
-                if not response_text or not response_text.strip():
-                    log_func(self.account_name, "LLM returned empty response — skipping send.")
+
+                # K2: фильтр исходящих ответов перед отправкой в Avito-чат.
+                # Блокирует ответы с телефонами / @telegram / wa.me /
+                # email / слишком короткие/длинные. Если LLM (или prompt-
+                # injection из листинга) попытается «увести» клиента из
+                # Avito — этот цикл пропустим, на следующем проходе LLM
+                # с большой вероятностью даст безопасный ответ.
+                clean_text, block_reason = sanitize_llm_reply(response_text)
+                if block_reason is not None:
+                    logger.warning(
+                        "[%s] LLM response blocked (reason=%s, len=%d): %r",
+                        self.account_name,
+                        block_reason,
+                        len(response_text or ""),
+                        (response_text or "")[:120],
+                    )
+                    log_func(
+                        self.account_name,
+                        f"K2: LLM-ответ заблокирован ({block_reason}) — пропускаю отправку.",
+                    )
+                    # Метрика для /report и health-мониторинга.
+                    try:
+                        self.db.incr_metric(self.account_name, "llm_response_blocked")
+                    except Exception as exc:
+                        logger.debug("incr_metric llm_response_blocked failed: %s", exc)
                     return
+
+                response_text = clean_text  # очищенный (стрипнутый) текст
                 log_func(self.account_name, f"Generated response: {response_text}")
 
                 if _stopping():

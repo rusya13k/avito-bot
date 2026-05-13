@@ -279,9 +279,24 @@ class TelegramController:
                 pass
         self._send(chat_id, text, kb_main())
 
+    def _accounts(self) -> list:
+        """
+        K1: единая точка чтения аккаунтов в TG-боте.
+
+        Источник правды — `accounts.json` (G2). Если его нет, читаем из
+        `config.json["accounts"]` (legacy). При записи в любом случае
+        пишем в `accounts.json` через accounts.add_account/remove/update.
+
+        Возвращаем НЕ-фильтрованный список (вместе с disabled), чтобы
+        пользователь видел все аккаунты в TG-меню — даже временно
+        отключённые `enabled=false`.
+        """
+        from accounts import load_all_accounts
+
+        return load_all_accounts(self.BASE, self._cfg())
+
     def _show_accounts(self, chat_id, edit_msg=None):
-        cfg = self._cfg()
-        accs = cfg.get("accounts", [])
+        accs = self._accounts()
         text = f"Аккаунты ({len(accs)}):"
         if edit_msg:
             try:
@@ -403,6 +418,184 @@ class TelegramController:
                 logger.exception("cmd_report failed")
                 bot.reply_to(message, f"Ошибка отчёта: {exc}")
 
+        # ── /budget ─────────────────────────────────────────────────────────
+        # C2: статус дневных бюджетов по всем аккаунтам.
+        @bot.message_handler(commands=["budget"])
+        def cmd_budget(message):
+            if not self._allowed(message.from_user.id):
+                bot.reply_to(message, "Нет доступа.")
+                return
+            try:
+                from account_state import account_state as _astate
+                from accounts import load_accounts
+                from database import DatabaseManager
+
+                cfg = self._cfg()
+                accounts_list = load_accounts(self.BASE, cfg)
+                db = DatabaseManager()
+                today = time.strftime("%Y-%m-%d 00:00:00")
+                lines = ["💰 Бюджет аккаунтов на сегодня", ""]
+                if not accounts_list:
+                    lines.append("Нет активных аккаунтов.")
+                for acc in accounts_list:
+                    name = acc["name"]
+                    lines.append(f"▪ {name}:")
+                    for action, metric in [
+                        ("listings", "listings_parsed"),
+                        ("messages", "messages_sent"),
+                        ("phone", "phone_clicks"),
+                    ]:
+                        if action == "phone":
+                            used = _astate.phone_clicks_today(name)
+                        else:
+                            rows = db.get_metrics(
+                                since=today,
+                                account_name=name,
+                                metric=metric,
+                                group_by="metric",
+                            )
+                            used = int(rows[0]["value"]) if rows else 0
+                        limit = _astate.get_effective_limit(name, action)
+                        pct = used * 100 // limit if limit > 0 else 0
+                        icon = "🔴" if pct >= 100 else "🟡" if pct >= 80 else "🟢"
+                        lines.append(f"  {icon} {action}: {used}/{limit} ({pct}%)")
+                    warmup = "⏳ warmup" if _astate.is_in_warmup(name) else ""
+                    if warmup:
+                        lines.append(f"  {warmup}")
+                    lines.append("")
+                bot.reply_to(message, "\n".join(lines))
+            except Exception as exc:
+                logger.exception("cmd_budget failed")
+                bot.reply_to(message, f"Ошибка: {exc}")
+
+        # ── /lastcaptcha ─────────────────────────────────────────────────────
+        # C3: последние капча-инциденты по аккаунту.
+        # Синтаксис: /lastcaptcha <account_name> [N]
+        @bot.message_handler(commands=["lastcaptcha"])
+        def cmd_lastcaptcha(message):
+            if not self._allowed(message.from_user.id):
+                bot.reply_to(message, "Нет доступа.")
+                return
+            try:
+                parts = (message.text or "").split()
+                if len(parts) < 2:
+                    bot.reply_to(message, "Использование: /lastcaptcha <имя_аккаунта> [N=5]")
+                    return
+                name = parts[1]
+                limit = int(parts[2]) if len(parts) > 2 else 5
+                from database import DatabaseManager
+
+                db = DatabaseManager()
+                rows = db.get_captcha_log(name, limit=limit)
+                if not rows:
+                    bot.reply_to(message, f"Нет капча-инцидентов для '{name}'.")
+                    return
+                lines = [f"🚨 Последние капчи — {name}:", ""]
+                for r in rows:
+                    lines.append(
+                        f"{r['ts']}  {r['action']}  {r['captcha_type']}\n  {r['page_url'] or '—'}"
+                    )
+                bot.reply_to(message, "\n".join(lines))
+            except Exception as exc:
+                logger.exception("cmd_lastcaptcha failed")
+                bot.reply_to(message, f"Ошибка: {exc}")
+
+        # ── /health ──────────────────────────────────────────────────────────
+        # C1: health score аккаунта за 7 дней.
+        # Синтаксис: /health [account_name]  — если не указан, все аккаунты.
+        @bot.message_handler(commands=["health"])
+        def cmd_health(message):
+            if not self._allowed(message.from_user.id):
+                bot.reply_to(message, "Нет доступа.")
+                return
+            try:
+                from account_state import account_state as _astate
+                from account_state import compute_account_health
+                from accounts import load_accounts
+                from database import DatabaseManager
+
+                parts = (message.text or "").split()
+                cfg = self._cfg()
+                db = DatabaseManager()
+
+                if len(parts) > 1:
+                    target_accounts = [{"name": parts[1]}]
+                else:
+                    target_accounts = load_accounts(self.BASE, cfg) or []
+
+                if not target_accounts:
+                    bot.reply_to(message, "Нет аккаунтов.")
+                    return
+
+                lines = ["🏥 Health score аккаунтов (7 дней)", ""]
+                mode_icon = {"healthy": "✅", "warning": "⚠️", "degraded": "🔴", "critical": "💀"}
+                for acc in target_accounts:
+                    name = acc["name"]
+                    h = compute_account_health(name, db)
+                    icon = mode_icon.get(h["mode"], "❓")
+                    warmup = " ⏳warmup" if _astate.is_in_warmup(name) else ""
+                    lines.append(
+                        f"{icon} {name}{warmup}\n"
+                        f"  режим: {h['mode']}  score: {h['score']:.3f}\n"
+                        f"  листингов: {h['listings_7d']}  капч: {h['captchas_7d']}\n"
+                        f"  (с {h['since']})"
+                    )
+                    lines.append("")
+                bot.reply_to(message, "\n".join(lines))
+            except Exception as exc:
+                logger.exception("cmd_health failed")
+                bot.reply_to(message, f"Ошибка: {exc}")
+
+        # ── /warmup ──────────────────────────────────────────────────────────
+        # B1: продлить warmup-период аккаунта на N дней от текущего момента.
+        # Синтаксис: /warmup <account_name> [days=3]
+        # Примеры:
+        #   /warmup acc1        — продлить на 3 дня
+        #   /warmup acc1 7      — продлить на 7 дней
+        #   /warmup acc1 0      — немедленно завершить warmup
+        @bot.message_handler(commands=["warmup"])
+        def cmd_warmup(message):
+            if not self._allowed(message.from_user.id):
+                bot.reply_to(message, "Нет доступа.")
+                return
+            try:
+                import time as _time
+
+                from account_state import account_state as _astate
+
+                parts = (message.text or "").split()
+                if len(parts) < 2:
+                    bot.reply_to(
+                        message,
+                        "Использование: /warmup <имя_аккаунта> [дни=3]\n"
+                        "  /warmup acc1     — продлить на 3 дня\n"
+                        "  /warmup acc1 7   — продлить на 7 дней\n"
+                        "  /warmup acc1 0   — завершить warmup немедленно",
+                    )
+                    return
+                name = parts[1]
+                days = int(parts[2]) if len(parts) > 2 else 3
+                if days < 0:
+                    bot.reply_to(message, "Число дней должно быть >= 0.")
+                    return
+                new_until = _time.time() + days * 86400
+                _astate.set_warmup_until(name, new_until)
+                if days == 0:
+                    bot.reply_to(message, f"✅ Warmup для '{name}' завершён — нормальный режим.")
+                else:
+                    import datetime as _dt
+
+                    until_str = _dt.datetime.fromtimestamp(new_until).strftime("%Y-%m-%d %H:%M")
+                    bot.reply_to(
+                        message,
+                        f"⏳ Warmup для '{name}' продлён на {days} дн. до {until_str}.",
+                    )
+            except ValueError:
+                bot.reply_to(message, "Число дней должно быть целым числом.")
+            except Exception as exc:
+                logger.exception("cmd_warmup failed")
+                bot.reply_to(message, f"Ошибка: {exc}")
+
         # ── Текстовый ввод (диалоговые состояния) ────────────────────────────
         @bot.message_handler(
             content_types=["text", "document"], func=lambda m: m.chat.id in self._state
@@ -421,9 +614,8 @@ class TelegramController:
                 if not name:
                     bot.reply_to(message, "Имя не может быть пустым.")
                     return
-                # Проверяем что такого нет
-                cfg = self._cfg()
-                if any(a["name"] == name for a in cfg.get("accounts", [])):
+                # K1: проверяем по реальному источнику — accounts.json.
+                if any(a["name"] == name for a in self._accounts()):
                     bot.reply_to(message, f"Аккаунт '{name}' уже существует.")
                     return
                 self._set_dialog(cid, "acc_add_cookies", {"name": name})
@@ -465,10 +657,9 @@ class TelegramController:
                     bot.reply_to(message, "Куки должны быть массивом [].")
                     return
 
-                # Определяем путь
+                # K1: путь к cookies + имя аккаунта берём из accounts.json.
+                accs = self._accounts()
                 if idx is not None:
-                    cfg = self._cfg()
-                    accs = cfg.get("accounts", [])
                     if idx >= len(accs):
                         bot.reply_to(message, "Аккаунт не найден.")
                         self._clear_dialog(cid)
@@ -480,22 +671,34 @@ class TelegramController:
                     cookies_path = self.BASE / "accounts" / safe_name / "cookies.json"
                     acc_name = name
 
-                # Сохраняем куки
+                # Сохраняем куки на диск
                 cookies_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(cookies_path, "w", encoding="utf-8") as f:
                     json.dump(cookies_json, f, ensure_ascii=False, indent=2)
 
-                # Добавляем в config если новый
+                # K1: при добавлении нового аккаунта — пишем в accounts.json,
+                # а не в config.json. Раньше TG-бот добавлял в cfg["accounts"],
+                # но bot.py читал accounts.json приоритетно — изменения через
+                # TG не доходили до бота.
                 if idx is None:
-                    cfg = self._cfg()
                     rel_path = cookies_path.relative_to(self.BASE).as_posix()
-                    cfg.setdefault("accounts", []).append(
-                        {
-                            "name": acc_name,
-                            "cookies_path": rel_path,
-                        }
-                    )
-                    self._save_cfg(cfg)
+                    try:
+                        from accounts import add_account
+
+                        add_account(
+                            self.BASE,
+                            {"name": acc_name, "cookies_path": rel_path, "enabled": True},
+                            cfg=self._cfg(),
+                        )
+                    except ValueError as exc:
+                        bot.reply_to(message, f"Не удалось добавить аккаунт: {exc}")
+                        self._clear_dialog(cid)
+                        return
+                    except Exception as exc:
+                        logger.exception("add_account failed")
+                        bot.reply_to(message, f"Ошибка записи accounts.json: {exc}")
+                        self._clear_dialog(cid)
+                        return
 
                 self._clear_dialog(cid)
                 bot.reply_to(
@@ -639,17 +842,34 @@ class TelegramController:
                 if not user_id:
                     bot.reply_to(message, "ID не может быть пустым.")
                     return
-                cfg = self._cfg()
-                accs = cfg.get("accounts", [])
-                if idx >= len(accs):
+                accs = self._accounts()
+                if idx is None or idx >= len(accs):
                     bot.reply_to(message, "Аккаунт не найден.")
                     self._clear_dialog(cid)
                     return
-                accs[idx]["user_id"] = user_id
-                self._save_cfg(cfg)
+                acc_name = accs[idx]["name"]
+                # K1: пишем в accounts.json. Поле adspower_id — новое каноническое
+                # имя (G2), user_id поддерживается как alias и проставляется
+                # автоматически в _normalize_only.
+                try:
+                    from accounts import update_account
+
+                    updated = update_account(
+                        self.BASE,
+                        acc_name,
+                        {"adspower_id": user_id, "user_id": user_id},
+                        cfg=self._cfg(),
+                    )
+                except Exception as exc:
+                    logger.exception("update_account failed")
+                    bot.reply_to(message, f"Ошибка записи accounts.json: {exc}")
+                    self._clear_dialog(cid)
+                    return
+                if updated is None:
+                    bot.reply_to(message, f"Аккаунт '{acc_name}' не найден.")
                 self._clear_dialog(cid)
                 bot.reply_to(
-                    message, f"✅ AdsPower ID для '{accs[idx]['name']}' установлен: {user_id}"
+                    message, f"✅ AdsPower ID для '{acc_name}' установлен: {user_id}"
                 )
                 self._show_accounts(cid)
 
@@ -819,10 +1039,12 @@ class TelegramController:
                     self._send(cid, text, kb_back())
 
             # ── Аккаунты: детали ──────────────────────────────────────────────
+            # K1: все handler'ы используют self._accounts() (читает accounts.json),
+            # удаление — accounts.remove_account (пишет в accounts.json), т.к.
+            # bot.py читает аккаунты приоритетно из accounts.json (G2).
             elif d.startswith("acc_detail_"):
                 idx = int(d.split("_")[-1])
-                cfg = self._cfg()
-                accs = cfg.get("accounts", [])
+                accs = self._accounts()
                 if idx >= len(accs):
                     self._send(cid, "Аккаунт не найден.")
                     return
@@ -830,9 +1052,10 @@ class TelegramController:
                 cookie_ok = (self.BASE / acc.get("cookies_path", "")).exists()
                 text = (
                     f"👤 {acc['name']}\n"
-                    f"AdsPower ID: {acc.get('user_id', '❌ НЕ ЗАДАН')}\n"
+                    f"AdsPower ID: {acc.get('user_id') or acc.get('adspower_id') or '❌ НЕ ЗАДАН'}\n"
                     f"Куки: {'✅ есть' if cookie_ok else '❌ нет'}\n"
-                    f"Путь: {acc.get('cookies_path', '—')}"
+                    f"Путь: {acc.get('cookies_path', '—')}\n"
+                    f"Enabled: {'✅' if acc.get('enabled', True) else '💤 (disabled)'}"
                 )
                 try:
                     bot.edit_message_text(
@@ -847,8 +1070,7 @@ class TelegramController:
 
             elif d.startswith("acc_cookies_"):
                 idx = int(d.split("_")[-1])
-                cfg = self._cfg()
-                accs = cfg.get("accounts", [])
+                accs = self._accounts()
                 if idx >= len(accs):
                     self._send(cid, "Аккаунт не найден.")
                     return
@@ -857,18 +1079,16 @@ class TelegramController:
 
             elif d.startswith("acc_userid_"):
                 idx = int(d.split("_")[-1])
-                cfg = self._cfg()
-                accs = cfg.get("accounts", [])
+                accs = self._accounts()
                 if idx >= len(accs):
                     self._send(cid, "Аккаунт не найден.")
                     return
                 self._set_dialog(cid, "acc_set_userid", {"idx": idx})
                 self._send(cid, f"Введите AdsPower User ID для аккаунта '{accs[idx]['name']}':")
 
-            elif d.startswith("acc_del_"):
+            elif d.startswith("acc_del_") and not d.startswith("acc_del_ok_"):
                 idx = int(d.split("_")[-1])
-                cfg = self._cfg()
-                accs = cfg.get("accounts", [])
+                accs = self._accounts()
                 if idx >= len(accs):
                     self._send(cid, "Аккаунт не найден.")
                     return
@@ -888,16 +1108,27 @@ class TelegramController:
 
             elif d.startswith("acc_del_ok_"):
                 idx = int(d.split("_")[-1])
-                cfg = self._cfg()
-                accs = cfg.get("accounts", [])
+                accs = self._accounts()
                 if idx >= len(accs):
                     self._send(cid, "Аккаунт не найден.")
                     return
-                # Имя удаляемого аккаунта используется только для лога;
-                # _show_accounts перерисует список и будет видно, что нет.
-                logger.info("Removing account index=%s name=%s", idx, accs[idx].get("name"))
-                cfg["accounts"].pop(idx)
-                self._save_cfg(cfg)
+                acc_name = accs[idx]["name"]
+                logger.info("Removing account index=%s name=%s", idx, acc_name)
+                # K1: удаление через accounts.remove_account (пишет в accounts.json).
+                # Раньше: cfg["accounts"].pop(idx) + save_cfg → bot.py всё равно
+                # читал accounts.json и видел удалённый аккаунт как "живой".
+                try:
+                    from accounts import remove_account
+
+                    removed = remove_account(self.BASE, acc_name, cfg=self._cfg())
+                except Exception as exc:
+                    logger.exception("remove_account failed")
+                    self._send(cid, f"Ошибка удаления: {exc}", kb_back("accounts_menu"))
+                    return
+                if not removed:
+                    self._send(
+                        cid, f"Аккаунт '{acc_name}' не найден.", kb_back("accounts_menu")
+                    )
                 self._show_accounts(cid, call.message)
 
             # ── Прокси ────────────────────────────────────────────────────────
@@ -1032,29 +1263,25 @@ class TelegramController:
                     self._send(cid, f"Ошибка переклассификации: {str(e)}", kb_classification())
 
             elif d == "classification_stats":
+                # K3: используем DatabaseManager.get_classification_stats() вместо
+                # прямого sqlite3.connect (соблюдаем AGENTS.md "Never bypass
+                # DatabaseManager"). Раньше: ручной conn без WAL/busy_timeout,
+                # без write_lock, без надёжного close при exception.
                 try:
-                    import sqlite3
-
                     from database import DatabaseManager
 
-                    db_manager = DatabaseManager()
-                    # Get classification statistics
-                    conn = sqlite3.connect(db_manager.db_path)
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "SELECT classification, COUNT(*) as count FROM listings WHERE classification IS NOT NULL GROUP BY classification"
-                    )
-                    results = cursor.fetchall()
-                    stats = {row[0]: row[1] for row in results}
-                    total = sum(count for _, count in results)
-                    text = "📊 Статистика классификации:\n"
-                    for classification, count in stats.items():
-                        text += f"{classification}: {count}\n"
-                    text += f"Всего: {total}"
-                    self._send(cid, text, kb_classification())
-                    conn.close()
+                    stats = DatabaseManager().get_classification_stats()
+                    if not stats["total"]:
+                        self._send(cid, "📊 Нет классифицированных объявлений.", kb_classification())
+                    else:
+                        lines = ["📊 Статистика классификации:"]
+                        for label, count in sorted(stats["by_label"].items()):
+                            lines.append(f"{label}: {count}")
+                        lines.append(f"Всего: {stats['total']}")
+                        self._send(cid, "\n".join(lines), kb_classification())
                 except Exception as e:
-                    self._send(cid, f"Ошибка получения статистики: {str(e)}", kb_classification())
+                    logger.exception("classification_stats failed")
+                    self._send(cid, f"Ошибка получения статистики: {e}", kb_classification())
 
             elif d == "create_ground_truth":
                 # This would trigger the creation of ground truth data

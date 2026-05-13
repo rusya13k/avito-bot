@@ -9,5 +9,12 @@
   "openai_model": "gpt-3.5-turbo",
   "openai_api_base": "https://api.openai.com/v1",
   "adspower_api_key": "",
-  "captcha_cooldown_minutes": 30
+  "captcha_cooldown_minutes": 30,
+  "daily_budget_listings": 80,
+  "daily_budget_messages": 30,
+  "daily_budget_phone": 25,
+  "session_pause_min": 30,
+  "session_pause_max": 90,
+  "active_hours_start": 9,
+  "active_hours_end": 23
 }

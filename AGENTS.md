@@ -20,7 +20,7 @@ python -m pytest tests/ -v
 python -c "import bot, tg_bot, database, commercial_parser, avito_messenger, avito_client, llm_classifier, listing_classifier, heuristic_scorer, logging_setup, env_config, accounts; print('OK')"
 ```
 
-A successful baseline: `84 tests pass, ruff returns "All checks passed!"`.
+A successful baseline: `187 tests pass, ruff returns "All checks passed!"`.
 
 ## Project conventions
 
@@ -84,9 +84,13 @@ A successful baseline: `84 tests pass, ruff returns "All checks passed!"`.
 ## Sprint status
 
 Tracked in `zadachi.txt`. As of latest:
-- **Sprints 1-5 + E2 + G1 + G2 done**: A1-A3, B1-B4, C1-C5, D1-D5, E1-E4,
-  F1-F2+F4-F5, G1, G2, H1-H4.
-- **Pending**: G3 (task queue — recommended only when scaling).
+- **All sprints done**: Sprints 1-5, E2 (metrics + search_filters), G1, G2,
+  Tier1 (A1-A4: proxy, budget, phone-limit, session-pauses),
+  Tier2 (B1-B4: warmup, active-hours, thread-rng, long-cooldown),
+  Tier3 (C1-C3: health-score, budget-alerts, captcha-log).
+- **TG commands**: `/report`, `/budget`, `/lastcaptcha`, `/health`, `/warmup`.
+- **Not recommended now**: G3/D1 (task queue — only for 10+ accounts),
+  E1 (G1 Phase 2 — defer until major selector changes).
 
 ### E2 — Metrics
 

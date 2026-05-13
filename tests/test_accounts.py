@@ -227,3 +227,211 @@ def test_account_state_invalid_override_is_ignored():
     until = s.mark_captcha("acc1")
     expected = time.time() + DEFAULT_CAPTCHA_COOLDOWN_MINUTES * 60
     assert abs(until - expected) < 5
+
+
+# ──────────────────────────────────────────────────────────────────────
+# K1: load_all_accounts + CRUD (save/add/update/remove)
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_load_all_accounts_includes_disabled(repo):
+    """K1: load_all_accounts возвращает И disabled-аккаунты — для UI TG-бота."""
+    from accounts import load_all_accounts
+
+    _write_accounts(
+        repo,
+        [
+            {"name": "acc1"},
+            {"name": "acc2", "enabled": False},
+            {"name": "acc3", "enabled": True},
+        ],
+    )
+    all_accs = load_all_accounts(repo)
+    names = [a["name"] for a in all_accs]
+    assert names == ["acc1", "acc2", "acc3"]
+    assert all_accs[0]["enabled"] is True
+    assert all_accs[1]["enabled"] is False  # сохранён как есть
+    assert all_accs[2]["enabled"] is True
+
+    # А load_accounts (без _all_) — отфильтрует disabled
+    visible = load_accounts(repo)
+    assert [a["name"] for a in visible] == ["acc1", "acc3"]
+
+
+def test_load_all_accounts_falls_back_to_cfg(repo):
+    """K1: если accounts.json нет, читаем cfg['accounts'] — но БЕЗ фильтра."""
+    from accounts import load_all_accounts
+
+    cfg = {"accounts": [{"name": "a", "enabled": False}, {"name": "b"}]}
+    accs = load_all_accounts(repo, cfg)
+    names = [a["name"] for a in accs]
+    assert names == ["a", "b"]
+
+
+def test_save_accounts_writes_and_load_roundtrips(repo):
+    from accounts import load_all_accounts, save_accounts
+
+    data = [
+        {"name": "alpha", "adspower_id": "a1", "enabled": True},
+        {"name": "beta", "adspower_id": "b1", "enabled": False, "phone": "+7..."},
+    ]
+    target = save_accounts(repo, data)
+    assert target.exists()
+    assert target.name == ACCOUNTS_JSON_FILENAME
+
+    # Файл читаемый JSON
+    on_disk = json.loads(target.read_text(encoding="utf-8"))
+    assert on_disk == data
+
+    # load_all_accounts возвращает то же содержимое (с alias-нормализацией)
+    loaded = load_all_accounts(repo)
+    assert [a["name"] for a in loaded] == ["alpha", "beta"]
+    # alias adspower_id → user_id
+    assert loaded[0]["user_id"] == "a1"
+
+
+def test_save_accounts_validates_each_item(repo):
+    from accounts import save_accounts
+
+    with pytest.raises(TypeError):
+        save_accounts(repo, ["not a dict"])  # type: ignore[list-item]
+    with pytest.raises(ValueError):
+        save_accounts(repo, [{"name": ""}])
+    with pytest.raises(ValueError):
+        save_accounts(repo, [{"adspower_id": "x"}])  # нет name
+
+
+def test_add_account_appends_and_persists(repo):
+    from accounts import add_account, load_all_accounts
+
+    _write_accounts(repo, [{"name": "existing"}])
+    add_account(repo, {"name": "new_acc", "phone": "+71112223344"})
+
+    accs = load_all_accounts(repo)
+    names = [a["name"] for a in accs]
+    assert names == ["existing", "new_acc"]
+
+
+def test_add_account_rejects_duplicate(repo):
+    from accounts import add_account
+
+    _write_accounts(repo, [{"name": "existing"}])
+    with pytest.raises(ValueError, match="уже существует"):
+        add_account(repo, {"name": "existing"})
+
+
+def test_add_account_rejects_empty_name(repo):
+    from accounts import add_account
+
+    with pytest.raises(ValueError, match="обязателен"):
+        add_account(repo, {"name": "   "})
+
+
+def test_add_account_creates_file_if_missing(repo):
+    """K1: первый add_account при отсутствии accounts.json — создаёт файл."""
+    from accounts import add_account
+
+    assert not (repo / ACCOUNTS_JSON_FILENAME).exists()
+    add_account(repo, {"name": "first"})
+    assert (repo / ACCOUNTS_JSON_FILENAME).exists()
+
+
+def test_add_account_migrates_from_cfg_on_first_write(repo):
+    """
+    K1: если accounts.json нет, но в cfg["accounts"] что-то есть, первый
+    add_account ДОЛЖЕН перенести существующие аккаунты в accounts.json
+    (иначе они потеряются при следующем чтении).
+    """
+    from accounts import add_account, load_all_accounts
+
+    cfg = {"accounts": [{"name": "legacy_acc"}]}
+    add_account(repo, {"name": "new_acc"}, cfg=cfg)
+
+    accs = load_all_accounts(repo)
+    assert [a["name"] for a in accs] == ["legacy_acc", "new_acc"]
+
+
+def test_update_account_patches_fields(repo):
+    from accounts import load_all_accounts, update_account
+
+    _write_accounts(repo, [{"name": "a", "phone": "old"}])
+    updated = update_account(repo, "a", {"phone": "new", "user_id": "uid42"})
+    assert updated is not None
+    assert updated["phone"] == "new"
+    assert updated["user_id"] == "uid42"
+
+    on_disk = load_all_accounts(repo)
+    assert on_disk[0]["phone"] == "new"
+    assert on_disk[0]["user_id"] == "uid42"
+
+
+def test_update_account_returns_none_for_unknown(repo):
+    from accounts import update_account
+
+    _write_accounts(repo, [{"name": "exists"}])
+    assert update_account(repo, "nope", {"phone": "x"}) is None
+
+
+def test_remove_account_deletes_and_persists(repo):
+    from accounts import load_all_accounts, remove_account
+
+    _write_accounts(repo, [{"name": "a"}, {"name": "b"}, {"name": "c"}])
+    assert remove_account(repo, "b") is True
+
+    accs = load_all_accounts(repo)
+    assert [a["name"] for a in accs] == ["a", "c"]
+
+
+def test_remove_account_returns_false_for_unknown(repo):
+    from accounts import remove_account
+
+    _write_accounts(repo, [{"name": "a"}])
+    assert remove_account(repo, "nope") is False
+    # содержимое не изменилось
+    assert (repo / ACCOUNTS_JSON_FILENAME).read_text(encoding="utf-8") != ""
+
+
+def test_atomic_write_does_not_leave_temp_files(repo):
+    """
+    K1: при штатной записи временные .accounts_*.json.tmp не остаются.
+    Это проверка правильного использования tempfile + os.replace.
+    """
+    from accounts import save_accounts
+
+    save_accounts(repo, [{"name": "a"}])
+    save_accounts(repo, [{"name": "a"}, {"name": "b"}])
+
+    leftovers = list(repo.glob(".accounts_*.json.tmp"))
+    assert leftovers == [], f"Остались temp-файлы: {leftovers}"
+
+
+def test_concurrent_add_account_is_safe(repo, tmp_path):
+    """
+    K1: 10 параллельных потоков add_account не теряют изменения и не
+    падают на UNIQUE-нарушении (все имена разные).
+    """
+    import threading
+
+    from accounts import add_account, load_all_accounts
+
+    save_path = repo / ACCOUNTS_JSON_FILENAME
+    save_path.write_text("[]", encoding="utf-8")
+
+    errors: list[Exception] = []
+
+    def worker(i):
+        try:
+            add_account(repo, {"name": f"acc{i}"})
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == [], f"Ошибки в параллельных add_account: {errors}"
+    final = load_all_accounts(repo)
+    names = sorted(a["name"] for a in final)
+    assert names == sorted(f"acc{i}" for i in range(10))

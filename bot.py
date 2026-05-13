@@ -357,7 +357,13 @@ def check_block(driver, account_name):
     return False
 
 
-def view_listing(driver, wait, account_name):
+def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.05):
+    """
+    F1: favorite_rate — вероятность «Добавить в избранное» (default 8%).
+    F1: call_rate    — вероятность нажать «Позвонить»       (default 5%).
+    Оба параметра конфигурируются через config.json / accounts.json
+    (ключи view_listing_favorite_rate / view_listing_call_rate).
+    """
     if check_block(driver, account_name):
         return False
 
@@ -401,8 +407,9 @@ def view_listing(driver, wait, account_name):
         random_mouse_move(driver)
         hp(1, 4)
 
-    # Add to favorites with 70% probability
-    if random.random() < 0.70:
+    # F1: «Добавить в избранное» — реалистичная вероятность 8% вместо 70%.
+    # Конфигурируется через view_listing_favorite_rate в config.json/accounts.json.
+    if random.random() < favorite_rate:
         try:
             fav_btn = WebDriverWait(driver, 6).until(
                 EC.element_to_be_clickable(
@@ -423,30 +430,61 @@ def view_listing(driver, wait, account_name):
         except Exception:
             pass
 
-    # Click "Call" in ~55% of cases
-    if random.random() < 0.55:
-        try:
-            call_btn = WebDriverWait(driver, 8).until(
-                EC.element_to_be_clickable(
-                    (
-                        By.XPATH,
-                        "//button[@data-marker='item-contact-bar/call'] | "
-                        "//button[contains(@class,'phone-button')] | "
-                        "//button[.//span[contains(text(),'Позвонить')]]",
+    # F1: «Позвонить» — реалистичная вероятность 5% вместо 55%.
+    # A3: проверяем дневной/сессионный лимит phone_clicks перед кликом —
+    # та же защита, что и для «Показать телефон» в commercial_parser.
+    # Конфигурируется через view_listing_call_rate в config.json/accounts.json.
+    if random.random() < call_rate:
+        if account_state.should_skip_phone(account_name):
+            log(account_name, "  A3: Пропуск 'Позвонить' — дневной/сессионный лимит")
+        else:
+            try:
+                call_btn = WebDriverWait(driver, 8).until(
+                    EC.element_to_be_clickable(
+                        (
+                            By.XPATH,
+                            "//button[@data-marker='item-contact-bar/call'] | "
+                            "//button[contains(@class,'phone-button')] | "
+                            "//button[.//span[contains(text(),'Позвонить')]]",
+                        )
                     )
                 )
-            )
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", call_btn)
-            hp(1.5, 3.5)
-            move_click(driver, call_btn)
-            log(account_name, "  'Call' button pressed.")
-            hp(5, 12)  # Stay after call
-        except Exception:
-            log(account_name, "  'Call' button not found.")
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", call_btn)
+                hp(1.5, 3.5)
+                move_click(driver, call_btn)
+                log(account_name, "  'Call' button pressed.")
+                account_state.record_phone_click(account_name)  # F1: учитываем в A3
+                hp(5, 12)  # Stay after call
+            except Exception:
+                log(account_name, "  'Call' button not found.")
 
     # Final dwell before leaving
     hp(2, 5)
     return True
+
+
+# ── F2: Variable batch sizes ──────────────────────────────────────────────────
+
+# Весовое распределение для числа листингов за один запрос/категорию.
+# Индекс = количество листингов; 0 исключён — всегда ≥ 1.
+# Пик на 2-4, длинный хвост до max_n. Реальный пользователь:
+#   иногда смотрит 1-2 (надоело), чаще 2-4, изредка 6-7 (заинтересован).
+_LISTING_COUNT_WEIGHTS = [0, 0.10, 0.25, 0.30, 0.20, 0.10, 0.04, 0.01]  # idx 0..7
+
+
+def _weighted_listing_count(max_n: int = 7) -> int:
+    """
+    F2: возвращает случайное число листингов от 1 до max_n включительно,
+    взвешенное по _LISTING_COUNT_WEIGHTS. Результат всегда ≥ 1.
+
+    max_n > 7 округляется до 7 (длина таблицы весов).
+    """
+    effective_max = min(max_n, len(_LISTING_COUNT_WEIGHTS) - 1)
+    effective_max = max(1, effective_max)
+    weights = _LISTING_COUNT_WEIGHTS[: effective_max + 1]
+    # random.choices нормализует веса, поэтому weights[0]=0 — не проблема.
+    result = random.choices(range(len(weights)), weights=weights)[0]
+    return max(1, result)  # гарантируем ≥ 1
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -469,17 +507,65 @@ def safe_get(driver, url, account_name, retries=2):
     return False
 
 
-# Thematic queries for Yandex warmup
+# F4: тематические запросы для Yandex warmup (коммерческая недвижимость).
+# Расширены с 8 до 28 — разные формулировки, регионы, типы объектов.
+# Цель: не повторять один и тот же запрос каждый день → меньше паттерна.
 THEMATIC_QUERIES = [
+    # Утвердительные — «купить/арендовать»
     "коммерческая недвижимость в москве купить",
     "аренда офиса от собственника",
+    "купить офис в центре москвы",
     "склады и производства продажа",
     "торговые площади в аренду миллионники",
     "купить готовый бизнес в россии",
-    "инвестиции в недвижимость 2024",
+    "инвестиции в коммерческую недвижимость",
     "авито коммерческая недвижимость",
     "помещение свободного назначения купить",
+    "аренда склада от собственника московская область",
+    "купить торговое помещение в спб",
+    "офис в аренду без посредников",
+    # Вопросительные — «сколько стоит / как»
+    "сколько стоит арендовать офис в москве",
+    "как купить коммерческую недвижимость",
+    "сколько стоит аренда склада в подмосковье",
+    "как оформить аренду коммерческой недвижимости",
+    # С регионом
+    "коммерческая недвижимость казань 2024",
+    "аренда офиса екатеринбург от собственника",
+    "торговые помещения краснодар продажа",
+    "офисы новосибирск аренда недорого",
+    "коммерческая недвижимость ростов-на-дону",
+    "склад аренда самара от собственника",
+    # С характеристиками
+    "офис 200 м2 аренда москва центр",
+    "торговое помещение 100 квм первый этаж",
+    "склад 1000 кв м ответственное хранение",
+    # Сделочные / информационные
+    "договор аренды коммерческой недвижимости образец",
+    "налог при продаже коммерческой недвижимости",
+    "оценка коммерческой недвижимости онлайн",
 ]
+
+
+def _pick_queries(num: int) -> list[str]:
+    """
+    F4: формирует список запросов для Yandex warmup с распределением:
+      70% — тематические (THEMATIC_QUERIES, коммерческая недвижимость)
+      25% — общие (YANDEX_QUERIES, чтобы не выглядеть «маньяком одной темы»)
+       5% — пропуск (аккаунт открыл Yandex, но ничего не искал)
+
+    num — сколько запросов хотим, возвращаем список фактически выбранных.
+    Может быть короче num, если часть позиций попала в «пропуск».
+    """
+    pool = []
+    for _ in range(num):
+        r = random.random()
+        if r < 0.70:
+            pool.append(random.choice(THEMATIC_QUERIES))
+        elif r < 0.95:
+            pool.append(random.choice(YANDEX_QUERIES))
+        # else: 5% — пропуск (idle warmup, просто открыли Яндекс)
+    return pool
 
 
 def update_profile_proxy(adspower_api, user_id, proxy_str):
@@ -517,7 +603,8 @@ def yandex_warmup(driver, wait, account_name, num_queries=2):
     if not safe_get(driver, "https://ya.ru", account_name):
         return False
 
-    queries = random.sample(THEMATIC_QUERIES, min(num_queries, len(THEMATIC_QUERIES)))
+    # F4: смешиваем тематические (70%), общие (25%) и пропуски (5%).
+    queries = _pick_queries(num_queries)
     success_count = 0
 
     for q_idx, query in enumerate(queries, 1):
@@ -579,6 +666,12 @@ def yandex_warmup(driver, wait, account_name, num_queries=2):
         except Exception as e:
             log(account_name, f"    Query failed: {str(e)[:50]}")
 
+    # F4: если queries пустой (все слоты попали в 5%-пропуск) — это нормально:
+    # аккаунт просто открыл Яндекс и ничего не искал. Не считается провалом.
+    if not queries:
+        log(account_name, "Warmup completed (idle — no queries this time).")
+        return True
+
     if success_count == 0:
         log(account_name, "  Warmup FAILED: No successful queries.")
         return False
@@ -587,14 +680,49 @@ def yandex_warmup(driver, wait, account_name, num_queries=2):
     return True
 
 
-def browse_commercial_categories(driver, wait, account_name, num_categories=3, ads_per_category=3):
+def browse_commercial_categories(
+    driver,
+    wait,
+    account_name,
+    num_categories=None,
+    ads_per_category=None,
+    search_filters=None,
+    favorite_rate=0.08,
+    call_rate=0.05,
+    max_categories_per_browse=4,
+    max_listings_per_browse=4,
+):
+    """
+    F2: num_categories и ads_per_category по умолчанию None — тогда используется
+    _weighted_listing_count() для случайного числа в диапазоне [1, max_*].
+    Явная передача числа переопределяет случайное поведение (для тестов).
+    """
+    # F2: случайное число категорий и листингов за категорию
+    n_cats = (
+        num_categories
+        if num_categories is not None
+        else _weighted_listing_count(max_n=max_categories_per_browse)
+    )
+    n_ads = (
+        ads_per_category
+        if ads_per_category is not None
+        else _weighted_listing_count(max_n=max_listings_per_browse)
+    )
     log(account_name, "=== Browsing commercial real estate categories on Avito ===")
+    log(account_name, f"  F2: категорий={n_cats}, листингов/кат={n_ads}")
     chosen = random.sample(
-        AVITO_COMMERCIAL_CATEGORIES, min(num_categories, len(AVITO_COMMERCIAL_CATEGORIES))
+        AVITO_COMMERCIAL_CATEGORIES, min(n_cats, len(AVITO_COMMERCIAL_CATEGORIES))
     )
 
+    # E2: per-account city filter — если задано, вставляем в URL.
+    _sf = search_filters or {}
+    _cities = _sf.get("cities")
+    _city_prefix = ""
+    if _cities:
+        _city_prefix = "/" + random.choice(_cities)
+
     for cat in chosen:
-        url = "https://www.avito.ru" + cat
+        url = "https://www.avito.ru" + _city_prefix + cat
         log(account_name, f"  Category: {cat}")
         if not safe_get(driver, url, account_name):
             continue
@@ -611,7 +739,7 @@ def browse_commercial_categories(driver, wait, account_name, num_categories=3, a
 
         hrefs = [
             lnk.get_attribute("href")
-            for lnk in random.sample(links, min(ads_per_category, len(links)))
+            for lnk in random.sample(links, min(n_ads, len(links)))
             if lnk.get_attribute("href")
         ]
 
@@ -619,14 +747,23 @@ def browse_commercial_categories(driver, wait, account_name, num_categories=3, a
             log(account_name, f"    Listing {i}/{len(hrefs)}")
             if not safe_get(driver, href, account_name):
                 break
-            if not view_listing(driver, wait, account_name):
+            if not view_listing(
+                driver, wait, account_name,
+                favorite_rate=favorite_rate, call_rate=call_rate,
+            ):
                 break
             driver.back()
             hp(2, 4)
 
 
-def find_and_view_commercial_listings(driver, wait, account_name, db_manager):
-    """Search for commercial real estate listings in million-plus cities with price filters."""
+def find_and_view_commercial_listings(
+    driver, wait, account_name, db_manager, search_filters=None, max_listings_per_search=7
+):
+    """Search for commercial real estate listings in million-plus cities with price filters.
+
+    F2: max_listings_per_search — верхняя граница весового распределения
+    числа листингов за один вызов. Default 7.
+    """
     log(account_name, "=== Commercial real estate search (Million Cities + Price Filters) ===")
 
     # A3: если аккаунт недавно попал на капчу — не дёргаем Avito.
@@ -639,14 +776,30 @@ def find_and_view_commercial_listings(driver, wait, account_name, db_manager):
     new_listings_count = 0
     error_count = 0
 
-    deal_type = random.choice(["sale", "rent"])
+    # E2: per-account search_filters переопределяют глобальные константы.
+    _sf = search_filters or {}
+
+    # Тип сделки: "deal_type" (строка) или "deal_types" (список); иначе random.
+    _deal_types = _sf.get("deal_types") or (
+        [_sf["deal_type"]] if _sf.get("deal_type") else ["sale", "rent"]
+    )
+    deal_type = random.choice(_deal_types)
+
     config = COMMERCIAL_SEARCH_FILTERS[deal_type]
 
-    city = random.choice(MILLION_CITIES)
+    # Города: per-account список или глобальный MILLION_CITIES.
+    _cities = _sf.get("cities") or MILLION_CITIES
+    city = random.choice(_cities)
+
     category_path = random.choice(config["paths"])
-    min_price = config["min_price"]
+
+    # Цена: per-account переопределяет config["min_price"]; pmax — опционально.
+    min_price = _sf.get("price_min") if _sf.get("price_min") is not None else config["min_price"]
+    max_price = _sf.get("price_max")
 
     url = f"https://www.avito.ru/{city}{category_path}?pmin={min_price}"
+    if max_price is not None:
+        url += f"&pmax={max_price}"
 
     log(account_name, f"  Searching in {city} for {deal_type} (min {min_price} RUB)")
     log(account_name, f"  URL: {url}")
@@ -661,9 +814,12 @@ def find_and_view_commercial_listings(driver, wait, account_name, db_manager):
         log(account_name, f"  No listings found in {city} for this category.")
         return 0, 0, 0
 
+    # F2: случайное число листингов [1, max_listings_per_search] с весами.
+    _n = _weighted_listing_count(max_n=max_listings_per_search)
+    log(account_name, f"  F2: листингов в этом запросе={_n}")
     hrefs = [
         lnk.get_attribute("href")
-        for lnk in random.sample(links, min(5, len(links)))
+        for lnk in random.sample(links, min(_n, len(links)))
         if lnk.get_attribute("href")
     ]
 
@@ -946,6 +1102,76 @@ def get_random_proxy():
         return None
 
 
+def _apply_account_proxy(
+    adspower: "AdsPowerAPI",
+    user_id: str,
+    account: dict,
+    account_name: str,
+) -> str | None:
+    """
+    A1: Выбирает и применяет прокси для AdsPower-профиля.
+
+    Порядок:
+      1. Поле "proxy" из accounts.json (per-account).
+      2. Случайный прокси из proxies.txt (глобальный fallback).
+      3. Если ничего нет — логирует ERROR (E4 → TG) и возвращает None.
+
+    Возвращает строку прокси, который удалось применить, или None.
+    """
+    account_proxy = account.get("proxy")
+
+    if account_proxy:
+        if update_profile_proxy(adspower, user_id, account_proxy):
+            log(account_name, "A1: Per-account proxy установлен")
+            return account_proxy
+        log(account_name, "A1: Не удалось установить per-account proxy — пробую proxies.txt")
+
+    fallback = get_random_proxy()
+    if fallback:
+        if update_profile_proxy(adspower, user_id, fallback):
+            log(account_name, "A1: Fallback proxy из proxies.txt установлен")
+            return fallback
+        log(account_name, "A1: Fallback proxy из proxies.txt не удалось установить")
+
+    _bot_logger.error(
+        "[%s] A1: Нет доступного прокси — ни per-account, ни в proxies.txt. "
+        "Аккаунт пропущен для защиты от блокировки. "
+        'Добавь поле "proxy" в accounts.json или заполни proxies.txt.',
+        account_name,
+    )
+    return None
+
+
+# ── B2: Активное окно времени ─────────────────────────────────────────────
+
+
+def _is_in_active_hours(account: dict, cfg: dict) -> bool:
+    """
+    B2: True если текущий час (local time) попадает в активное окно
+    [active_hours_start, active_hours_end). Дефолт: 9..23.
+    Per-account override имеет приоритет над глобальным из config.json.
+    """
+    start = int(account.get("active_hours_start", cfg.get("active_hours_start", 9)))
+    end = int(account.get("active_hours_end", cfg.get("active_hours_end", 23)))
+    hour = time.localtime().tm_hour
+    return start <= hour < end
+
+
+def _seconds_until_active_hours(account: dict, cfg: dict) -> float:
+    """
+    B2: сколько секунд до начала активного окна.
+    Если сейчас уже в окне — вернёт 0.
+    """
+    start = int(account.get("active_hours_start", cfg.get("active_hours_start", 9)))
+    now = time.localtime()
+    current_secs = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
+    target_secs = start * 3600
+    if current_secs < target_secs:
+        return float(target_secs - current_secs)
+    # уже после start сегодня → ждём до завтра
+    return float(86400 - current_secs + target_secs)
+
+
 def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: DatabaseManager):
     account_name = account["name"]
     user_id = account.get("user_id")
@@ -956,6 +1182,78 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
     account_state.set_account_cooldown_minutes(
         account_name, account.get("captcha_cooldown_minutes")
     )
+
+    # A2: применяем per-account дневные бюджеты из accounts.json.
+    # Ключи: daily_budget_listings / daily_budget_messages / daily_budget_phone.
+    # Значение None → не переопределяем (используем глобальный дефолт).
+    _budget_overrides = {
+        "listings": account.get("daily_budget_listings"),
+        "messages": account.get("daily_budget_messages"),
+        "phone": account.get("daily_budget_phone"),
+    }
+    account_state.set_daily_budget_limits(account_name, _budget_overrides)
+
+    # ── B1: Warmup-режим для нового аккаунта ──────────────────────────────
+    # Если в accounts.json задано "created_at": "YYYY-MM-DD", то первые
+    # warmup_days дней (default 3) аккаунт работает в щадящем режиме:
+    # нет кликов телефона, нет LLM-сообщений, меньше листингов.
+    _created_at_str = account.get("created_at")
+    if _created_at_str:
+        try:
+            import datetime as _dt
+
+            _created_dt = _dt.datetime.strptime(_created_at_str, "%Y-%m-%d")
+            _warmup_days = int(account.get("warmup_days", 3))
+            _warmup_end_ts = _created_dt.timestamp() + _warmup_days * 86400
+            account_state.set_warmup_until(account_name, _warmup_end_ts)
+            if account_state.is_in_warmup(account_name):
+                _warmup_listing_limit = int(account.get("warmup_daily_listings", 20))
+                account_state.set_daily_budget_limits(
+                    account_name, {"listings": _warmup_listing_limit}
+                )
+                log(
+                    account_name,
+                    f"B1: warmup-режим до {_dt.datetime.fromtimestamp(_warmup_end_ts).strftime('%Y-%m-%d')} "
+                    f"(+{_warmup_days} дн. с created_at). "
+                    f"Листингов/день: {_warmup_listing_limit}. Телефон и сообщения — выкл.",
+                )
+        except (ValueError, OSError):
+            _bot_logger.warning(
+                "[%s] B1: некорректный created_at=%r — warmup пропускаем",
+                account_name,
+                _created_at_str,
+            )
+
+    # ── C1: Health score — применяем ограничения если нужно ──────────────
+    # Вычисляем captcha_rate за 7 дней ПОСЛЕ применения per-account бюджетов
+    # (B1/A2), чтобы health-ограничения были дополнительным слоем поверх.
+    try:
+        from account_state import apply_health_restrictions, compute_account_health
+
+        _health = compute_account_health(account_name, db_manager)
+        if _health["mode"] in ("degraded", "critical"):
+            apply_health_restrictions(account_name, _health)
+            log(
+                account_name,
+                f"C1: режим {_health['mode']} (captcha_rate={_health['score']:.3f}, "
+                f"капч={_health['captchas_7d']}, листингов={_health['listings_7d']} за 7д). "
+                "Бюджет снижен, телефон заблокирован.",
+            )
+        else:
+            log(
+                account_name,
+                f"C1: аккаунт здоров (captcha_rate={_health['score']:.3f}, "
+                f"капч={_health['captchas_7d']} за 7д).",
+            )
+    except Exception:
+        pass  # C1 не должен блокировать запуск
+
+    # ── A1: Per-account proxy setup ────────────────────────────────────────
+    # Приоритет: 1) поле "proxy" в accounts.json, 2) случайный из proxies.txt.
+    # Если прокси нет совсем — ERROR в TG (E4) и пропускаем аккаунт, чтобы
+    # несколько аккаунтов с одного IP не склеились и не были забанены вместе.
+    if _apply_account_proxy(adspower, user_id, account, account_name) is None:
+        return
 
     try:
         # Initial connect attempt
@@ -996,6 +1294,33 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
             "api_base": cfg.get("openai_api_base", "https://api.openai.com/v1"),
         }
         llm = LLMClassifier(llm_config, db_manager=db_manager)
+
+        # F1: вероятности кликов «Избранное»/«Позвонить» в view_listing.
+        # Per-account override → глобальный cfg → дефолт (8% / 5%).
+        _fav_rate = float(
+            account.get("view_listing_favorite_rate",
+                         cfg.get("view_listing_favorite_rate", 0.08))
+        )
+        _call_rate = float(
+            account.get("view_listing_call_rate",
+                         cfg.get("view_listing_call_rate", 0.05))
+        )
+
+        # F2: верхние границы числа листингов/категорий за цикл.
+        # Per-account override → глобальный cfg → дефолт.
+        _max_listings = int(
+            account.get("max_listings_per_search",
+                         cfg.get("max_listings_per_search", 7))
+        )
+        _max_cats = int(
+            account.get("max_categories_per_browse",
+                         cfg.get("max_categories_per_browse", 4))
+        )
+        _max_browse_listings = int(
+            account.get("max_listings_per_browse",
+                         cfg.get("max_listings_per_browse", 4))
+        )
+
         client = AvitoClient(
             driver,
             wait,
@@ -1003,6 +1328,12 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
             log_func=log,
             db_manager=db_manager,
             llm_classifier=llm,
+            search_filters=account.get("search_filters"),
+            favorite_rate=_fav_rate,
+            call_rate=_call_rate,
+            max_listings_per_search=_max_listings,
+            max_categories_per_browse=_max_cats,
+            max_listings_per_browse=_max_browse_listings,
         )
 
         # ── Stage 0: Yandex warmup ──
@@ -1023,19 +1354,70 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
         if _tg.stop_event.is_set():
             return
 
-        # ── Stage 2: Browse & Search ──
-        log(account_name, "  Ready to work. Selecting categories...")
-        hp(4, 10)  # Thinking time
-        client.browse_commercial_categories()
+        # ── A4: Main cycle loop ─────────────────────────────────────────────
+        # Warmup и Login выполнены выше один раз; дальше гоняем цикл пока не
+        # придёт сигнал stop. После каждого цикла — пауза 30-90 мин (A4).
+        # Per-account параметры: session_pause_min / session_pause_max.
+        _pause_min = float(account.get("session_pause_min", cfg.get("session_pause_min", 30)))
+        _pause_max = float(account.get("session_pause_max", cfg.get("session_pause_max", 90)))
 
-        if _tg.stop_event.is_set():
-            return
+        while not _tg.stop_event.is_set():
+            # ── B2: Активное окно времени ─────────────────────────────────
+            # Если текущий час вне [active_hours_start, active_hours_end)
+            # — ждём до начала окна, проверяя stop_event каждые 30 сек.
+            if not _is_in_active_hours(account, cfg):
+                _active_start = int(
+                    account.get("active_hours_start", cfg.get("active_hours_start", 9))
+                )
+                _wait_secs = _seconds_until_active_hours(account, cfg)
+                _wake_time = time.strftime("%H:%M", time.localtime(time.time() + _wait_secs))
+                log(
+                    account_name,
+                    f"B2: вне активного окна — сплю до {_active_start:02d}:00 (~{_wake_time}).",
+                )
+                _slept = 0.0
+                while _slept < _wait_secs and not _tg.stop_event.is_set():
+                    _chunk = min(30.0, _wait_secs - _slept)
+                    time.sleep(_chunk)
+                    _slept += _chunk
+                continue
 
-        processed, new_listings, errors = client.find_and_view_commercial_listings()
-        log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
+            # A3/A4: сбрасываем сессионные phone-счётчики в начале цикла.
+            account_state.start_new_session(account_name)
 
-        # ── Stage 3: Messages ──
-        client.process_messages()
+            # ── Stage 2: Browse & Search ──
+            log(account_name, "  Ready to work. Selecting categories...")
+            hp(4, 10)  # Thinking time
+            client.browse_commercial_categories()
+
+            if _tg.stop_event.is_set():
+                break
+
+            processed, new_listings, errors = client.find_and_view_commercial_listings()
+            log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
+
+            if _tg.stop_event.is_set():
+                break
+
+            # ── Stage 3: Messages ──
+            client.process_messages()
+
+            if _tg.stop_event.is_set():
+                break
+
+            # ── A4: Session pause ───────────────────────────────────────────
+            # После каждого полного цикла бот делает паузу, как реальный пользователь.
+            # Пауза прерывается при получении stop-сигнала (команда /stop в TG).
+            _pause_secs = random.uniform(_pause_min * 60, _pause_max * 60)
+            _next_time = time.strftime("%H:%M", time.localtime(time.time() + _pause_secs))
+            log(
+                account_name,
+                f"Цикл завершён. Следующий запуск в ~{_next_time} "
+                f"(пауза {_pause_secs / 60:.0f} мин).",
+            )
+            _human_delay(
+                _pause_secs, _pause_secs, stop_event=_tg.stop_event, distribution="uniform"
+            )
 
     except Exception as e:
         log(account_name, f"ERROR: {e}")
@@ -1143,7 +1525,9 @@ def _launch_commercial_bot_threads(cfg=None):
         threads.append(t)
         _tg.active_threads.append(t)
         t.start()
-        time.sleep(5)
+        # B3: случайная задержка 30-180 сек между стартами потоков.
+        # Предотвращает регулярный паттерн «все аккаунты стартуют одновременно».
+        _human_delay(30, 180, stop_event=_tg.stop_event)
 
     for t in threads:
         t.join()

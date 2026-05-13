@@ -363,3 +363,56 @@ def test_get_daily_summary_includes_metric_counters(db):
     assert s["captcha_hits"] == 1
     assert s["dialogs_handled"] == 2
     assert s["messages_sent"] == 4
+
+
+# ── K3: get_classification_stats ────────────────────────────────────
+
+
+def _add_classified(db, url, classification):
+    """Helper: создаёт листинг и проставляет ему классификацию."""
+    lid = db.upsert_listing(
+        url=url,
+        category="c",
+        area=10,
+        price=100,
+        location="loc",
+        description="d",
+        date_parsed="2024-01-01",
+        date_published="2024-01-01",
+        date_scraped="2024-01-01",
+    )
+    if classification is not None:
+        db.update_listing_classification(
+            lid, classification, 0.9, "heuristic", "2024-01-01T00:00:00"
+        )
+    return lid
+
+
+def test_get_classification_stats_empty(db):
+    """Пустая БД → total=0, by_label={}."""
+    stats = db.get_classification_stats()
+    assert stats == {"by_label": {}, "total": 0}
+
+
+def test_get_classification_stats_excludes_unclassified(db):
+    """NULL и пустая classification не попадают в статистику."""
+    _add_classified(db, "https://t/1", "owner")
+    _add_classified(db, "https://t/2", None)  # unclassified
+    _add_classified(db, "https://t/3", "")  # пустая (на случай legacy)
+
+    stats = db.get_classification_stats()
+    assert stats["by_label"] == {"owner": 1}
+    assert stats["total"] == 1
+
+
+def test_get_classification_stats_groups_by_label(db):
+    _add_classified(db, "https://t/1", "owner")
+    _add_classified(db, "https://t/2", "owner")
+    _add_classified(db, "https://t/3", "agent")
+    _add_classified(db, "https://t/4", "agent")
+    _add_classified(db, "https://t/5", "agent")
+    _add_classified(db, "https://t/6", "uncertain")
+
+    stats = db.get_classification_stats()
+    assert stats["by_label"] == {"owner": 2, "agent": 3, "uncertain": 1}
+    assert stats["total"] == 6

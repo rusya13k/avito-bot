@@ -6,7 +6,29 @@
     "password": "REPLACE_WITH_PASSWORD",
     "cookies_path": "accounts/мой_тест/cookies.json",
     "enabled": true,
-    "captcha_cooldown_minutes": 30
+    "captcha_cooldown_minutes": 30,
+    "proxy": "user:pass@host:port",
+    "daily_budget_listings": 80,
+    "daily_budget_messages": 30,
+    "daily_budget_phone": 25,
+    "session_pause_min": 30,
+    "session_pause_max": 90,
+    "created_at": "2025-01-15",
+    "warmup_days": 3,
+    "warmup_daily_listings": 20,
+    "active_hours_start": 9,
+    "active_hours_end": 23,
+    "search_filters": {
+      "cities": ["moskva", "sankt-peterburg"],
+      "deal_type": "rent",
+      "price_min": 100000,
+      "price_max": 1000000
+    },
+    "view_listing_favorite_rate": 0.08,
+    "view_listing_call_rate": 0.05,
+    "max_listings_per_search": 7,
+    "max_categories_per_browse": 4,
+    "max_listings_per_browse": 4
   },
   {
     "name": "second account (disabled пример)",

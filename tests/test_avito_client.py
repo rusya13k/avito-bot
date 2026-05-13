@@ -289,7 +289,10 @@ def test_find_and_view_commercial_listings_requires_db(driver, wait):
 def test_find_and_view_commercial_listings_delegates(client, driver, wait):
     with patch("bot.find_and_view_commercial_listings", return_value=(5, 2, 1)) as m:
         assert client.find_and_view_commercial_listings() == (5, 2, 1)
-        m.assert_called_once_with(driver, wait, "acc1", client.db)
+        m.assert_called_once()
+        _, kwargs = m.call_args
+        assert kwargs.get("search_filters") is None
+        assert "max_listings_per_search" in kwargs  # F2
 
 
 # ── Messenger ───────────────────────────────────────────────

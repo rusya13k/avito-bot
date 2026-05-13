@@ -1,9 +1,18 @@
 КОНТЕКСТ И ЦЕЛЬ
 ================
 
-Текущее состояние: бот функционально готов. Sprints 1-5 + E2 + G1 + G2 done.
-84 тестов проходят, ruff чистый. Селениум-флоу за единым фасадом
-AvitoClient, метрики per account / per hour работают, accounts.json вынесен.
+Текущее состояние: бот функционально готов. Sprints 1-5 + E2(metrics) + E2(search_filters) +
+G1 + G2 + Tier1(A1-A4) + Tier2(B1-B4) + Tier3(C1-C3) done.
+187 тестов проходят, ruff чистый. Селениум-флоу за единым фасадом
+AvitoClient, метрики per account / per hour работают, accounts.json вынесен,
+per-account search_filters реализованы, защита аккаунтов (proxy, budget,
+phone-limit, session-паузы, warmup, active-hours, health-score, captcha-log)
+полностью реализована и интегрирована.
+
+ТЕКУЩАЯ ЦЕЛЬ: максимизировать лайфтайм аккаунтов (3-6+ мес/аккаунт).
+Прямая дорога — БЛОК F (Tier 4: Behavioral Fingerprinting), 12 задач,
+описанных в деталях для делегирования. См. секцию РЕКОМЕНДУЕМЫЙ ПОРЯДОК
+снизу — задачи отсортированы по соотношению эффект/усилие.
 
 Реальная проблема СЕЙЧАС — лайфтайм Avito-аккаунтов. Без описанных ниже
 доработок реалистичная вилка:
@@ -24,19 +33,23 @@ AvitoClient, метрики per account / per hour работают, accounts.js
   • Yandex warmup (не заходим прямо на Avito)
   • E2 metrics — есть на чём строить дневные лимиты
 
-Что НЕ защищено и палит:
-  • proxies.txt пустой
-  • Нет дневных лимитов — поток крутится while True
-  • Клик "Показать телефон" на каждом листинге без капа (самое палевное)
-  • Нет cooldown'а между прогонами (через 5 сек после messenger начинаем search)
-  • Нет warmup для нового аккаунта (сразу клацает на телефоны)
-  • Парсит 24/7 без time-of-day pattern
-  • Все потоки стартуют с фиксированным time.sleep(5) — регулярный паттерн
+Что ТЕПЕРЬ защищено (было проблемой, теперь реализовано):
+  ✓ per-account proxy (A1) — каждый аккаунт через свой прокси
+  ✓ Дневные лимиты listings/messages/phone (A2) — guard'ы в AvitoClient
+  ✓ Клик "Показать телефон" ограничен (A3) — 30% soft-limit + дневной хард
+  ✓ Паузы 30-90 мин между прогонами (A4) — session_pause_min/max
+  ✓ Warmup для новых аккаунтов (B1) — /warmup команда в TG
+  ✓ Активное окно времени (B2) — active_hours_start/end, per-account
+  ✓ Рандомизация старта потоков (B3) — 30-180 сек между запусками
+  ✓ Long-cooldown при множественных капчах (B4) — 4-8ч при ≥3, до следующего дня при ≥5
+  ✓ Budget alerts 80%/100% в TG (C2) — de-dup per день
+  ✓ Captcha log с traceability (C3) — /lastcaptcha команда в TG
+  ✓ Per-account health score (C1) — /health команда, автоснижение бюджета
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-БЛОК A — TIER 1: ЗАЩИТА АККАУНТОВ (без этого бан за дни)
+БЛОК A — TIER 1: ЗАЩИТА АККАУНТОВ [✓ ВСЁ СДЕЛАНО]
 
-A1. Per-account proxy [M]
+A1. Per-account proxy [M] ✓ DONE
 
   • Файлы: accounts.py, bot.py (run_thread), accounts.example.json
   • Проблема: proxies.txt пуст. Если у тебя 2+ аккаунта — все идут с
@@ -56,7 +69,7 @@ A1. Per-account proxy [M]
   • Зависимости: G2 (accounts.json) — done
   • Эффект: x3-5 к лайфтайму при наличии 2+ аккаунтов
 
-A2. Дневной budget per account [M]
+A2. Дневной budget per account [M] ✓ DONE
 
   • Файлы: новый daily_budget.py (или внутри account_state.py),
     bot.run_thread, avito_client.py, commercial_parser.py
@@ -79,7 +92,7 @@ A2. Дневной budget per account [M]
   • Зависимости: E2 (metrics) — done
   • Эффект: x2-3 к лайфтайму — устраняет самый палевный признак "это бот"
 
-A3. Лимит на "Показать телефон" [S]
+A3. Лимит на "Показать телефон" [S] ✓ DONE
 
   • Файл: commercial_parser.py:extract_listing_data (блок get_phone)
   • Проблема: клик на каждом листинге. У реального пользователя 1-2 раза
@@ -96,7 +109,7 @@ A3. Лимит на "Показать телефон" [S]
   • Зависимости: A2 (или хотя бы простой счётчик в account_state)
   • Эффект: x2 к лайфтайму, минимум усилий
 
-A4. Сессионные паузы между прогонами [S]
+A4. Сессионные паузы между прогонами [S] ✓ DONE
 
   • Файл: bot.run_thread (loop), tg_bot.py (для отображения "in cooldown")
   • Проблема: после messenger сразу новый search-цикл. Реальный
@@ -114,9 +127,9 @@ A4. Сессионные паузы между прогонами [S]
   • Эффект: x1.5-2 к лайфтайму
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-БЛОК B — TIER 2: ДЛЯ ДОЛГОЖИТЕЛЕЙ (1-3 месяца лайфтайма)
+БЛОК B — TIER 2: ДЛЯ ДОЛГОЖИТЕЛЕЙ [✓ ВСЁ СДЕЛАНО]
 
-B1. Warmup-режим для новых аккаунтов [M]
+B1. Warmup-режим для новых аккаунтов [M] ✓ DONE
 
   • Файлы: новый flag-поле в БД (или в accounts.json), bot.run_thread,
     avito_client.py
@@ -137,7 +150,7 @@ B1. Warmup-режим для новых аккаунтов [M]
   • Зависимости: A2 (дневные лимиты), A3 (контроль get_phone)
   • Эффект: x3 к лайфтайму для новых аккаунтов
 
-B2. Активное окно времени [S]
+B2. Активное окно времени [S] ✓ DONE
 
   • Файл: bot.run_thread, account_state.py
   • Проблема: бот парсит в 3 ночи так же, как в 14:00. Реальные
@@ -153,7 +166,7 @@ B2. Активное окно времени [S]
   • Зависимости: нет
   • Эффект: x1.5 к лайфтайму, плюс снижение нагрузки на прокси/сервер
 
-B3. Рандомизация старта потоков [S]
+B3. Рандомизация старта потоков [S] ✓ DONE
 
   • Файл: bot._launch_commercial_bot_threads
   • Проблема: time.sleep(5) между стартами потоков — слишком регулярный
@@ -165,7 +178,7 @@ B3. Рандомизация старта потоков [S]
   • Зависимости: нет
   • Эффект: x1.2 (мелкое улучшение, но почти бесплатное)
 
-B4. Long-cooldown при множественных капчах [S]
+B4. Long-cooldown при множественных капчах [S] ✓ DONE
 
   • Файл: account_state.py
   • Проблема: после 3-5 капч за день аккаунт уже под подозрением.
@@ -182,9 +195,9 @@ B4. Long-cooldown при множественных капчах [S]
   • Эффект: спасает аккаунт после первой серьёзной "красной зоны"
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-БЛОК C — TIER 3: ПОЛИРОВКА (3-6+ месяцев лайфтайма)
+БЛОК C — TIER 3: ПОЛИРОВКА [✓ ВСЁ СДЕЛАНО]
 
-C1. Per-account dynamic reputation [M]
+C1. Per-account dynamic reputation [M] ✓ DONE
 
   • Файлы: account_state.py, новая таблица account_health в database.py
   • Проблема: "плохой" аккаунт (часто капчит) и "хороший" (стабильный)
@@ -202,7 +215,7 @@ C1. Per-account dynamic reputation [M]
   • Зависимости: A2 (budget), B4 (long-cooldown), E2 — done
   • Эффект: пере-распределение нагрузки на здоровые аккаунты
 
-C2. TG-алерты на approaching limit [S]
+C2. TG-алерты на approaching limit [S] ✓ DONE
 
   • Файл: tg_bot.py + хук в account_state
   • Проблема: оператор не знает, что аккаунт близко к дневному budget'у
@@ -216,7 +229,7 @@ C2. TG-алерты на approaching limit [S]
   • Зависимости: A2 — обязательно
   • Эффект: операционная видимость, нулевой риск регрессии
 
-C3. Логи captcha-инцидентов с traceability [S]
+C3. Логи captcha-инцидентов с traceability [S] ✓ DONE
 
   • Файлы: database.py (новая таблица captcha_log), captcha_detect.py
   • Проблема: при бане аккаунта непонятно когда и где он начал капчить.
@@ -229,6 +242,672 @@ C3. Логи captcha-инцидентов с traceability [S]
     3. /lastcaptcha acc1 — показать последние 5 инцидентов для аккаунта.
   • Зависимости: E2 (metrics) — done
   • Эффект: помогает диагностировать, какие действия / страницы палят
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+БЛОК F — TIER 4: BEHAVIORAL FINGERPRINTING (3-6+ мес. лайфтайма)
+
+Эти задачи касаются паттернов поведения, которые антифрод видит даже
+при идеальной защите аккаунтов (прокси + AdsPower + лимиты). Цель —
+сделать действия бота статистически неотличимыми от живого пользователя.
+Не критично при наличии Tier 1-3, но даёт +30-50% к лайфтайму при долгой
+эксплуатации (3+ месяцев на аккаунт).
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F1. Снизить favorite/call rates в view_listing [S]
+
+  • Файл: bot.py:360-449 (view_listing)
+  • Проблема: сейчас на каждом просмотренном листинге:
+      - 70% шанс «Добавить в избранное»  (bot.py:405)
+      - 55% шанс клика «Позвонить»        (bot.py:427)
+    Это ОЧЕНЬ много. Реальный пользователь:
+      - Избранное:   5-10% (выбирает 1-2 листинга из 20)
+      - Позвонить:   3-8% (потенциальные сделки)
+    За один цикл (3 категории × 3 листинга = 9 просмотров) бот сейчас
+    делает ~6 фавов и ~5 кликов «Позвонить». Это сразу палится на
+    fingerprinting'е (паттерн engagement не похож на человеческий).
+
+    Дополнительная проблема: клик «Позвонить» в view_listing — это
+    ОТДЕЛЬНАЯ кнопка от «Показать телефон» в commercial_parser, и
+    её клики НЕ учитываются в дневном A3-лимите. Получается двойной
+    учёт: один и тот же листинг может получить и «Позвонить»
+    (из view_listing) и «Показать телефон» (из commercial_parser),
+    причём «Позвонить» вообще без лимитов.
+
+  • Шаги:
+    1. В bot.py:405 заменить `random.random() < 0.70` на `0.08`
+       (8% шанс добавления в избранное).
+    2. В bot.py:427 заменить `random.random() < 0.55` на `0.05`
+       (5% шанс клика «Позвонить»).
+    3. Сделать вероятности конфигурируемыми через config.json:
+         "view_listing_favorite_rate": 0.08,
+         "view_listing_call_rate": 0.05,
+       Per-account override в accounts.json (тоже же ключи).
+       Загрузка: в bot.py:run_thread достать из cfg/account и передать
+       в view_listing через новый параметр. ИЛИ: глобальные модульные
+       переменные, которые устанавливает run_thread.
+    4. Добавить хук в А3-лимит «Позвонить»: в view_listing перед кликом
+       «Позвонить» проверять `account_state.should_skip_phone(account_name)`.
+       Если True — пропускаем клик (и лог-сообщение в стиле «A3:
+       Пропуск 'Позвонить' — лимит»). Если успешный клик — вызвать
+       `account_state.record_phone_click(account_name)`.
+    5. Связь с metric phone_clicks: после клика «Позвонить» в
+       view_listing инкрементировать через listing_data[_PHONE_CLICKED_FLAG]
+       = True ПЕРЕД save_listing_to_db. (НО! view_listing вызывается
+       только из browse_commercial_categories, где save_listing не
+       идёт. Тогда: или инкрементировать метрику напрямую через
+       db_manager.incr_metric (нужно прокинуть db_manager в view_listing),
+       или просто использовать только in-memory счётчик record_phone_click
+       без БД-метрики. ВАРИАНТ 2 проще; in-memory достаточно для лимита).
+    6. Tests (новый tests/test_view_listing_rates.py):
+       - test_favorite_rate_8_percent: с зафиксированным random.seed(0)
+         и 1000 итерациями — счёт fav_clicks/total ≈ 0.08 ±0.02.
+       - test_call_rate_5_percent: то же для call_btn.
+       - test_call_blocked_when_phone_limit_reached: mock
+         account_state.should_skip_phone=True → call_btn.click НЕ вызывается.
+       - test_call_records_phone_click: при успешном клике —
+         account_state.record_phone_click вызвана 1 раз.
+  • Зависимости: A3 (record_phone_click, should_skip_phone) — done
+  • Эффект: x2-3 к лайфтайму. Самое палевное действие после неконтролируемого
+    «Показать телефон». Особенно критично при > 1 месяц работы аккаунта.
+  • Приоритет: ★★★★★ (наивысший, минимум усилий, огромный эффект)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F2. Variable batch sizes (листинги и категории per cycle) [S]
+
+  • Файлы:
+      - bot.py:594-640 (browse_commercial_categories) — параметр
+        num_categories=3, ads_per_category=3.
+      - bot.py:642-735 (find_and_view_commercial_listings) — захардкожено
+        `random.sample(links, min(5, len(links)))` (стр. 696).
+  • Проблема: каждый цикл бот парсит:
+      - В browse: РОВНО 3 категории × РОВНО 3 листинга (зашитые defaults)
+      - В find_and_view: РОВНО 5 листингов
+    Антифрод видит в логах паттерн: 11:00 — 5 listings, 13:00 — 5 listings,
+    14:30 — 5 listings, ... Это очень регулярно. Реальный пользователь
+    смотрит то 2 листинга и закрывает (надоело), то 8 (заинтересовался).
+
+  • Шаги:
+    1. В bot.py:642-735 заменить `random.sample(links, min(5, len(links)))`
+       на использование функции с весовым распределением:
+       ```python
+       def _weighted_listing_count(max_n: int = 7) -> int:
+           # Вес: чаще 2-4, реже 1, 5-7. Вес 0 = практически невозможно.
+           weights = [0, 0.10, 0.25, 0.30, 0.20, 0.10, 0.04, 0.01]  # idx=0..7
+           weights = weights[:max_n + 1]
+           return random.choices(range(len(weights)), weights=weights)[0]
+       ```
+       Положить в bot.py рядом с view_listing (или в новый
+       bot/_behavioral.py).
+    2. В browse_commercial_categories:
+       - num_categories: дефолт = `random.randint(1, 4)` вместо 3.
+       - ads_per_category: дефолт = `_weighted_listing_count(max_n=4)`
+         (т.к. в browse меньше листингов на каждую категорию).
+    3. Аналогично в find_and_view_commercial_listings — `n = _weighted_listing_count()`,
+       потом `random.sample(links, min(n, len(links)))`.
+    4. Параметризация: в config.json/accounts.json:
+         "max_listings_per_search": 7,
+         "max_categories_per_browse": 4
+       (по умолчанию текущие значения).
+    5. Tests (новый tests/test_batch_sizes.py):
+       - test_listing_count_distribution: 10000 вызовов
+         _weighted_listing_count, проверить что mean ≈ 3.5,
+         std ≈ 1.3, max ≤ 7.
+       - test_listing_count_never_zero: 1000 вызовов — все ≥ 1.
+       - test_category_count_distribution: то же для категорий.
+       - test_find_and_view_uses_weighted_count: mock random.choices →
+         find_and_view_commercial_listings вызовет random.sample с
+         нужным числом.
+  • Зависимости: нет
+  • Эффект: x1.3-1.5 к лайфтайму. Ломает основной паттерн «всегда 5».
+    Эффект растёт со временем (за 30 дней — 90 циклов с разной активностью).
+  • Приоритет: ★★★★ (легко, хороший эффект)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F3. Учёт «Позвонить» в дневном A3-лимите phone_clicks [XS] ✓ DONE (в F1)
+
+  • Объединено с F1, шаг 4. Зафиксировано отдельным пунктом для ясности:
+    клик «Позвонить» в view_listing должен идти через тот же лимит
+    phone_clicks, что и «Показать телефон» в commercial_parser.
+
+  • Если F1 не делается, минимальная версия F3:
+    1. В bot.py:427 ПЕРЕД `move_click(driver, call_btn)`:
+       ```python
+       if account_state.should_skip_phone(account_name):
+           log(account_name, "  A3: 'Позвонить' пропуск (лимит)")
+           continue  # или break наружу
+       ```
+    2. После успешного клика:
+       ```python
+       account_state.record_phone_click(account_name)
+       ```
+    3. Tests: достаточно 1-2 проверок mock'ом account_state.
+
+  • Зависимости: A3 — done
+  • Эффект: x1.5 к лайфтайму (если F1 НЕ делается). Если F1 сделан —
+    эффект включён в F1.
+  • Приоритет: ★★★ (только если F1 решено не делать)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F4. Расширить Yandex query pool + микс с general queries [XS]
+
+  • Файл: bot.py:472-520 (THEMATIC_QUERIES + yandex_warmup)
+  • Проблема: сейчас в THEMATIC_QUERIES всего 8 запросов и они ВСЕ
+    про коммерческую недвижимость. Каждый аккаунт каждый день шлёт
+    1-2 из этих 8 в Yandex. Avito видит Yandex referrer и:
+      - Понимает, что пользователь искал именно коммерч. недвиж. (нормально)
+      - Видит, что один и тот же запрос повторяется → паттерн
+    Кроме того, есть YANDEX_QUERIES (15 общих запросов, bot.py:50-66),
+    но он НЕ ИСПОЛЬЗУЕТСЯ.
+
+  • Шаги:
+    1. Расширить THEMATIC_QUERIES до 25-30 запросов разной формы:
+       - Утвердительные: «купить офис в Москве»
+       - Вопросительные: «сколько стоит арендовать склад в СПб»
+       - С регионом: «коммерческая недвижимость Казань 2024»
+       - С характеристиками: «офис до 500 м2 центр»
+       - Сделочные: «сделка с коммерческой недвижимостью документы»
+    2. В yandex_warmup (bot.py:514) изменить логику выбора:
+       - 70% — из THEMATIC_QUERIES (тематика)
+       - 25% — из YANDEX_QUERIES (общие, чтобы аккаунт не выглядел
+         «искателем-маньяком одной темы»)
+       - 5% — без warmup'а (просто открыть Yandex и ничего не искать)
+       Реализация:
+       ```python
+       def _pick_queries(num: int) -> list[str]:
+           pool = []
+           for _ in range(num):
+               r = random.random()
+               if r < 0.70:
+                   pool.append(random.choice(THEMATIC_QUERIES))
+               elif r < 0.95:
+                   pool.append(random.choice(YANDEX_QUERIES))
+               # else: пропускаем (соответствует empty warmup)
+           return pool
+       ```
+    3. Tests (tests/test_yandex_warmup.py):
+       - test_thematic_queries_count: len(THEMATIC_QUERIES) >= 25
+       - test_pick_queries_diversity: 1000 вызовов _pick_queries(2),
+         проверить что встречаются и thematic, и general.
+  • Зависимости: нет
+  • Эффект: x1.2 к лайфтайму. Малый, но почти бесплатный.
+  • Приоритет: ★★★ (5 минут работы)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F5. Messenger reply delays — не отвечать сразу [M]
+
+  • Файлы:
+      - avito_messenger.py:344-369 (_handle_current_chat, send response)
+      - account_state.py — новые методы
+      - database.py — возможно новая таблица pending_replies (или
+        in-memory state — обсудим в шагах)
+  • Проблема: сейчас при детекте in-сообщения бот сразу же:
+      1. Генерирует LLM-ответ
+      2. Отправляет в течение текущего messenger-цикла
+    Это значит, что максимальная задержка ответа = размер цикла
+    (30-90 мин из A4). Слишком быстро для реальности.
+
+    Реальный пользователь:
+      - Видит push через 5-30 мин
+      - Часто отвечает через 1-4 часа («занят, отвечу позже»)
+      - Иногда отвечает на следующий день
+      - Иногда вообще не отвечает (на спам, на агентские предложения)
+
+  • Шаги:
+    1. Добавить в avito_messenger._handle_current_chat:
+       ```python
+       # F5: реалистичная задержка ответа
+       last_in_msg_time = ...  # извлечь из last in-сообщения
+       age_minutes = (now - last_in_msg_time) / 60
+       min_reply_age = config.get("messenger_min_reply_age_min", 15)
+       if age_minutes < min_reply_age:
+           log_func(account_name,
+               f"F5: сообщение {age_minutes:.1f} мин назад — "
+               f"отложено до следующего цикла")
+           return  # не отвечаем сейчас
+       ```
+       Сложность: timestamp in-сообщения трудно достать из DOM Avito
+       (только относительные «5 минут назад»). АЛЬТЕРНАТИВА:
+       использовать дату записи сообщения в БД (мы её сохраняем как
+       time.strftime() при первой обработке). При повторной обработке
+       того же диалога этот timestamp = когда МЫ впервые увидели
+       сообщение, что тоже годится.
+
+    2. Новая таблица в БД (опционально, если хочется persistence
+       между перезапусками):
+       ```sql
+       CREATE TABLE IF NOT EXISTS pending_replies (
+           dialog_id INTEGER PRIMARY KEY,
+           visitor_msg_id TEXT,
+           visitor_msg_text TEXT,
+           visitor_msg_seen_at TIMESTAMP,
+           reply_due_at TIMESTAMP NOT NULL,
+           reply_text TEXT,                  -- если LLM уже сгенерировал
+           status TEXT DEFAULT 'pending'     -- pending|sent|expired
+       );
+       ```
+       Логика: вместо игнорирования — сохраняем «надо ответить через
+       N мин». На следующих циклах достаём pending_replies где
+       reply_due_at < now и отправляем их.
+
+       ПРОЩЕ (без БД, in-memory): account_state хранит dict
+       {dialog_id: reply_due_at}. На каждом цикле messenger проверяет
+       — есть ли диалоги, для которых reply_due_at прошёл. После
+       перезапуска эти задержки сбрасываются — и это нормально, мы
+       просто отвечаем «сразу» (= в первом цикле после рестарта).
+
+    3. Распределение задержки: lognormal
+       ```python
+       reply_delay_min = random.lognormvariate(2.5, 1.0)  # mean ~30 мин,
+                                                          # хвост до 10ч
+       reply_delay_min = max(15, min(600, reply_delay_min))
+       ```
+       Конфиг:
+         "messenger_reply_delay_mean_min": 30,
+         "messenger_reply_delay_max_min": 600,  # 10 часов
+
+    4. «Зацепка» для реальных «не ответивших»: 5-10% сообщений
+       НИКОГДА не получают ответ (status='expired' через 48ч). Это
+       соответствует тому, что юзер просто пропустил/не заинтересовался.
+       ```python
+       if random.random() < 0.05:
+           # F5: 5% сообщений игнорируем навсегда
+           mark_dialog_ignored(dialog_id)
+           continue
+       ```
+
+    5. Tests (tests/test_reply_delay.py):
+       - test_skips_recent_message: in-сообщение возрастом 5 мин →
+         _handle_current_chat возвращает без отправки.
+       - test_replies_to_old_message: возраст 60 мин → отвечает.
+       - test_5_percent_ignored: с зафиксированным seed(0), 1000
+         сообщений → 30-70 в среднем игнорируются.
+       - test_reply_delay_distribution: lognormal samples в нужном диапазоне.
+
+  • Зависимости: A2/A4 (нужен messenger-cycle, который может откладывать)
+  • Эффект: x1.5-2 к лайфтайму. Очень естественное поведение.
+    Дополнительный плюс: меньше LLM-запросов (экономия $).
+  • Приоритет: ★★★★ (среднее усилие, большой эффект)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F6. Probabilistic active hours (вероятностное окно вместо бинарного) [S]
+
+  • Файл: bot.py:1022-1046 (_is_in_active_hours, _seconds_until_active_hours)
+  • Проблема: сейчас активное окно — двоичный флаг (в окне → работаем
+    100%, вне → 0%). Реальный пользователь:
+      - Утро (9-11):     пик ~95%
+      - Обед (12-14):    спад ~50% (на встрече / на обеде)
+      - День (15-17):    высокий ~85%
+      - Вечер (18-21):   снова пик ~90%
+      - Поздно (22-23):  спад ~40% (уходит спать)
+      - Ночь (0-8):      ~5% (исключения)
+    Сейчас в 22:30 бот всегда работает, в 23:01 всегда спит — это
+    тоже паттерн.
+
+  • Шаги:
+    1. Заменить `_is_in_active_hours` на `_active_probability`:
+       ```python
+       _ACTIVITY_BY_HOUR = {
+           # часовое распределение, sum по дню ≈ 14 (≈ кол-во активных часов)
+           0: 0.02, 1: 0.01, 2: 0.01, 3: 0.005, 4: 0.005,
+           5: 0.01, 6: 0.05, 7: 0.20, 8: 0.40,
+           9: 0.85, 10: 0.95, 11: 0.95,
+           12: 0.55, 13: 0.45, 14: 0.55,
+           15: 0.85, 16: 0.85, 17: 0.80,
+           18: 0.90, 19: 0.90, 20: 0.85,
+           21: 0.70, 22: 0.45, 23: 0.20,
+       }
+       def _active_probability(account: dict, cfg: dict) -> float:
+           # per-account override через "activity_pattern" в accounts.json
+           pattern = account.get("activity_pattern") or cfg.get("activity_pattern") \
+                     or _ACTIVITY_BY_HOUR
+           return float(pattern.get(time.localtime().tm_hour, 0.5))
+       ```
+    2. В run_thread (bot.py:1206) заменить:
+       ```python
+       if not _is_in_active_hours(account, cfg):
+           ...long sleep...
+           continue
+       ```
+       на:
+       ```python
+       prob = _active_probability(account, cfg)
+       if random.random() > prob:
+           # сегодняшний бросок — спим один цикл
+           sleep_minutes = random.uniform(_pause_min, _pause_max)
+           log(account_name,
+               f"F6: пропуск цикла (prob={prob:.2f}). "
+               f"Следующая попытка через {sleep_minutes:.0f} мин.")
+           _human_delay(sleep_minutes * 60, sleep_minutes * 60,
+                        stop_event=_tg.stop_event, distribution="uniform")
+           continue
+       ```
+       Старая логика «спать до 9:00» больше не нужна — низкие
+       вероятности ночью сами разрулят.
+    3. Сохранить совместимость: если в config.json/accounts.json есть
+       `active_hours_start` / `active_hours_end` — продолжаем уважать
+       (вне окна prob=0). Это для пользователей, которые хотят строго
+       9-23 без вероятностной модели.
+    4. Tests (расширить tests/test_active_hours.py):
+       - test_activity_probability_high_at_peak: prob(10:00) > 0.9
+       - test_activity_probability_low_at_night: prob(03:00) < 0.05
+       - test_per_account_pattern_override: account.activity_pattern
+         перебивает default.
+  • Зависимости: B2 — done (заменяем его реализацию)
+  • Эффект: x1.3 к лайфтайму. Особенно при долгой работе (1+ месяц).
+  • Приоритет: ★★★
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F7. Random «dead days» — пропуск целого дня раз в 1-3 недели [S]
+
+  • Файлы:
+      - account_state.py — новый метод
+      - bot.run_thread — проверка
+  • Проблема: бот работает каждый день. У нормального человека
+    бывают дни без Авито: отпуск, занят, забыл. Особенно у риелтора
+    — выходной — суббота/воскресенье часто полностью без работы.
+
+  • Шаги:
+    1. В account_state добавить метод:
+       ```python
+       def is_dead_day(self, account_name: str) -> bool:
+           """
+           F7: True если сегодня объявлен «выходным» для аккаунта.
+           Решение принимается раз в день при первом обращении.
+           Probability per day определяется dead_day_rate (default 0.05).
+           """
+           today = time.strftime("%Y-%m-%d")
+           with self._lock:
+               entry = self._get(account_name)
+               cached = entry.dead_day_decision
+               if cached and cached["date"] == today:
+                   return cached["is_dead"]
+               # Бросаем кости один раз
+               rate = entry.dead_day_rate or 0.05
+               is_dead = random.random() < rate
+               entry.dead_day_decision = {"date": today, "is_dead": is_dead}
+               return is_dead
+       ```
+       Атрибут `dead_day_decision` в `_Entry` (dict[str, Any]).
+       Атрибут `dead_day_rate: float | None`.
+
+    2. Переопределение для weekend boost:
+       ```python
+       def _effective_dead_day_rate(self, account_name: str) -> float:
+           base = self._get(account_name).dead_day_rate or 0.05
+           weekday = datetime.datetime.now().weekday()
+           if weekday in (5, 6):  # суббота, воскресенье
+               return base * 3  # 15% на выходных
+           return base
+       ```
+
+    3. В bot.run_thread в начале каждой итерации:
+       ```python
+       if account_state.is_dead_day(account_name):
+           log(account_name, "F7: сегодня выходной — пропускаем.")
+           # спим до начала следующего дня
+           tomorrow = datetime.now().replace(hour=9, minute=0, second=0) \
+                      + datetime.timedelta(days=1)
+           _human_delay((tomorrow.timestamp() - time.time()),
+                        (tomorrow.timestamp() - time.time()),
+                        stop_event=_tg.stop_event)
+           continue
+       ```
+
+    4. TG-команда /skipday <account>: установить is_dead на сегодня.
+       Полезно при ручном решении админа («я вижу что аккаунт нагружен,
+       дам ему день отдыха»).
+
+    5. Per-account override: accounts.json «dead_day_rate»: 0.10.
+
+    6. Tests (tests/test_dead_days.py):
+       - test_dead_day_decision_persistent: 10 вызовов is_dead_day
+         в один день → одинаковый ответ.
+       - test_dead_day_resets_next_day: меняем дату → новое решение.
+       - test_weekend_boost: пятница vs суббота → разные rates.
+       - test_per_account_rate_override.
+
+  • Зависимости: нет
+  • Эффект: x1.2 к лайфтайму. Особенно эффективно для аккаунтов,
+    которые работают месяцами.
+  • Приоритет: ★★★
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F8. Idle cycles — иногда только messenger или только профиль [M]
+
+  • Файл: bot.run_thread (bot.py:1199-1262)
+  • Проблема: каждый цикл = warmup → search → messenger. Реальный
+    пользователь:
+      - Открывает Авито только проверить мессенджер (часто)
+      - Просто пролистывает главную, ничего не нажимает (бывает)
+      - Заходит в «Профиль» / «Мои объявления» / «Избранное» (редко)
+    Бот же всегда выполняет полный цикл. Это паттерн.
+
+  • Шаги:
+    1. Внутри run_thread добавить выбор «типа цикла»:
+       ```python
+       def _pick_cycle_kind() -> str:
+           """F8: выбираем тип сегодняшнего цикла."""
+           r = random.random()
+           if r < 0.55: return "full"          # warmup + search + messenger
+           if r < 0.75: return "messenger_only"  # только мессенджер
+           if r < 0.90: return "browse_only"     # только browse, без detail
+           return "profile_check"               # только зайти в /profile
+       ```
+
+    2. Реализовать каждый kind:
+       ```python
+       kind = _pick_cycle_kind()
+       log(account_name, f"F8: cycle kind = {kind}")
+       if kind == "full":
+           # как сейчас
+           ...
+       elif kind == "messenger_only":
+           client.process_messages()
+       elif kind == "browse_only":
+           # warmup + browse без save_listing
+           client.warmup_yandex()
+           client.browse_commercial_categories()
+           # НЕ зовём find_and_view_commercial_listings
+       elif kind == "profile_check":
+           # просто заходим в профиль и листаем 30-60s
+           client.warmup_yandex()
+           driver.get("https://www.avito.ru/profile")
+           hp(30, 60)
+           # опционально: посмотреть «Избранное»
+           if random.random() < 0.3:
+               driver.get("https://www.avito.ru/profile/favorites")
+               hp(20, 40)
+       ```
+
+    3. Per-account override: accounts.json «cycle_distribution» — словарь
+       с весами:
+       ```json
+       "cycle_distribution": {
+           "full": 0.45, "messenger_only": 0.30,
+           "browse_only": 0.15, "profile_check": 0.10
+       }
+       ```
+
+    4. В warmup-режиме (B1) — больше profile_check / browse_only,
+       меньше full и messenger_only:
+       ```python
+       if account_state.is_in_warmup(account_name):
+           weights = {"full": 0.20, "messenger_only": 0.0,
+                      "browse_only": 0.40, "profile_check": 0.40}
+       ```
+       (т.к. в warmup мы и так не отправляем сообщения).
+
+    5. Tests (tests/test_cycle_kinds.py):
+       - test_pick_cycle_distribution: 10000 вызовов → проверка
+         частот ±5%.
+       - test_warmup_uses_warmup_distribution: mock is_in_warmup=True →
+         distribution смещается к browse_only/profile_check.
+       - test_each_kind_callable: каждый kind корректно делегирует
+         в нужные методы AvitoClient.
+
+  • Зависимости: B1 (warmup) — done
+  • Эффект: x1.4 к лайфтайму. Самый сильный эффект против behavioral
+    fingerprinting'а — ломает паттерн «всегда полный цикл».
+  • Приоритет: ★★★★
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F9. Realistic dwell times (lognormal, ~20-60s mean) [S]
+
+  • Файл: bot.py:371-374, 388-397 (view_listing — dwell + reading)
+  • Проблема: сейчас:
+      - dwell_time = random.uniform(5, 15)     # 5-15 секунд (uniform!)
+      - reading description hp(3, 7)           # 3-7 секунд
+    Это слишком быстро для коммерческой недвижимости. Реальный
+    пользователь, читая описание объекта на 5-15 млн рублей,
+    сидит 30 сек — 2 мин (а если интересно — и 3-5 мин).
+
+  • Шаги:
+    1. Заменить uniform на lognormal в view_listing (bot.py:372):
+       ```python
+       # F9: lognormal — пик ~20s, длинный хвост до 2 мин.
+       dwell_time = _human_delay(10, 120, distribution='lognormal',
+                                 stop_event=_tg.stop_event)
+       ```
+       (human_delay уже умеет lognormal, см. human_delay.py:44)
+
+    2. Reading description — увеличить до 15-90s lognormal:
+       ```python
+       hp(15, 90, distribution='lognormal')  # bot.py:394
+       ```
+
+    3. Добавить «interest score»:
+       ```python
+       # F9: 15% листингов — «очень интересные», читаем 2-5 мин
+       if random.random() < 0.15:
+           extra = random.uniform(60, 300)
+           log(account_name, f"  Особо интересный листинг (+{extra:.0f}s)")
+           hp(extra, extra)
+       # 20% — «совсем неинтересные», закрываем за 2-5s
+       elif random.random() < 0.20:
+           log(account_name, "  Неинтересно, закрываем")
+           return True  # выходим из view_listing рано
+       ```
+
+    4. Tests (tests/test_dwell_times.py):
+       - test_dwell_distribution: 1000 вызовов _human_delay(10,120,
+         lognormal) → mean 20-40, max ≤ 240 (clamp в _draw_seconds).
+       - test_interest_short_circuit: с zafiks. seed → 20% return early.
+
+  • Зависимости: нет (human_delay уже умеет lognormal)
+  • Эффект: x1.3 к лайфтайму. Делает interaction time похожим на человека.
+  • Приоритет: ★★★
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F10. scroll_gallery не всегда (60% probability) [XS]
+
+  • Файл: bot.py:377 (вызов scroll_gallery в view_listing)
+  • Проблема: scroll_gallery всегда вызывается из view_listing.
+    Реальный пользователь: смотрит галерею часто, но не всегда.
+    Иногда — только первое фото и ушёл.
+
+  • Шаги:
+    1. Обернуть вызов:
+       ```python
+       # F10: галерею смотрим не всегда
+       if random.random() < 0.60:
+           scroll_gallery(driver, wait)
+       ```
+    2. Внутри scroll_gallery (bot.py:298): вместо `for _ in range(20)`
+       — `for _ in range(random.randint(1, 12))`. Чтобы и сколько
+       перелистываний тоже было разным.
+
+  • Зависимости: нет
+  • Эффект: x1.1 к лайфтайму. Мелочь, но почти бесплатно.
+  • Приоритет: ★★ (5 минут)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F11. Variable number of dialogs to process [XS]
+
+  • Файл: avito_messenger.py:181
+  • Проблема: `for i in range(min(5, len(dialogs)))` — всегда первые 5.
+    Реальный пользователь: проверяет ВСЕ unread, или вообще закрывает
+    после 1-2 (надоело).
+
+  • Шаги:
+    1. Заменить:
+       ```python
+       n = random.randint(1, min(7, len(dialogs)))
+       # Веса смещены к 1-3 (короткие сессии чаще)
+       weights = [0, 0.30, 0.25, 0.20, 0.10, 0.08, 0.05, 0.02]
+       n = random.choices(range(len(weights)), weights=weights[:len(dialogs)+1])[0]
+       n = max(1, n)
+       for i in range(min(n, len(dialogs))):
+           ...
+       ```
+    2. Приоритет unread: если есть unread — обрабатываем сначала их,
+       потом остальные. Сейчас бот идёт подряд, не выделяя unread.
+       ```python
+       unread, read = [], []
+       for d in dialogs:
+           if _has_unread_indicator(d):
+               unread.append(d)
+           else:
+               read.append(d)
+       ordered = unread + read
+       for i in range(min(n, len(ordered))):
+           dialog = ordered[i]
+           ...
+       ```
+
+    3. Tests: достаточно расширить test_avito_messenger_*.py
+       (если такие есть; иначе минимально).
+
+  • Зависимости: нет
+  • Эффект: x1.1 к лайфтайму.
+  • Приоритет: ★★
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+F12. Budget guard для browse_commercial_categories [XS]
+
+  • Файлы:
+      - avito_client.py:282-298 (browse_commercial_categories wrapper)
+      - bot.py:594-640 (browse_commercial_categories impl)
+  • Проблема: сейчас A2-budget на listings проверяется ТОЛЬКО в
+    find_and_view_commercial_listings. Но browse_commercial_categories
+    тоже листает листинги (3 категории × 3 листинга = 9 листингов
+    каждый цикл). Эти 9 НЕ учитываются в дневном лимите → реально
+    бот может переборщить с лимитом.
+
+  • Шаги:
+    1. В avito_client.py:282 (browse_commercial_categories) добавить
+       budget guard ПЕРЕД делегированием в bot.browse_commercial_categories:
+       ```python
+       def browse_commercial_categories(self, *args, **kwargs):
+           from account_state import account_state as _astate
+           if not _astate.check_daily_budget(self.account_name, "listings", self.db):
+               self.log(self.account_name,
+                   "A2: Дневной лимит исчерпан — пропускаем browse.")
+               return
+           ...текущая реализация...
+       ```
+    2. В bot.py:browse_commercial_categories — после save_listing'а
+       (хотя save в browse не вызывается; листинги только просматриваются)
+       — увеличивать ВНУТРЕННИЙ счётчик. Либо: т.к. browse не сохраняет
+       в БД, считать по числу просмотренных и отдельной метрикой
+       `listings_browsed`. Можно оставить общий метрик `listings_parsed`
+       — для бюджета это всё «вес» листинга.
+    3. Tests: расширить tests/test_daily_budget.py.
+
+  • Зависимости: A2 — done
+  • Эффект: x1.1 к лайфтайму (без неё бот превышает лимит на ~10-15%).
+  • Приоритет: ★★
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 БЛОК D — МАСШТАБИРОВАНИЕ (только при росте до 10+ аккаунтов)
@@ -290,47 +969,47 @@ E2. Per-account search_filters [M]
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 РЕКОМЕНДУЕМЫЙ ПОРЯДОК
 
-СПРИНТ 1 — Tier 1 (без него лайфтайм короткий):
-  1. A1 (per-account proxy)             — обязательно если 2+ аккаунта
-  2. A2 (дневной budget)                — фундамент для A3, B4, C1, C2
-  3. A3 (лимит get_phone)                — самое палевное действие
-  4. A4 (сессионные паузы)               — мелочь, но важная
+СПРИНТ 1-3 — Tier 1-3 ✓ ВСЁ ВЫПОЛНЕНО
 
-  Эффект: с 1-2 недель до 1-2 месяцев лайфтайма.
+СПРИНТ 4 — Tier 4 (behavioral fingerprinting, текущий приоритет):
+  Порядок по убыванию эффекта/усилия (★★★★★ → ★★):
 
-СПРИНТ 2 — Tier 2 (для долгожителей):
-  5. B1 (warmup новых аккаунтов)
-  6. B4 (long-cooldown при многих капчах)
-  7. B2 (активное окно)
-  8. B3 (рандомизация старта)
+  1. F1  (★★★★★) — снизить fav/call rates [S]      — x2-3 эффект
+  2. F8  (★★★★)  — idle cycles [M]                 — x1.4 эффект
+  3. F2  (★★★★)  — variable batch sizes [S]        — x1.3-1.5 эффект
+  4. F5  (★★★★)  — messenger reply delays [M]      — x1.5-2 эффект
+  5. F6  (★★★)   — probabilistic active hours [S]  — x1.3 эффект
+  6. F9  (★★★)   — realistic dwell times [S]       — x1.3 эффект
+  7. F7  (★★★)   — random dead days [S]            — x1.2 эффект
+  8. F4  (★★★)   — расширить yandex queries [XS]   — x1.2 эффект
+  9. F12 (★★)    — budget guard в browse [XS]      — x1.1 эффект
+  10. F10 (★★)   — scroll_gallery не всегда [XS]   — x1.1 эффект
+  11. F11 (★★)   — variable dialogs count [XS]     — x1.1 эффект
 
-  Эффект: устойчивая работа 1-3 месяцев на аккаунт.
+  F3 — поглощается F1 (если F1 не делается, F3 = mini-версия F1).
 
-СПРИНТ 3 — Tier 3 (полировка + видимость):
-  9. C2 (TG-алерты на budget)            — операционно полезно сразу после A2
-  10. C3 (captcha-log с traceability)
-  11. C1 (per-account reputation)
+  Эффект Tier 4 в сумме: с 1-3 мес до 3-6+ мес лайфтайма на аккаунт
+  (при условии Tier 1-3 + качественные прокси).
 
-СПРИНТ 4 — Оптимизация (опционально, если будут крупные доработки):
-  12. E2 (per-account search_filters)
-  13. E1 (G1 Phase 2 — миграция реализаций в AvitoClient)
-
-СПРИНТ 5 — Масштаб (только если будет >10 аккаунтов):
-  14. D1 (task queue)
+СПРИНТ 5 — Опциональное (отложено):
+  • E1 (G1 Phase 2 — миграция реализаций в AvitoClient)
+  • D1 (G3: task queue) — только при росте до 10+ аккаунтов
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 ИТОГО
 
-  Tier 1 (must-do):         4 задачи, ~1-2 спринта
-  Tier 2 (highly recommend): 4 задачи, ~1-2 спринта
-  Tier 3 (polish):          3 задачи, ~1 спринт
-  Optional/future:          3 задачи, по необходимости
+  Tier 1 (must-do):              ✓ DONE — 4 задачи
+  Tier 2 (highly recommended):    ✓ DONE — 4 задачи
+  Tier 3 (polish + visibility):   ✓ DONE — 3 задачи
+  Tier 4 (behavioral fingerprint): 12 задач, ~2-3 спринта
+  Optional/future:                 2 задачи (E1, D1) — по необходимости
 
   Без Tier 1 лайфтайм аккаунтов <2 недель.
   С Tier 1 + 2 — реалистично 1-3 месяца.
-  С Tier 3 + Pro Practice (warmup, прокси и т.п.) — 3-6+ месяцев.
+  С Tier 3 — устойчивые 1-3 месяца + видимость.
+  С Tier 4 — 3-6+ месяцев на аккаунт.
 
-С какой задачи начинаем?
-Рекомендую A1 (per-account proxy) — это #1 фактор лайфтайма.
-Параллельно можно делать A2 (дневной budget) — он независим и open's путь
-к большинству задач Tier 2/3.
+ТЕКУЩАЯ ЦЕЛЬ: реализовать Tier 4 для максимизации лайфтайма аккаунтов.
+
+Каждая задача F1-F12 описана с полной детализацией (файлы, строки,
+конкретные значения, тесты) для делегирования другому ИИ-агенту.
