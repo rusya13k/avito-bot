@@ -3,8 +3,11 @@ Telegram-бот для управления Avito-ботом.
 Inline-кнопки, управление аккаунтами/прокси/настройками без редактирования файлов.
 """
 
+import copy
 import json
 import logging
+import os
+import tempfile
 import threading
 import time
 from collections import deque
@@ -188,6 +191,11 @@ class TelegramController:
         self._run_callback = None
         # Состояние диалога: {chat_id: {"state": str, "data": dict}}
         self._state: dict = {}
+        # L5: cfg-кэш с mtime-инвалидацией. _cfg() раньше читал config.json
+        # на каждом callback-вызове (24+ мест → диск каждый раз). Кэш
+        # перечитывает только если файл был изменён извне.
+        self._cfg_cache: dict | None = None
+        self._cfg_cache_mtime: float = 0.0
         self._setup()
 
     # ── Утилиты ──────────────────────────────────────────────────────────────
@@ -206,12 +214,47 @@ class TelegramController:
         return not self.admin_id or uid == self.admin_id
 
     def _cfg(self) -> dict:
-        with open(self.BASE / "config.json", encoding="utf-8") as f:
-            return json.load(f)
+        # L5: mtime-кэш. Проверяем os.stat — если mtime совпадает с тем,
+        # что мы помним, отдаём deepcopy кэша (чтобы вызывающий код не
+        # мутировал состояние). Если файл был изменён внешне (или мы ещё
+        # не читали), перечитываем.
+        path = self.BASE / "config.json"
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        if self._cfg_cache is not None and mtime == self._cfg_cache_mtime:
+            return copy.deepcopy(self._cfg_cache)
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        self._cfg_cache = cfg
+        self._cfg_cache_mtime = mtime
+        # возвращаем копию, чтобы кэш не пострадал от мутаций вызывающего.
+        return copy.deepcopy(cfg)
 
     def _save_cfg(self, cfg: dict):
-        with open(self.BASE / "config.json", "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        # L8: атомарная запись через tempfile + os.replace — как в
+        # accounts.save_accounts (K1). Гарантирует, что bot.py / другой
+        # читатель не увидит partial-write при крэше.
+        # L5: после успешной записи обновляем кэш и mtime.
+        path = self.BASE / "config.json"
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(self.BASE),
+            prefix=".config-",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            json.dump(cfg, tmp, ensure_ascii=False, indent=2)
+            tmp_path = tmp.name
+        os.replace(tmp_path, path)
+        try:
+            self._cfg_cache_mtime = path.stat().st_mtime
+            self._cfg_cache = copy.deepcopy(cfg)
+        except OSError:
+            self._cfg_cache = None
+            self._cfg_cache_mtime = 0.0
 
     def _proxies(self) -> list:
         cfg = self._cfg()
@@ -1245,9 +1288,11 @@ class TelegramController:
                     from listing_classifier import ListingClassifier
 
                     db_manager = DatabaseManager()
+                    # L4: один _cfg() вместо двух — не дёргаем диск дважды.
+                    cfg = self._cfg()
                     llm_config = {
-                        "api_key": self._cfg().get("openai_api_key", ""),
-                        "model": self._cfg().get("openai_model", "gpt-3.5-turbo"),
+                        "api_key": cfg.get("openai_api_key", ""),
+                        "model": cfg.get("openai_model", "gpt-3.5-turbo"),
                     }
                     classifier = ListingClassifier(db_manager, llm_config)
                     results = classifier.classify_all_listings()

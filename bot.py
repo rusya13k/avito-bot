@@ -5,14 +5,13 @@ Avito Commercial Real Estate Parser Bot
 import json
 import logging
 import random
-import sys
 import threading
 import time
 from pathlib import Path
 
 import requests
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
@@ -65,8 +64,6 @@ YANDEX_QUERIES = [
     "как сэкономить на продуктах",
 ]
 
-print_lock = threading.Lock()
-
 # E1: главный логгер бота. Каждый поток-аккаунт получает свой адаптер
 # через get_account_logger(...) с пристёгнутым account_id, поэтому в
 # каждом сообщении видно, какой аккаунт его породил.
@@ -96,7 +93,8 @@ class AdsPowerAPI:
     Profiles are created manually in AdsPower; the bot only starts and stops them.
     """
 
-    def __init__(self, base_url: str, api_key: str = None):
+    def __init__(self, base_url: str, api_key: str | None = None):
+        # L3: implicit Optional → explicit str | None (PEP 604).
         self.base = base_url.rstrip("/")
         self.api_key = api_key
 
@@ -114,7 +112,8 @@ class AdsPowerAPI:
             key_hint = (
                 f"{self.api_key[:4]}...{self.api_key[-4:]}" if len(self.api_key) > 8 else "****"
             )
-            print(f"[AdsPower] Using API Key: {key_hint}")
+            # L1: print → logger.debug (debug-level чтобы не шуметь в обычных логах)
+            _bot_logger.debug("[AdsPower] Using API Key: %s", key_hint)
 
         r = requests.get(
             self._url("/api/v1/browser/start"), params=params, headers=headers, timeout=60
@@ -160,7 +159,8 @@ def connect_to_sphere(debug_port: int) -> webdriver.Chrome:
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
     except Exception as e:
-        print(f"Standard driver install failed: {e}. Trying fallback...")
+        # L1: print → logger.warning (заметно в логах, но не критично)
+        _bot_logger.warning("Standard driver install failed: %s. Trying fallback...", e)
         driver = webdriver.Chrome(options=options)
 
     return driver
@@ -593,7 +593,9 @@ def update_profile_proxy(adspower_api, user_id, proxy_str):
     try:
         r = requests.post(url, json=payload, headers=headers, timeout=15)
         return r.json().get("code") == 0
-    except:
+    except (requests.RequestException, ValueError):
+        # L2: bare except → конкретные. RequestException — сетевые ошибки,
+        # ValueError — если AdsPower вернул не-JSON.
         return False
 
 
@@ -1098,7 +1100,8 @@ def get_random_proxy():
         with open(path, encoding="utf-8") as f:
             proxies = [line.strip() for line in f if line.strip()]
         return random.choice(proxies) if proxies else None
-    except:
+    except OSError:
+        # L2: bare except → OSError (PermissionError, IsADirectoryError и т.п.).
         return None
 
 
@@ -1419,13 +1422,21 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
                 _pause_secs, _pause_secs, stop_event=_tg.stop_event, distribution="uniform"
             )
 
-    except Exception as e:
-        log(account_name, f"ERROR: {e}")
+    except Exception:
+        # L6: run_thread — top-level потока. Раньше теряли traceback (только
+        # str(e)), что критично, если падение из-за неочевидного бага в
+        # глубине Selenium/avito-flow. logger.exception() добавляет полный
+        # stacktrace + триггерит TGAlertHandler (E4) → админ получает алерт
+        # с trace, не нужно идти в файл-лог.
+        get_account_logger(_bot_logger.name, account_name).exception("run_thread crashed")
     finally:
         if driver:
             try:
                 driver.quit()
-            except:
+            except WebDriverException:
+                # L7: bare except → WebDriverException. driver.quit() может
+                # упасть при уже закрытом браузере / отвалившемся debug-port.
+                # Любые другие исключения тут — настоящие баги, не глотаем.
                 pass
         adspower.stop_profile(user_id)
 
@@ -1436,50 +1447,47 @@ def _load_cfg():
     в stderr/log_buffer и выходит из процесса (C1).
     """
     cfg_path = Path(__file__).parent / "config.json"
+    # L1: print + add_log → _bot_logger.critical. После setup_logging() и
+    # install_tg_buffer_handler() стандартные log-handler'ы сами доставляют
+    # в stderr (HumanFormatter) и в TG-буфер. Если уже стоит TGAlertHandler
+    # (на момент перезапуска через TG-команду), сообщение пойдёт админу
+    # мгновенно — что лучше старого поведения через ручной add_log.
     try:
         with open(cfg_path, encoding="utf-8") as f:
             cfg = json.load(f)
     except FileNotFoundError:
-        msg = (
-            f"CRITICAL: config.json не найден: {cfg_path}\n"
-            f"Создай файл по шаблону README.md (минимум: telegram_bot_token, "
-            f"telegram_admin_id, accounts[]). Пример — в начале README."
+        _bot_logger.critical(
+            "config.json не найден: %s\n"
+            "Создай файл по шаблону README.md (минимум: telegram_bot_token, "
+            "telegram_admin_id, accounts[]). Пример — в начале README.",
+            cfg_path,
         )
-        print(msg, file=sys.stderr)
-        try:
-            _tg.add_log(msg)
-        except Exception:
-            pass
-        raise SystemExit(2)
+        raise SystemExit(2) from None
     except json.JSONDecodeError as e:
-        msg = (
-            f"CRITICAL: config.json не парсится как JSON: {e.msg} "
-            f"(line={e.lineno}, col={e.colno})\n"
-            f"Открой {cfg_path} и проверь синтаксис (запятые, кавычки, скобки)."
+        _bot_logger.critical(
+            "config.json не парсится как JSON: %s (line=%d, col=%d)\n"
+            "Открой %s и проверь синтаксис (запятые, кавычки, скобки).",
+            e.msg,
+            e.lineno,
+            e.colno,
+            cfg_path,
         )
-        print(msg, file=sys.stderr)
-        try:
-            _tg.add_log(msg)
-        except Exception:
-            pass
-        raise SystemExit(2)
+        raise SystemExit(2) from None
     except OSError as e:
-        msg = f"CRITICAL: не могу прочитать {cfg_path}: {e}"
-        print(msg, file=sys.stderr)
-        try:
-            _tg.add_log(msg)
-        except Exception:
-            pass
-        raise SystemExit(2)
+        _bot_logger.critical("не могу прочитать %s: %s", cfg_path, e)
+        raise SystemExit(2) from None
 
     # Базовая валидация ожидаемых полей (warn-only, чтобы не блокировать
     # запуск с неполным конфигом во время разработки).
     if not isinstance(cfg, dict):
-        msg = f"CRITICAL: config.json должен быть JSON-объектом, получено: {type(cfg).__name__}"
-        print(msg, file=sys.stderr)
+        _bot_logger.critical(
+            "config.json должен быть JSON-объектом, получено: %s", type(cfg).__name__
+        )
         raise SystemExit(2)
     if "accounts" not in cfg or not isinstance(cfg["accounts"], list):
-        _tg.add_log("WARNING: в config.json отсутствует или некорректен ключ 'accounts'")
+        # L1: ручной _tg.add_log → logger.warning (через TGBufferHandler уйдёт
+        # в тот же буфер). Сообщение информационное — не CRITICAL.
+        _bot_logger.warning("в config.json отсутствует или некорректен ключ 'accounts'")
 
     # H3: применить env-переопределения для секретов
     # (OPENAI_API_KEY / TELEGRAM_BOT_TOKEN / ADSPOWER_API_KEY и т.п.).
@@ -1563,7 +1571,10 @@ def main():
 
         try:
             input()
-        except:
+        except (KeyboardInterrupt, EOFError):
+            # L2: bare except → конкретные. Ctrl-C / EOF — нормальные пути
+            # завершения main, проглатываем без лога. Любое другое
+            # исключение сюда теперь не попадёт и убьёт процесс с trace.
             pass
         if not _tg.is_running():
             _launch_commercial_bot_threads(cfg)
