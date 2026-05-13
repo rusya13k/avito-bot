@@ -624,6 +624,73 @@ def update_profile_proxy(adspower_api, user_id, proxy_str):
     return adspower_api.update_proxy(user_id, proxy_str)
 
 
+# F8: idle cycles — иногда только messenger или только профиль.
+# Default-распределение типов цикла. Реальный пользователь открывает Авито
+# с разными целями: проверить мессенджер, полистать главную, просто зайти
+# в профиль. Бот не должен ВСЕГДА делать «полный цикл» (browse + parse +
+# messenger) — это сильнейший behavioral fingerprint.
+_CYCLE_KINDS_DEFAULT: dict[str, float] = {
+    "full": 0.55,            # warmup → browse → find_and_view → messenger (как сейчас)
+    "messenger_only": 0.20,  # только мессенджер
+    "browse_only": 0.15,     # browse + find_and_view, без messenger
+    "profile_check": 0.10,   # просто заходим в /profile, никаких действий
+}
+
+# Распределение для warmup-режима (B1): аккаунт пока не должен слать
+# сообщений (messenger_only=0) и стараемся НЕ парсить много — больше
+# спокойных profile_check / browse_only.
+_CYCLE_KINDS_WARMUP: dict[str, float] = {
+    "full": 0.20,
+    "messenger_only": 0.0,
+    "browse_only": 0.40,
+    "profile_check": 0.40,
+}
+
+
+def _pick_cycle_kind(account: dict, cfg: dict, *, is_warmup: bool = False) -> str:
+    """F8: выбирает тип сегодняшнего цикла.
+
+    Чистая функция (без обращения к account_state) — для лёгкой
+    тестируемости. Флаг `is_warmup` пробрасывается из run_thread, который
+    сам опрашивает account_state.is_in_warmup().
+
+    Override для НЕ-warmup-режима:
+        1. account["cycle_distribution"]   (per-account, accounts.json)
+        2. cfg["cycle_distribution"]       (глобальный, config.json)
+        3. _CYCLE_KINDS_DEFAULT            (хард-кодед)
+
+    Returns:
+        Один из ключей словаря весов: "full" / "messenger_only" /
+        "browse_only" / "profile_check".
+    """
+    if is_warmup:
+        weights = _CYCLE_KINDS_WARMUP
+    else:
+        weights = (
+            account.get("cycle_distribution")
+            or cfg.get("cycle_distribution")
+            or _CYCLE_KINDS_DEFAULT
+        )
+    kinds = list(weights.keys())
+    probs = [float(weights[k]) for k in kinds]
+    # random.choices гарантирует выбор хотя бы одного, если суммa > 0.
+    # _CYCLE_KINDS_WARMUP содержит 0 для messenger_only — это нормально.
+    return random.choices(kinds, weights=probs, k=1)[0]
+
+
+def _do_profile_check(driver, account_name: str) -> None:
+    """F8: «короткий цикл» — заходим в профиль, листаем 30-60 секунд.
+
+    Не парсим, не отвечаем — просто визит. Имитирует «зашёл проверить
+    своё». В 30% случаев заглядываем ещё и в /profile/favorites.
+    """
+    safe_get(driver, "https://www.avito.ru/profile", account_name)
+    hp(30, 60)
+    if random.random() < 0.3:
+        safe_get(driver, "https://www.avito.ru/profile/favorites", account_name)
+        hp(20, 40)
+
+
 def yandex_warmup(driver, wait, account_name, num_queries=2):
     log(account_name, "=== Enhanced Thematic Yandex Warmup ===")
 
@@ -1413,25 +1480,66 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
             # A3/A4: сбрасываем сессионные phone-счётчики в начале цикла.
             account_state.start_new_session(account_name)
 
-            # ── Stage 2: Browse & Search ──
-            log(account_name, "  Ready to work. Selecting categories...")
-            hp(4, 10)  # Thinking time
-            client.browse_commercial_categories()
+            # ── F8: выбор типа цикла ─────────────────────────────────────────
+            # Не каждый цикл должен быть «полным» (browse + parse + messenger).
+            # Реальный пользователь чаще заходит просто проверить мессенджер
+            # или полистать профиль — и эту вариативность надо имитировать.
+            # См. _pick_cycle_kind для деталей распределения и warmup-mode.
+            kind = _pick_cycle_kind(
+                account, cfg, is_warmup=account_state.is_in_warmup(account_name)
+            )
+            log(account_name, f"F8: cycle kind = {kind}")
 
-            if _tg.stop_event.is_set():
-                break
+            if kind == "full":
+                # ── Stage 2: Browse & Search ──
+                log(account_name, "  Ready to work. Selecting categories...")
+                hp(4, 10)  # Thinking time
+                client.browse_commercial_categories()
 
-            processed, new_listings, errors = client.find_and_view_commercial_listings()
-            log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
+                if _tg.stop_event.is_set():
+                    break
 
-            if _tg.stop_event.is_set():
-                break
+                processed, new_listings, errors = client.find_and_view_commercial_listings()
+                log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
 
-            # ── Stage 3: Messages ──
-            client.process_messages()
+                if _tg.stop_event.is_set():
+                    break
 
-            if _tg.stop_event.is_set():
-                break
+                # ── Stage 3: Messages ──
+                client.process_messages()
+
+                if _tg.stop_event.is_set():
+                    break
+
+            elif kind == "messenger_only":
+                # F8: только мессенджер. Имитирует «зашёл с пуша/прочитать».
+                client.process_messages()
+                if _tg.stop_event.is_set():
+                    break
+
+            elif kind == "browse_only":
+                # F8: browse + парс листингов, но БЕЗ мессенджера. Часто бывает
+                # у людей: «Открыл — поискать что есть нового, мессенджер не
+                # лез смотреть».
+                log(account_name, "  Browse-only cycle...")
+                hp(4, 10)
+                client.browse_commercial_categories()
+
+                if _tg.stop_event.is_set():
+                    break
+
+                processed, new_listings, errors = client.find_and_view_commercial_listings()
+                log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
+
+                if _tg.stop_event.is_set():
+                    break
+
+            elif kind == "profile_check":
+                # F8: «зашёл просто посмотреть свой профиль». Никакого парсинга,
+                # никакого LLM, никаких сообщений — только активность сессии.
+                _do_profile_check(driver, account_name)
+                if _tg.stop_event.is_set():
+                    break
 
             # ── A4: Session pause ───────────────────────────────────────────
             # После каждого полного цикла бот делает паузу, как реальный пользователь.

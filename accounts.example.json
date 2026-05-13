@@ -28,7 +28,13 @@
     "view_listing_call_rate": 0.05,
     "max_listings_per_search": 7,
     "max_categories_per_browse": 4,
-    "max_listings_per_browse": 4
+    "max_listings_per_browse": 4,
+    "cycle_distribution": {
+      "full": 0.55,
+      "messenger_only": 0.20,
+      "browse_only": 0.15,
+      "profile_check": 0.10
+    }
   },
   {
     "name": "second account (disabled пример)",
