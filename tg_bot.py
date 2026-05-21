@@ -353,9 +353,7 @@ class TelegramController:
         accs = self._accounts()
         text = f"Аккаунты ({len(accs)}):"
         if edit_msg:
-            self._edit_or_send(
-                edit_msg.chat.id, edit_msg.message_id, text, kb_accounts(accs)
-            )
+            self._edit_or_send(edit_msg.chat.id, edit_msg.message_id, text, kb_accounts(accs))
             return
         self._send(chat_id, text, kb_accounts(accs))
 
@@ -363,9 +361,7 @@ class TelegramController:
         proxies = self._proxies()
         text = f"Прокси ({len(proxies)}):\n(нажми на прокси чтобы удалить)"
         if edit_msg:
-            self._edit_or_send(
-                edit_msg.chat.id, edit_msg.message_id, text, kb_proxies(proxies)
-            )
+            self._edit_or_send(edit_msg.chat.id, edit_msg.message_id, text, kb_proxies(proxies))
             return
         self._send(chat_id, text, kb_proxies(proxies))
 
@@ -382,18 +378,14 @@ class TelegramController:
             f"AdsPower Key: {'✅ задан' if cfg.get('adspower_api_key', '') else '❌ не задан'}"
         )
         if edit_msg:
-            self._edit_or_send(
-                edit_msg.chat.id, edit_msg.message_id, text, kb_settings()
-            )
+            self._edit_or_send(edit_msg.chat.id, edit_msg.message_id, text, kb_settings())
             return
         self._send(chat_id, text, kb_settings())
 
     def _show_classification(self, chat_id, edit_msg=None):
         text = "🔍 Классификация объявлений"
         if edit_msg:
-            self._edit_or_send(
-                edit_msg.chat.id, edit_msg.message_id, text, kb_classification()
-            )
+            self._edit_or_send(edit_msg.chat.id, edit_msg.message_id, text, kb_classification())
             return
         self._send(chat_id, text, kb_classification())
 
@@ -722,8 +714,7 @@ class TelegramController:
             except json.JSONDecodeError:
                 self.bot.reply_to(
                     message,
-                    "Не удалось распознать JSON. "
-                    "Отправь файл .json или валидный JSON-текст.",
+                    "Не удалось распознать JSON. Отправь файл .json или валидный JSON-текст.",
                 )
                 return
 
@@ -817,7 +808,9 @@ class TelegramController:
         self.bot.reply_to(message, f"✅ Сохранено {len(lines)} ключевых слов.")
         self._show_settings(cid)
 
-    def _save_cfg_text_field(self, message, cfg_key: str, success_text: str, *, require_url: bool = False):
+    def _save_cfg_text_field(
+        self, message, cfg_key: str, success_text: str, *, require_url: bool = False
+    ):
         """Helper для set_url/set_sphere_key/set_openai_*/set_adspower_*:
         читает message.text, валидирует (URL prefix если require_url),
         сохраняет в cfg[cfg_key], показывает settings-меню.
@@ -868,9 +861,7 @@ class TelegramController:
         )
 
     def _dialog_set_adspower_key(self, message, data):
-        self._save_cfg_text_field(
-            message, "adspower_api_key", "✅ AdsPower API Key обновлён."
-        )
+        self._save_cfg_text_field(message, "adspower_api_key", "✅ AdsPower API Key обновлён.")
 
     def _dialog_set_threads(self, message, data):
         """State: число потоков (0..50)."""
@@ -1005,8 +996,7 @@ class TelegramController:
             self._edit_or_send(
                 cid,
                 call.message.message_id,
-                f"✅ Ответ принят: {response}\n"
-                f"Аккаунт «{req.account_name}», kind={req.kind}",
+                f"✅ Ответ принят: {response}\nАккаунт «{req.account_name}», kind={req.kind}",
             )
         else:
             self._send(cid, f"Не удалось закрыть запрос {request_id}.")
@@ -1105,16 +1095,12 @@ class TelegramController:
                 for t in active_threads
             ]
             text = "\n".join(lines)
-        self._edit_or_send(
-            call.message.chat.id, call.message.message_id, text, kb_back()
-        )
+        self._edit_or_send(call.message.chat.id, call.message.message_id, text, kb_back())
 
     def _cb_logs(self, call):
         recent = list(log_buffer)[-30:]
         text = "\n".join(recent) if recent else "Лог пуст."
-        self._edit_or_send(
-            call.message.chat.id, call.message.message_id, text, kb_back()
-        )
+        self._edit_or_send(call.message.chat.id, call.message.message_id, text, kb_back())
 
     # ── Аккаунты (K1: все CRUD идёт через accounts.json) ──────────────────
 
@@ -1209,9 +1195,7 @@ class TelegramController:
     def _cb_proxy_add(self, call):
         cid = call.message.chat.id
         self._set_dialog(cid, "proxy_add")
-        self._send(
-            cid, "Введи прокси в формате:\nip:port:user:pass\n\nИли: /cancel для отмены"
-        )
+        self._send(cid, "Введи прокси в формате:\nip:port:user:pass\n\nИли: /cancel для отмены")
 
     def _cb_proxy_replace(self, call):
         cid = call.message.chat.id
@@ -1258,8 +1242,7 @@ class TelegramController:
         cfg = self._cfg()
         self._send(
             cid,
-            f"Текущий URL:\n{cfg.get('target_url', '—')}\n\n"
-            f"Отправь новую ссылку на объявление:",
+            f"Текущий URL:\n{cfg.get('target_url', '—')}\n\nОтправь новую ссылку на объявление:",
         )
 
     def _cb_set_sphere_key(self, call):
@@ -1277,9 +1260,7 @@ class TelegramController:
         self._set_dialog(cid, "set_openai_model")
         cfg = self._cfg()
         cur = cfg.get("openai_model", "gpt-3.5-turbo")
-        self._send(
-            cid, f"Текущая модель: {cur}\n\nОтправь название новой модели (напр. gpt-4o):"
-        )
+        self._send(cid, f"Текущая модель: {cur}\n\nОтправь название новой модели (напр. gpt-4o):")
 
     def _cb_set_adspower_url(self, call):
         cid = call.message.chat.id
@@ -1308,13 +1289,10 @@ class TelegramController:
         cid = call.message.chat.id
         self._set_dialog(cid, "set_keywords")
         kws = self._keywords()
-        current = (
-            "\n".join(f"{i + 1}. {k}" for i, k in enumerate(kws)) if kws else "(пусто)"
-        )
+        current = "\n".join(f"{i + 1}. {k}" for i, k in enumerate(kws)) if kws else "(пусто)"
         self._send(
             cid,
-            f"Текущие ключевые слова:\n{current}\n\n"
-            f"Отправь новый список (по одному на строку):",
+            f"Текущие ключевые слова:\n{current}\n\nОтправь новый список (по одному на строку):",
         )
 
     # ── Классификация ──────────────────────────────────────────────────────

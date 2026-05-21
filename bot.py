@@ -689,10 +689,10 @@ def update_profile_proxy(adspower_api, user_id, proxy_str):
 # в профиль. Бот не должен ВСЕГДА делать «полный цикл» (browse + parse +
 # messenger) — это сильнейший behavioral fingerprint.
 _CYCLE_KINDS_DEFAULT: dict[str, float] = {
-    "full": 0.40,            # warmup → browse → find_and_view → messenger
+    "full": 0.40,  # warmup → browse → find_and_view → messenger
     "messenger_only": 0.15,  # только мессенджер (reactive replies)
-    "browse_only": 0.10,     # browse + find_and_view, без messenger
-    "profile_check": 0.05,   # просто заходим в /profile
+    "browse_only": 0.10,  # browse + find_and_view, без messenger
+    "profile_check": 0.05,  # просто заходим в /profile
     # H1: outbound — proactive контакты к собственникам по уже распарсенным
     # листингам. Самый «продуктовый» режим — даёт основные leads. Доля 30%
     # обеспечивает ~3-4 outbound-цикла в день (см. F7/F6 reduction); при
@@ -913,8 +913,7 @@ def yandex_warmup(driver, wait, account_name, num_queries=2):
 
     log(
         account_name,
-        f"Warmup completed ({success_count} queries successful, "
-        f"{captcha_count} captcha).",
+        f"Warmup completed ({success_count} queries successful, {captcha_count} captcha).",
     )
     return True
 
@@ -987,8 +986,11 @@ def browse_commercial_categories(
             if not safe_get(driver, href, account_name):
                 break
             if not view_listing(
-                driver, wait, account_name,
-                favorite_rate=favorite_rate, call_rate=call_rate,
+                driver,
+                wait,
+                account_name,
+                favorite_rate=favorite_rate,
+                call_rate=call_rate,
             ):
                 break
             driver.back()
@@ -1418,13 +1420,30 @@ def _seconds_until_active_hours(account: dict, cfg: dict) -> float:
 # Теперь каждый цикл бросаем монетку с вероятностью _active_probability(hour);
 # выпало > prob — пропускаем один цикл (длинная пауза 30-90 мин).
 _ACTIVITY_BY_HOUR: dict[int, float] = {
-    0: 0.02, 1: 0.01, 2: 0.01, 3: 0.005, 4: 0.005,
-    5: 0.01, 6: 0.05, 7: 0.20, 8: 0.40,
-    9: 0.85, 10: 0.95, 11: 0.95,
-    12: 0.55, 13: 0.45, 14: 0.55,
-    15: 0.85, 16: 0.85, 17: 0.80,
-    18: 0.90, 19: 0.90, 20: 0.85,
-    21: 0.70, 22: 0.45, 23: 0.20,
+    0: 0.02,
+    1: 0.01,
+    2: 0.01,
+    3: 0.005,
+    4: 0.005,
+    5: 0.01,
+    6: 0.05,
+    7: 0.20,
+    8: 0.40,
+    9: 0.85,
+    10: 0.95,
+    11: 0.95,
+    12: 0.55,
+    13: 0.45,
+    14: 0.55,
+    15: 0.85,
+    16: 0.85,
+    17: 0.80,
+    18: 0.90,
+    19: 0.90,
+    20: 0.85,
+    21: 0.70,
+    22: 0.45,
+    23: 0.20,
 }
 
 
@@ -1454,11 +1473,7 @@ def _active_probability(account: dict, cfg: dict, hour: int | None = None) -> fl
         if not (int(start) <= hour < int(end)):
             return 0.0
 
-    pattern = (
-        account.get("activity_pattern")
-        or cfg.get("activity_pattern")
-        or _ACTIVITY_BY_HOUR
-    )
+    pattern = account.get("activity_pattern") or cfg.get("activity_pattern") or _ACTIVITY_BY_HOUR
     # Ключи в JSON всегда строки — нормализуем оба варианта.
     if isinstance(pattern, dict):
         return float(pattern.get(hour, pattern.get(str(hour), 0.5)))
@@ -1525,9 +1540,7 @@ def _apply_warmup_if_new(account: dict, account_name: str) -> None:
         account_state.set_warmup_until(account_name, warmup_end_ts)
         if account_state.is_in_warmup(account_name):
             warmup_listing_limit = int(account.get("warmup_daily_listings", 20))
-            account_state.set_daily_budget_limits(
-                account_name, {"listings": warmup_listing_limit}
-            )
+            account_state.set_daily_budget_limits(account_name, {"listings": warmup_listing_limit})
             log(
                 account_name,
                 f"B1: warmup-режим до {_dt.datetime.fromtimestamp(warmup_end_ts).strftime('%Y-%m-%d')} "
@@ -1570,9 +1583,7 @@ def _check_health_and_log(account_name: str, db_manager: DatabaseManager) -> Non
         pass  # C1 не должен блокировать запуск
 
 
-def _connect_with_retry(
-    adspower: "AdsPowerAPI", user_id: str, account_name: str
-) -> tuple | None:
+def _connect_with_retry(adspower: "AdsPowerAPI", user_id: str, account_name: str) -> tuple | None:
     """Запуск AdsPower-профиля + WebDriver-подключение с попытками.
 
     На каждом провале — ротируем прокси из общего пула proxies.txt и
@@ -1699,8 +1710,7 @@ def _sleep_until_tomorrow(account: dict, cfg: dict, account_name: str) -> None:
     wait_secs = max(0.0, (tomorrow - now).total_seconds())
     log(
         account_name,
-        f"F7: сегодня dead-day — спим {wait_secs / 3600:.1f} ч "
-        f"до завтра {start_hour:02d}:00.",
+        f"F7: сегодня dead-day — спим {wait_secs / 3600:.1f} ч до завтра {start_hour:02d}:00.",
     )
     slept = 0.0
     while slept < wait_secs and not _tg.stop_event.is_set():
@@ -1709,9 +1719,7 @@ def _sleep_until_tomorrow(account: dict, cfg: dict, account_name: str) -> None:
         slept += chunk
 
 
-def _run_main_loop(
-    client, driver, account: dict, cfg: dict, account_name: str
-) -> None:
+def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) -> None:
     """Основной цикл: F7 dead-day → F6 prob → F8 cycle dispatch → A4 пауза.
 
     Гоняем пока не выставлен _tg.stop_event. Каждый «цикл» — это либо
@@ -1738,9 +1746,7 @@ def _run_main_loop(
         if random.random() > prob:
             hour = time.localtime().tm_hour
             sleep_min = random.uniform(pause_min, pause_max)
-            wake_time = time.strftime(
-                "%H:%M", time.localtime(time.time() + sleep_min * 60)
-            )
+            wake_time = time.strftime("%H:%M", time.localtime(time.time() + sleep_min * 60))
             log(
                 account_name,
                 f"F6: пропуск цикла (час={hour:02d}, prob={prob:.2f}). "
@@ -1761,9 +1767,7 @@ def _run_main_loop(
         # Не каждый цикл должен быть «полным» (browse + parse + messenger).
         # Реальный пользователь чаще заходит просто проверить мессенджер
         # или полистать профиль. См. _pick_cycle_kind для деталей.
-        kind = _pick_cycle_kind(
-            account, cfg, is_warmup=account_state.is_in_warmup(account_name)
-        )
+        kind = _pick_cycle_kind(account, cfg, is_warmup=account_state.is_in_warmup(account_name))
         log(account_name, f"F8: cycle kind = {kind}")
 
         if kind == "full":
@@ -1823,12 +1827,9 @@ def _run_main_loop(
         next_time = time.strftime("%H:%M", time.localtime(time.time() + pause_secs))
         log(
             account_name,
-            f"Цикл завершён. Следующий запуск в ~{next_time} "
-            f"(пауза {pause_secs / 60:.0f} мин).",
+            f"Цикл завершён. Следующий запуск в ~{next_time} (пауза {pause_secs / 60:.0f} мин).",
         )
-        _human_delay(
-            pause_secs, pause_secs, stop_event=_tg.stop_event, distribution="uniform"
-        )
+        _human_delay(pause_secs, pause_secs, stop_event=_tg.stop_event, distribution="uniform")
 
 
 def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: DatabaseManager):

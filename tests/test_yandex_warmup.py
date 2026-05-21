@@ -18,9 +18,7 @@ from bot import THEMATIC_QUERIES, YANDEX_QUERIES, _pick_queries
 
 def test_thematic_queries_count():
     """F4: THEMATIC_QUERIES должен содержать >= 25 запросов."""
-    assert len(THEMATIC_QUERIES) >= 25, (
-        f"Ожидалось >= 25, получено {len(THEMATIC_QUERIES)}"
-    )
+    assert len(THEMATIC_QUERIES) >= 25, f"Ожидалось >= 25, получено {len(THEMATIC_QUERIES)}"
 
 
 def test_thematic_queries_are_strings():
@@ -73,9 +71,7 @@ def test_pick_queries_idle_possible():
     results = [_pick_queries(1) for _ in range(2000)]
     empty_count = sum(1 for r in results if len(r) == 0)
     # 5% вероятность на 1 слот → ≈100 из 2000. Проверяем диапазон.
-    assert 10 <= empty_count <= 300, (
-        f"idle count={empty_count} вне ожидаемого диапазона [10, 300]"
-    )
+    assert 10 <= empty_count <= 300, f"idle count={empty_count} вне ожидаемого диапазона [10, 300]"
 
 
 # ── yandex_warmup использует _pick_queries ────────────────────────────────

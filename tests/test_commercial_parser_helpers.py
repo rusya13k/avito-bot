@@ -109,10 +109,7 @@ def test_extract_category_business():
 def test_extract_category_default_for_unknown():
     """Никакое ключевое слово не попало → дефолтная категория."""
     drv = _mock_driver("https://avito.ru/x")
-    assert (
-        _extract_category(drv, "Объект коммерческой недвижимости")
-        == "коммерческая недвижимость"
-    )
+    assert _extract_category(drv, "Объект коммерческой недвижимости") == "коммерческая недвижимость"
 
 
 def test_extract_category_handles_driver_exception():

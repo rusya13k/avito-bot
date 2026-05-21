@@ -93,8 +93,9 @@ def test_interesting_listing_continues_full_flow(state_mock):
         mock_rng.shuffle.side_effect = lambda x: None
         mock_wdw.return_value.until.return_value = MagicMock()
 
-        result = view_listing(_make_driver(), _make_wait(), "acc1",
-                              favorite_rate=0.5, call_rate=0.5)
+        result = view_listing(
+            _make_driver(), _make_wait(), "acc1", favorite_rate=0.5, call_rate=0.5
+        )
 
     assert result is True
     mock_scroll.assert_called_once()

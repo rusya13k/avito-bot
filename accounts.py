@@ -250,9 +250,7 @@ def _normalize_only(raw: list[Any], source: str) -> list[dict[str, Any]]:
             logger.warning("K1: %s: account #%d без 'name' — пропускаю", source, i)
             continue
         if name in seen_names:
-            logger.warning(
-                "K1: %s: дубль имени %r — оставляю первое вхождение", source, name
-            )
+            logger.warning("K1: %s: дубль имени %r — оставляю первое вхождение", source, name)
             continue
         seen_names.add(name)
 
@@ -292,9 +290,7 @@ def save_accounts(repo_dir: Path | str, accounts: list[dict[str, Any]]) -> Path:
     with _WRITE_LOCK:
         # tempfile в той же директории, чтобы os.replace был атомарным
         # (cross-device replace не атомарен на некоторых FS).
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=".accounts_", suffix=".json.tmp", dir=str(repo_dir)
-        )
+        fd, tmp_path = tempfile.mkstemp(prefix=".accounts_", suffix=".json.tmp", dir=str(repo_dir))
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(payload)
@@ -415,9 +411,7 @@ def _atomic_write(repo_dir: Path, accounts: list[dict[str, Any]]) -> Path:
     repo_dir.mkdir(parents=True, exist_ok=True)
     target = repo_dir / ACCOUNTS_JSON_FILENAME
     payload = json.dumps(accounts, ensure_ascii=False, indent=2)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=".accounts_", suffix=".json.tmp", dir=str(repo_dir)
-    )
+    fd, tmp_path = tempfile.mkstemp(prefix=".accounts_", suffix=".json.tmp", dir=str(repo_dir))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(payload)

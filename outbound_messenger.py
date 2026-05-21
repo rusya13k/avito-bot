@@ -73,16 +73,14 @@ PERSONAS: dict[str, str] = {
         "Важны удобный въезд для фургонов, сухость, отопление."
     ),
     "cafe_owner": (
-        "ищу площадь под кафе/кофейню. Важны вытяжка, мокрые точки, "
-        "размер помещения, район."
+        "ищу площадь под кафе/кофейню. Важны вытяжка, мокрые точки, размер помещения, район."
     ),
     "clinic_medical": (
         "ищу помещение под медицинский центр / стоматологию. "
         "Важны санузлы, водоотведение, лицензируемость."
     ),
     "beauty_salon": (
-        "ищу под салон красоты / барбершоп. "
-        "Важны окна, вытяжка, мокрые точки, проходимость."
+        "ищу под салон красоты / барбершоп. Важны окна, вытяжка, мокрые точки, проходимость."
     ),
     "fitness_studio": (
         "открываю небольшую студию (йога/растяжка/пилатес). "
@@ -93,24 +91,19 @@ PERSONAS: dict[str, str] = {
         "Важен заезд для авто, высота ворот, электричество."
     ),
     "educational": (
-        "открываю детский центр / курсы. "
-        "Нужны несколько кабинетов, санузел, безопасный двор."
+        "открываю детский центр / курсы. Нужны несколько кабинетов, санузел, безопасный двор."
     ),
     "coworking": (
-        "развиваю небольшой коворкинг. "
-        "Нужен open space, переговорная, скоростной интернет."
+        "развиваю небольшой коворкинг. Нужен open space, переговорная, скоростной интернет."
     ),
     "logistics": (
-        "логистическая компания, ищу склад. "
-        "Важны площадь, рампа, въезд для длинномера, охрана."
+        "логистическая компания, ищу склад. Важны площадь, рампа, въезд для длинномера, охрана."
     ),
     "it_office": (
-        "IT-команда, ищу офис на 10-15 рабочих мест. "
-        "Важен интернет, отдельный санузел, тихий этаж."
+        "IT-команда, ищу офис на 10-15 рабочих мест. Важен интернет, отдельный санузел, тихий этаж."
     ),
     "legal_office": (
-        "юридическая практика, ищу офис в центре. "
-        "Желательно деловой район, парковка для клиентов."
+        "юридическая практика, ищу офис в центре. Желательно деловой район, парковка для клиентов."
     ),
     "retail_chain": (
         "представитель торговой сети, рассматриваем расширение. "
@@ -401,9 +394,7 @@ class OutboundMessenger:
             return False
 
         # 3. Pre-click captcha check.
-        if detect_phone_captcha(
-            self.driver, log_func=log_func, account_name=self.account_name
-        ):
+        if detect_phone_captcha(self.driver, log_func=log_func, account_name=self.account_name):
             log_func(self.account_name, "H1: капча на странице листинга — скип.")
             _astate.mark_captcha(self.account_name)
             return False
@@ -468,9 +459,7 @@ class OutboundMessenger:
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
                 # Скроллим чтобы кнопка точно была видна — иначе click перехватится.
-                self.driver.execute_script(
-                    "arguments[0].scrollIntoView({block: 'center'});", btn
-                )
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
                 _human_delay(0.5, 1.5, stop_event=_tg.stop_event)
                 try:
                     btn.click()
@@ -571,9 +560,7 @@ class OutboundMessenger:
 
         # Post-send capture-check: иногда Avito подсовывает капчу сразу
         # после первого outbound — это самый детектируемый момент.
-        if detect_phone_captcha(
-            self.driver, log_func=log_func, account_name=self.account_name
-        ):
+        if detect_phone_captcha(self.driver, log_func=log_func, account_name=self.account_name):
             log_func(self.account_name, "H1: КАПЧА после Send — записываем как captcha.")
             _astate.mark_captcha(self.account_name)
             return False

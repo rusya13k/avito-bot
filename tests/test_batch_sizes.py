@@ -161,7 +161,9 @@ def test_browse_explicit_num_categories_skips_weighted():
         patch("bot._weighted_listing_count", return_value=2) as mock_wlc,
     ):
         browse_commercial_categories(
-            MagicMock(), MagicMock(), "acc1",
+            MagicMock(),
+            MagicMock(),
+            "acc1",
             num_categories=2,  # явно задано
         )
 
@@ -180,7 +182,9 @@ def test_avito_client_stores_max_params():
     from avito_client import AvitoClient
 
     client = AvitoClient(
-        MagicMock(), MagicMock(), "acc1",
+        MagicMock(),
+        MagicMock(),
+        "acc1",
         max_listings_per_search=5,
         max_categories_per_browse=3,
         max_listings_per_browse=2,
@@ -196,8 +200,7 @@ def test_avito_client_passes_max_listings_to_find():
     from avito_client import AvitoClient
 
     db = MagicMock()
-    client = AvitoClient(MagicMock(), MagicMock(), "acc1",
-                         db_manager=db, max_listings_per_search=5)
+    client = AvitoClient(MagicMock(), MagicMock(), "acc1", db_manager=db, max_listings_per_search=5)
 
     with (
         patch("account_state.account_state") as mock_state,
@@ -217,7 +220,9 @@ def test_avito_client_passes_max_browse_to_browse():
     from avito_client import AvitoClient
 
     client = AvitoClient(
-        MagicMock(), MagicMock(), "acc1",
+        MagicMock(),
+        MagicMock(),
+        "acc1",
         max_categories_per_browse=3,
         max_listings_per_browse=2,
     )

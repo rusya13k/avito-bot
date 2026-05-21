@@ -304,9 +304,7 @@ def test_get_first_in_message_age_ignores_out_messages(db):
         last_message_text="x",
         last_message_time="2024-01-01 12:00:00",
     )
-    long_ago = (datetime.datetime.now() - datetime.timedelta(hours=1)).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    long_ago = (datetime.datetime.now() - datetime.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
     db.add_message(did, "out", "hello", long_ago)  # это OUT — игнорируем
     assert db.get_first_in_message_age_seconds(did, "hello") is None
 

@@ -46,8 +46,7 @@ def test_yandex_warmup_has_no_grandma_loop():
     # «Бабушкина» сигнатура: time.sleep(random.uniform(<0.5+>, <1.5+>)) с большой минимальной.
     pattern = re.compile(r"time\.sleep\(\s*random\.uniform\(\s*0\.5\s*,\s*1\.5\s*\)\s*\)")
     assert not pattern.search(src), (
-        "В yandex_warmup найден slow-typing loop time.sleep(random.uniform(0.5, 1.5)) — "
-        "T1 регресс."
+        "В yandex_warmup найден slow-typing loop time.sleep(random.uniform(0.5, 1.5)) — T1 регресс."
     )
 
 
@@ -68,8 +67,7 @@ def test_perform_login_has_no_grandma_loop():
     src = _src(bot.perform_login)
     pattern = re.compile(r"time\.sleep\(\s*random\.uniform\(\s*0\.5\s*,\s*1\.5\s*\)\s*\)")
     assert not pattern.search(src), (
-        "В perform_login найден slow-typing loop time.sleep(random.uniform(0.5, 1.5)) — "
-        "T1 регресс."
+        "В perform_login найден slow-typing loop time.sleep(random.uniform(0.5, 1.5)) — T1 регресс."
     )
 
 

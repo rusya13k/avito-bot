@@ -143,9 +143,7 @@ def _extract_title(wait) -> str:
     """
     try:
         title_elem = wait.until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//h1[@data-marker='item-view/title-info']")
-            )
+            EC.presence_of_element_located((By.XPATH, "//h1[@data-marker='item-view/title-info']"))
         )
         return title_elem.text
     except TimeoutException:
@@ -267,9 +265,7 @@ def _extract_publication_date(driver) -> str:
 def _extract_photos(driver, max_n: int = 3) -> list[str]:
     """Первые `max_n` URL фото из image-frame/image. [] если нет."""
     try:
-        photo_elements = driver.find_elements(
-            By.XPATH, "//img[@data-marker='image-frame/image']"
-        )
+        photo_elements = driver.find_elements(By.XPATH, "//img[@data-marker='image-frame/image']")
         return [p.get_attribute("src") for p in photo_elements[:max_n]]
     except Exception:
         return []
@@ -583,9 +579,7 @@ def save_listing_to_db(listing_data, db_manager, log_func, account_name):
                     listing_id=listing_id,
                     cursor=cur,
                 )
-                _record_listing_outcome_metrics(
-                    db_manager, cur, account_name, listing_data, status
-                )
+                _record_listing_outcome_metrics(db_manager, cur, account_name, listing_data, status)
 
         log_func(account_name, f"Сохранено в БД (id={listing_id}): {listing_data['url']}")
         return listing_id

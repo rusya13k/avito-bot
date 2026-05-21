@@ -43,9 +43,7 @@ def test_edit_or_send_success_no_send(tg_ctrl):
 
     ctrl._edit_or_send(chat_id=123, message_id=456, text="hello", kb=None)
 
-    mock_bot.edit_message_text.assert_called_once_with(
-        "hello", 123, 456, reply_markup=None
-    )
+    mock_bot.edit_message_text.assert_called_once_with("hello", 123, 456, reply_markup=None)
     mock_bot.send_message.assert_not_called()
 
 
@@ -59,9 +57,7 @@ def test_edit_or_send_failure_falls_back_to_send(tg_ctrl):
     fake_kb = MagicMock(name="kb")
     ctrl._edit_or_send(chat_id=42, message_id=99, text="hi", kb=fake_kb)
 
-    mock_bot.edit_message_text.assert_called_once_with(
-        "hi", 42, 99, reply_markup=fake_kb
-    )
+    mock_bot.edit_message_text.assert_called_once_with("hi", 42, 99, reply_markup=fake_kb)
     # send_message должен быть вызван через _send → его последний positional
     # arg — chat_id, текст. reply_markup передаётся через kwargs.
     mock_bot.send_message.assert_called_once()

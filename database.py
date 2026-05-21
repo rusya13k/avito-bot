@@ -352,8 +352,7 @@ class DatabaseManager:
                 "ON outbound_contacts(account_name, contacted_at)"
             )
             cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_outbound_listing "
-                "ON outbound_contacts(listing_id)"
+                "CREATE INDEX IF NOT EXISTS idx_outbound_listing ON outbound_contacts(listing_id)"
             )
 
             # C3: captcha_log — идемпотентно для старых БД

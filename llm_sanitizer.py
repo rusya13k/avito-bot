@@ -53,15 +53,15 @@ _PHONE_RE = re.compile(
 _MESSENGER_URL_RE = re.compile(
     r"(?:https?://)?"
     r"(?:"
-    r"t\.me/"                # Telegram
-    r"|telegram\.me/"        # Telegram (старое)
+    r"t\.me/"  # Telegram
+    r"|telegram\.me/"  # Telegram (старое)
     r"|telegram\.dog/"
-    r"|wa\.me/"              # WhatsApp
+    r"|wa\.me/"  # WhatsApp
     r"|whatsapp\.com/"
     r"|api\.whatsapp\.com/"
-    r"|viber://"             # Viber
+    r"|viber://"  # Viber
     r"|viber\.com/"
-    r"|vk\.com/"             # ВКонтакте
+    r"|vk\.com/"  # ВКонтакте
     r"|vk\.me/"
     r"|instagram\.com/"
     r"|t-do\.ru/"

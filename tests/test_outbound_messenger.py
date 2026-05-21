@@ -50,9 +50,7 @@ def test_pick_persona_stable_per_account():
 
 def test_pick_persona_different_accounts_different_personas():
     """Разные аккаунты — статистически разные персоны (не все одинаковые)."""
-    personas = {
-        _pick_persona_for_account({"name": f"acc-{i}"}) for i in range(20)
-    }
+    personas = {_pick_persona_for_account({"name": f"acc-{i}"}) for i in range(20)}
     # 20 аккаунтов на 16 персон — должно быть >5 различных
     assert len(personas) >= 5
 
@@ -237,9 +235,16 @@ def test_run_one_cycle_dedup_race_skipped(fake_db, fake_llm):
     через was_owner_contacted и скипнуть, не открывая driver.get."""
     fake_db.get_owners_to_contact.return_value = [
         {
-            "id": 1, "url": "https://x", "title": "Офис", "profile_id": "o1",
-            "seller_name": "S", "location": "Москва", "area": 50.0,
-            "price": 100000, "description": "...", "category": "офис",
+            "id": 1,
+            "url": "https://x",
+            "title": "Офис",
+            "profile_id": "o1",
+            "seller_name": "S",
+            "location": "Москва",
+            "area": 50.0,
+            "price": 100000,
+            "description": "...",
+            "category": "офис",
         },
     ]
     fake_db.was_owner_contacted.return_value = True  # race!

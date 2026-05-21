@@ -427,9 +427,7 @@ class AccountState:
         используется глобальный дефолт 0.05.
         """
         with self._lock:
-            self._get(account_name).dead_day_rate = (
-                None if rate is None else float(rate)
-            )
+            self._get(account_name).dead_day_rate = None if rate is None else float(rate)
 
     def is_dead_day(self, account_name: str) -> bool:
         """

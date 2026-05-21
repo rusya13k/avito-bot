@@ -196,9 +196,7 @@ def test_on_callback_proxy_del_ok_wins_over_proxy_del_confirm(tg_ctrl, monkeypat
     Тест проверяет что они корректно разделены."""
     confirm_calls = []
     ok_calls = []
-    monkeypatch.setattr(
-        tg_ctrl, "_cb_proxy_del_confirm", lambda c: confirm_calls.append(c.data)
-    )
+    monkeypatch.setattr(tg_ctrl, "_cb_proxy_del_confirm", lambda c: confirm_calls.append(c.data))
     monkeypatch.setattr(tg_ctrl, "_cb_proxy_del_ok", lambda c: ok_calls.append(c.data))
 
     tg_ctrl._on_callback(_make_call(callback_data="proxy_del_ok_5"))
