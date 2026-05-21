@@ -797,10 +797,9 @@ def yandex_warmup(driver, wait, account_name, num_queries=2):
             driver.execute_script("arguments[0].focus();", box)
             hp(0.5, 1)
 
-            # Slow human typing
-            for ch in query:
-                box.send_keys(ch)
-                time.sleep(random.uniform(0.5, 1.5))
+            # Human typing — реалистичная скорость 50-250ms/char + «задумчивые»
+            # паузы (раньше тут был tupой 0.5-1.5s/char ≈ 8-12 WPM).
+            human_type(box, query)
 
             hp(1, 2)
             box.send_keys(Keys.RETURN)
@@ -1151,9 +1150,8 @@ def perform_login(driver, wait, account_name, phone, password):
         phone_input.send_keys(Keys.DELETE)
         hp(0.5, 1.0)
 
-        for ch in phone:
-            phone_input.send_keys(ch)
-            time.sleep(random.uniform(0.5, 1.5))
+        # Логин-инпуты обычно вводят аккуратнее — чуть медленнее (~100-350ms/char).
+        human_type(phone_input, phone, speed_range=(0.10, 0.35))
         hp(1.5, 2.5)
 
         # 2. Submit phone (на этом шаге Avito может попросить SMS/captcha
@@ -1211,9 +1209,8 @@ def perform_login(driver, wait, account_name, phone, password):
         log(account_name, "  Entering password (slow mode)...")
         password_input.click()
         hp(0.8, 1.5)
-        for ch in password:
-            password_input.send_keys(ch)
-            time.sleep(random.uniform(0.5, 1.5))
+        # Пароль вводят чуть медленнее обычного текста (~100-350ms/char).
+        human_type(password_input, password, speed_range=(0.10, 0.35))
         hp(1.5, 2.5)
 
         # 4. Final submit
