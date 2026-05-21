@@ -506,7 +506,9 @@ def _read_listing_meta(driver) -> tuple[str, int]:
     return description, image_count
 
 
-def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.05):
+def view_listing(
+    driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.05, db_manager=None
+):
     """
     F1: favorite_rate — вероятность «Добавить в избранное» (default 8%).
     F1: call_rate    — вероятность нажать «Позвонить»       (default 5%).
@@ -522,6 +524,10 @@ def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.
       • dwell ∝ base × log(text+1) × (1 + 0.04·images) × (0.5 + interest).
       • Клампим в [5, 300] сек.
       • 20% «совсем не моё» — возвращаемся рано (без scroll/favorite/call).
+
+    T20: db_manager (опциональный) — если передан, записывается sample
+    `dwell_sec` для percentile-аудита в /health. Не передан → no-op
+    (back-compat для тестов).
     """
     if check_block(driver, account_name):
         return False
@@ -556,6 +562,13 @@ def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.
         f"text={len(description)} chars, imgs={image_count}, "
         f"interest={interest:.2f})...",
     )
+
+    # T20: записываем sample для percentile-аудита.
+    if db_manager is not None:
+        try:
+            db_manager.record_behavioral_sample(account_name, "dwell_sec", float(dwell_time))
+        except Exception as e:
+            log(account_name, f"  T20: не смог записать dwell sample: {e}")
 
     # T10/F9: совсем неинтересно → закрываем рано.
     if interest < 0.10:
@@ -1035,6 +1048,7 @@ def browse_commercial_categories(
     call_rate=0.05,
     max_categories_per_browse=4,
     max_listings_per_browse=4,
+    db_manager=None,
 ):
     """
     F2: num_categories и ads_per_category по умолчанию None — тогда используется
@@ -1097,6 +1111,7 @@ def browse_commercial_categories(
                 account_name,
                 favorite_rate=favorite_rate,
                 call_rate=call_rate,
+                db_manager=db_manager,
             ):
                 break
             driver.back()
@@ -2139,6 +2154,16 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
         pause_secs, pause_label = pick_cycle_pause(
             account, cfg, account_state=account_state, account_name=account_name
         )
+        # T20: запись sample'а для percentile-аудита в /health.
+        # Разделяем regular (lognormal распределение) и long_break (uniform 2-5h)
+        # — иначе distribution получается bimodal и теряется смысл аудита.
+        try:
+            db = getattr(client, "db", None)
+            if db is not None:
+                event_type = "long_break_sec" if pause_label == "long_break" else "cycle_pause_sec"
+                db.record_behavioral_sample(account_name, event_type, float(pause_secs))
+        except Exception as e:
+            log(account_name, f"T20: не смог записать behavioral sample: {e}")
         next_time = time.strftime("%H:%M", time.localtime(time.time() + pause_secs))
         if pause_label == "long_break":
             log(

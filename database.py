@@ -210,6 +210,25 @@ class DatabaseManager:
                 )
             """)
 
+            # T20: поведенческие сэмплы (cycle_pause, dwell, scroll, ...).
+            # В отличие от metrics (часовые counter'ы), здесь храним отдельные
+            # значения — нужно для percentile-аудита: «у меня дисперсия пауз
+            # как у бота-генератора?». Не агрегируем в bucket, чтобы не
+            # терять distribution.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS behavioral_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_name TEXT NOT NULL DEFAULT '',
+                    event_type TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    ts REAL NOT NULL
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bsamples_account_event_ts "
+                "ON behavioral_samples(account_name, event_type, ts)"
+            )
+
             # C3: лог капча-инцидентов (url, action, тип капчи, момент).
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS captcha_log (
@@ -330,6 +349,21 @@ class DatabaseManager:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_metrics_bucket "
                 "ON metrics(bucket_hour, account_name, metric)"
+            )
+
+            # T20: behavioral_samples — миграция для старых БД.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS behavioral_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_name TEXT NOT NULL DEFAULT '',
+                    event_type TEXT NOT NULL,
+                    value REAL NOT NULL,
+                    ts REAL NOT NULL
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bsamples_account_event_ts "
+                "ON behavioral_samples(account_name, event_type, ts)"
             )
 
             # H1: для старых БД создаём outbound_contacts через миграцию.
@@ -708,6 +742,208 @@ class DatabaseManager:
             cur.execute(sql, params)
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # T20: Behavioral samples — отдельные значения для percentile-аудита
+    # ──────────────────────────────────────────────────────────────────────
+
+    def record_behavioral_sample(
+        self,
+        account_name: str,
+        event_type: str,
+        value: float,
+        ts: float | None = None,
+        cursor=None,
+    ) -> None:
+        """
+        T20: записать одно поведенческое значение (cycle_pause_sec, dwell_sec,
+        scroll_count, ...).
+
+        В отличие от incr_metric (часовой counter), здесь храним каждый sample
+        отдельно — это нужно для percentile-аудита: «у меня дисперсия пауз
+        как у бота-генератора или как у живого человека?». Агрегация в bucket
+        потеряла бы distribution.
+
+        Args:
+            account_name: имя аккаунта (или "" для глобальных).
+            event_type: тип события — `cycle_pause_sec`, `dwell_sec`,
+                `scroll_count`, и т.д.
+            value: численное значение sample'а (sec / count / px / ...).
+            ts: unix-time (по умолчанию сейчас).
+            cursor: для участия в общей транзакции (см. C4).
+        """
+        ts_val = float(ts) if ts is not None else time.time()
+        with self._with_cursor(write=True, cursor=cursor) as cur:
+            cur.execute(
+                "INSERT INTO behavioral_samples "
+                "(account_name, event_type, value, ts) VALUES (?, ?, ?, ?)",
+                (account_name or "", event_type, float(value), ts_val),
+            )
+
+    def get_behavioral_samples(
+        self,
+        account_name: str | None = None,
+        event_type: str | None = None,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
+        limit: int | None = None,
+    ) -> list[dict]:
+        """
+        T20: вернуть raw sample'ы по фильтру (для дебага и тестов).
+
+        Args:
+            account_name: None => все; "" => только глобальные.
+            event_type: None => все типы.
+            since_ts / until_ts: unix-time границы (since включительно,
+                until — исключительно).
+            limit: ограничить количество (последние).
+        """
+        where: list[str] = []
+        params: list = []
+        if account_name is not None:
+            where.append("account_name = ?")
+            params.append(account_name)
+        if event_type is not None:
+            where.append("event_type = ?")
+            params.append(event_type)
+        if since_ts is not None:
+            where.append("ts >= ?")
+            params.append(float(since_ts))
+        if until_ts is not None:
+            where.append("ts < ?")
+            params.append(float(until_ts))
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        sql = (
+            f"SELECT account_name, event_type, value, ts "
+            f"FROM behavioral_samples {where_sql} "
+            f"ORDER BY ts DESC"
+        )
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        with self._cursor() as cur:
+            cur.execute(sql, params)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_behavioral_stats(
+        self,
+        account_name: str | None = None,
+        event_type: str | None = None,
+        since_ts: float | None = None,
+        until_ts: float | None = None,
+        bins: int = 10,
+    ) -> dict:
+        """
+        T20: статистика для аудита pattern'а.
+
+        Загружает все sample'ы в память и считает через `statistics` —
+        для типичных объёмов (≤10k за 7 дней) это норм.
+
+        Возвращает dict с ключами:
+            count: int
+            min, max, mean, median, p25, p75, p95: float | None
+            stddev: float | None  (population std через statistics.pstdev)
+            histogram: list[dict] — bins с {left, right, count}
+        """
+        where: list[str] = []
+        params: list = []
+        if account_name is not None:
+            where.append("account_name = ?")
+            params.append(account_name)
+        if event_type is not None:
+            where.append("event_type = ?")
+            params.append(event_type)
+        if since_ts is not None:
+            where.append("ts >= ?")
+            params.append(float(since_ts))
+        if until_ts is not None:
+            where.append("ts < ?")
+            params.append(float(until_ts))
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        sql = f"SELECT value FROM behavioral_samples {where_sql} ORDER BY value"
+        with self._cursor() as cur:
+            cur.execute(sql, params)
+            values = [row[0] for row in cur.fetchall()]
+
+        empty = {
+            "count": 0,
+            "min": None,
+            "max": None,
+            "mean": None,
+            "median": None,
+            "p25": None,
+            "p75": None,
+            "p95": None,
+            "stddev": None,
+            "histogram": [],
+        }
+        if not values:
+            return empty
+
+        n = len(values)
+        # values уже отсортированы по SQL ORDER BY value.
+        v_min = float(values[0])
+        v_max = float(values[-1])
+        mean = sum(values) / n
+
+        def _percentile(sorted_vals: list[float], p: float) -> float:
+            # Linear-interpolation percentile на отсортированном списке.
+            # p в [0, 1].
+            if len(sorted_vals) == 1:
+                return float(sorted_vals[0])
+            k = (len(sorted_vals) - 1) * p
+            lo = int(k)
+            hi = min(lo + 1, len(sorted_vals) - 1)
+            frac = k - lo
+            return float(sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac)
+
+        median = _percentile(values, 0.5)
+        p25 = _percentile(values, 0.25)
+        p75 = _percentile(values, 0.75)
+        p95 = _percentile(values, 0.95)
+
+        if n >= 2:
+            # Population stddev (как pstdev из statistics) — без bessel-correction.
+            mean_ = mean
+            stddev = (sum((x - mean_) ** 2 for x in values) / n) ** 0.5
+        else:
+            stddev = 0.0
+
+        # Histogram: bins равной ширины от min до max.
+        bins = max(1, int(bins))
+        histogram: list[dict] = []
+        if v_max > v_min:
+            width = (v_max - v_min) / bins
+            counts = [0] * bins
+            for v in values:
+                # Последний бин включает v_max (правый край).
+                idx = int((v - v_min) / width) if v < v_max else bins - 1
+                idx = max(0, min(bins - 1, idx))
+                counts[idx] += 1
+            for i in range(bins):
+                histogram.append(
+                    {
+                        "left": v_min + width * i,
+                        "right": v_min + width * (i + 1),
+                        "count": counts[i],
+                    }
+                )
+        else:
+            # Все значения одинаковые — один бин.
+            histogram.append({"left": v_min, "right": v_max, "count": n})
+
+        return {
+            "count": n,
+            "min": v_min,
+            "max": v_max,
+            "mean": float(mean),
+            "median": median,
+            "p25": p25,
+            "p75": p75,
+            "p95": p95,
+            "stddev": float(stddev),
+            "histogram": histogram,
+        }
 
     # ──────────────────────────────────────────────────────────────────────
     # C3: Captcha log — журнал инцидентов для пост-mortem анализа

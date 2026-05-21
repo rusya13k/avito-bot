@@ -83,6 +83,21 @@
 - UNIQUE(account_name, metric, bucket_hour) — обеспечивает идемпотентность
   UPSERT'а (`INSERT ... ON CONFLICT DO UPDATE SET value = value + excluded.value`).
 
+### behavioral_samples (T20)
+Отдельные значения поведенческих событий — для percentile-аудита pattern'а
+(распределение пауз, dwell, скроллов). В отличие от `metrics` (часовой
+counter), здесь хранится КАЖДОЕ значение, иначе теряется distribution.
+Записи идут через `record_behavioral_sample(...)`, читаются через
+`get_behavioral_samples(...)` и `get_behavioral_stats(...)` (последний
+возвращает count/min/max/mean/median/p25/p75/p95/stddev/histogram).
+
+- id (INTEGER, PRIMARY KEY AUTOINCREMENT)
+- account_name (TEXT, NOT NULL, default '') — '' для глобальных
+- event_type (TEXT, NOT NULL) — `cycle_pause_sec` | `long_break_sec` |
+  `dwell_sec` (расширяется по мере добавления hook'ов)
+- value (REAL, NOT NULL) — само значение (sec / count / px / ...)
+- ts (REAL, NOT NULL) — unix-time момента записи
+
 ## Indexes
 - idx_listings_url ON listings(url)
 - idx_listings_profile_id ON listings(profile_id)    (A2)
@@ -93,6 +108,7 @@
 - idx_messages_dialog_id ON messages(dialog_id)
 - idx_dialogs_account_visitor ON dialogs(our_account, visitor_id, listing_id) (B3)
 - idx_metrics_bucket ON metrics(bucket_hour, account_name, metric) (E2)
+- idx_bsamples_account_event_ts ON behavioral_samples(account_name, event_type, ts) (T20)
 
 ## Relationships
 - listings(profile_id) logically references avito_accounts(profile_id) (без FK-constraint в SQL — мягкая связь через TEXT)

@@ -612,10 +612,65 @@ smoke-import OK.
 
 ---
 
-### T20 — Behavioral telemetry в `/health`  `status: pending`
+### T20 — Behavioral telemetry в `/health`  `status: done`
 
-В `/health` за 7 дней — гистограммы distribution (паузы, dwell,
-скроллы) для ручного аудита pattern.
+Раньше `/health` показывал только агрегаты — `listings_7d`, `captchas_7d`,
+`score`, `mode`. Этого недостаточно для аудита «как мой бот выглядит» —
+distribution (дисперсия пауз, длина dwell, и т.п.) не было видно. T20
+добавляет ASCII-гистограммы distribution для ручного pattern-аудита.
+
+- **Новая таблица `behavioral_samples`** (id, account_name, event_type,
+  value, ts) — отдельные значения, не bucket-агрегаты. CREATE TABLE и
+  миграция для старых БД в `database.init_database`.
+- **API `DatabaseManager`**:
+  - `record_behavioral_sample(account_name, event_type, value, ts=None,
+    cursor=None)` — INSERT одного sample'а. Поддерживает `cursor=...`
+    для участия в общей транзакции (см. C4).
+  - `get_behavioral_samples(account_name, event_type, since_ts, until_ts,
+    limit)` — raw sample'ы по фильтру.
+  - `get_behavioral_stats(account_name, event_type, since_ts, until_ts,
+    bins=10)` → dict с `count`, `min`/`max`/`mean`/`median`,
+    `p25`/`p75`/`p95`, `stddev` (population), `histogram` (list of
+    `{left, right, count}` для bins равной ширины). Linear-interpolation
+    percentiles. Пустая выборка → все None.
+- **Hook'и в `bot.py`**:
+  - `_run_main_loop` после `pick_cycle_pause(...)` — пишет `cycle_pause_sec`
+    (regular paused) или `long_break_sec` (long break). Разделение
+    нужно, чтобы distribution не получился bimodal — иначе теряется
+    смысл аудита.
+  - `view_listing` принимает опциональный `db_manager` и пишет
+    `dwell_sec` после `compute_reading_dwell(...)`. Не передан → no-op
+    (back-compat для старых тестов). Через `AvitoClient.browse_commercial_categories`
+    `db_manager` прокидывается автоматически — добавлен
+    `kwargs.setdefault("db_manager", self.db)`.
+  - Любая ошибка `record_behavioral_sample` глушится в try/except —
+    телеметрия не должна валить flow бота.
+- **TG `/health <name>`** — расширен блоком «📊 Pattern (7д)». Для
+  каждого event_type из (`cycle_pause_sec`, `dwell_sec`, `long_break_sec`):
+  ```
+  паузы цикла: n=87, med=40m, p95=1.9h, σ=22m
+  ▁▂▄█▆▃▁
+  dwell листингов: n=312, med=42s, p95=3m, σ=58s
+  ▆█▄▂▁
+  ```
+  - `/health` без аргументов оставлен как был — pattern-блок выводится
+    только для конкретного аккаунта (иначе сообщение переполнится).
+  - Helper'ы `_format_behavior_histogram(hist)` (12 bins → 12 unicode
+    блоков `▁..█`) и `_format_seconds_compact(sec)` (`45s/12m/3.5h`).
+  - Event_type без sample'ов — пропускается. Все three пусты → блок
+    не выводится.
+
+**Тесты** (`tests/test_behavioral_telemetry.py`, 28 шт.): DB CRUD —
+record + filter (account/event_type/ts/limit) + commit/rollback в
+транзакции; stats — empty / single / 101 значение / stddev / histogram
+bins / комбинированные фильтры; bot.py — cycle_pause regular vs long_break
+event_type, dwell_sec через view_listing с db_manager, no db_manager →
+no-op, exception в db не валит view_listing; tg_bot — histogram
+empty/all-zero/basic, seconds-compact thresholds, pattern empty/with
+samples/skip empty types/filter old samples (>7d).
+
+**Verify**: `ruff check .` ✓, `pytest tests/ -q` → 746 passed,
+smoke-import OK.
 
 ---
 

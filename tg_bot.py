@@ -178,6 +178,32 @@ def kb_confirm(yes_cb: str, no_cb: str = "menu_main") -> InlineKeyboardMarkup:
     return m
 
 
+def _format_behavior_histogram(histogram: list[dict]) -> str:
+    """T20: компактная ASCII-гистограмма по bins ('▁' .. '█').
+
+    Каждый bin → один блочный символ, высота пропорциональна count
+    относительно максимального bin. Пустой histogram / max_count==0 →
+    пустая строка.
+    """
+    if not histogram:
+        return ""
+    counts = [b.get("count", 0) for b in histogram]
+    max_c = max(counts) if counts else 0
+    if max_c == 0:
+        return ""
+    blocks = "▁▂▃▄▅▆▇█"
+    return "".join(blocks[min(7, int(c / max_c * 7.99))] for c in counts)
+
+
+def _format_seconds_compact(seconds: float) -> str:
+    """T20: компактный формат для секунд: 45s / 12m / 3.5h."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Контроллер
 # ══════════════════════════════════════════════════════════════════════════════
@@ -536,9 +562,51 @@ class TelegramController:
             logger.exception("cmd_lastcaptcha failed")
             self.bot.reply_to(message, f"Ошибка: {exc}")
 
+    def _format_behavior_pattern(self, db, account_name: str) -> str:
+        """T20: блок «📊 Pattern (7д)» для /health <name>.
+
+        Для каждого event_type из (cycle_pause_sec, dwell_sec,
+        long_break_sec) — count + median + p95 + stddev + ASCII-histogram.
+        Возвращает пустую строку если для аккаунта вообще нет sample'ов.
+        """
+        types = [
+            ("cycle_pause_sec", "паузы цикла"),
+            ("dwell_sec", "dwell листингов"),
+            ("long_break_sec", "длинные перерывы"),
+        ]
+        since_ts = time.time() - 7 * 86400
+        out: list[str] = []
+        any_samples = False
+        for event_type, label in types:
+            try:
+                stats = db.get_behavioral_stats(
+                    account_name=account_name,
+                    event_type=event_type,
+                    since_ts=since_ts,
+                    bins=12,
+                )
+            except Exception as e:
+                logger.warning("get_behavioral_stats(%s) failed: %s", event_type, e)
+                continue
+            if stats["count"] == 0:
+                continue
+            any_samples = True
+            med = _format_seconds_compact(stats["median"])
+            p95 = _format_seconds_compact(stats["p95"])
+            sigma = _format_seconds_compact(stats["stddev"])
+            out.append(f"  {label}: n={stats['count']}, med={med}, p95={p95}, σ={sigma}")
+            hist = _format_behavior_histogram(stats["histogram"])
+            if hist:
+                out.append(f"  {hist}")
+        if not any_samples:
+            return ""
+        return "📊 Pattern (7д):\n" + "\n".join(out)
+
     def _cmd_health(self, message):
         """C1: health score аккаунта (или всех аккаунтов) за 7 дней.
         /health [name] — если name не указан, выводит для всех.
+        T20: при /health <name> добавляется блок Pattern с гистограммами
+        cycle_pause_sec / dwell_sec / long_break_sec.
         """
         if not self._allowed(message.from_user.id):
             self.bot.reply_to(message, "Нет доступа.")
@@ -564,6 +632,7 @@ class TelegramController:
 
             lines = ["🏥 Health score аккаунтов (7 дней)", ""]
             mode_icon = {"healthy": "✅", "warning": "⚠️", "degraded": "🔴", "critical": "💀"}
+            single_account = len(target_accounts) == 1
             for acc in target_accounts:
                 name = acc["name"]
                 h = compute_account_health(name, db)
@@ -575,6 +644,12 @@ class TelegramController:
                     f"  листингов: {h['listings_7d']}  капч: {h['captchas_7d']}\n"
                     f"  (с {h['since']})"
                 )
+                # T20: behavioral pattern (только при /health <name>) — иначе
+                # сообщение переполнится при N>3 аккаунтов.
+                if single_account:
+                    pattern_block = self._format_behavior_pattern(db, name)
+                    if pattern_block:
+                        lines.append(pattern_block)
                 lines.append("")
             self.bot.reply_to(message, "\n".join(lines))
         except Exception as exc:

@@ -368,6 +368,9 @@ class AvitoClient:
         kwargs.setdefault("call_rate", self.call_rate)
         kwargs.setdefault("max_categories_per_browse", self.max_categories_per_browse)
         kwargs.setdefault("max_listings_per_browse", self.max_listings_per_browse)
+        # T20: db_manager прокидывается, чтобы view_listing мог записывать
+        # dwell_sec sample'ы.
+        kwargs.setdefault("db_manager", self.db)
         return browse_commercial_categories(
             self.driver,
             self.wait,
