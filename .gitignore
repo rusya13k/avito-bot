@@ -13,6 +13,9 @@ accounts/
 # по факту секрет, не должен уезжать в git)
 accounts.json
 
+# Список прокси (host:port:user:pass — секрет, не коммитим)
+proxies.txt
+
 # SQLite база
 *.db
 *.db-journal

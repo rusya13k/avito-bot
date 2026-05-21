@@ -194,14 +194,47 @@ class AdsPowerAPI:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def _detect_chromium_version(debug_port: int) -> str | None:
+    """
+    Спрашиваем у Chrome его собственную версию через DevTools-протокол
+    (endpoint /json/version). Нужно для пина chromedriver — AdsPower обычно
+    отстаёт от latest stable, и ChromeDriverManager без подсказки качает
+    chromedriver под latest, который не работает с более старым Chromium.
+
+    Возвращает строку вида "147.0.7727.56" или None если не удалось.
+    """
+    try:
+        resp = requests.get(f"http://127.0.0.1:{debug_port}/json/version", timeout=10)
+        # "Browser": "Chrome/147.0.7727.56"
+        browser = resp.json().get("Browser", "")
+        if "/" in browser:
+            return browser.split("/", 1)[1].strip() or None
+    except (requests.RequestException, ValueError, KeyError):
+        pass
+    return None
+
+
 def connect_to_sphere(debug_port: int) -> webdriver.Chrome:
-    """Connect Selenium to already running AdsPower profile."""
+    """Connect Selenium to already running AdsPower profile.
+
+    AdsPower упаковывает свой Chromium, который часто отстаёт от latest
+    stable. ChromeDriverManager без подсказки качает chromedriver под latest
+    и ломается с "This version of ChromeDriver only supports Chrome version N".
+    Поэтому сначала спрашиваем у самого Chrome его версию и просим
+    chromedriver-manager скачать именно её.
+    """
     options = webdriver.ChromeOptions()
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{debug_port}")
 
-    # Use Service to specify the driver path
+    browser_version = _detect_chromium_version(debug_port)
+    if browser_version:
+        _bot_logger.info("AdsPower Chromium version: %s", browser_version)
+
     try:
-        service = Service(ChromeDriverManager().install())
+        if browser_version:
+            service = Service(ChromeDriverManager(driver_version=browser_version).install())
+        else:
+            service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
     except Exception as e:
         # L1: print → logger.warning (заметно в логах, но не критично)
@@ -790,7 +823,21 @@ def yandex_warmup(driver, wait, account_name, num_queries=2):
             human_scroll(driver, "down", iters=random.randint(2, 4))
 
         except Exception as e:
-            log(account_name, f"    Query failed: {str(e)[:50]}")
+            # Расширенный лог: тип, текст (до 200), title и url Chrome — нужно
+            # чтобы отличать капчу/блок/изменение DOM/проблему сети друг от друга.
+            try:
+                page_title = driver.title[:80]
+            except Exception:
+                page_title = "<no title>"
+            try:
+                page_url = driver.current_url[:120]
+            except Exception:
+                page_url = "<no url>"
+            log(
+                account_name,
+                f"    Query failed: {type(e).__name__}: {str(e)[:200]} "
+                f"| url={page_url} | title={page_title}",
+            )
 
     # F4: если queries пустой (все слоты попали в 5%-пропуск) — это нормально:
     # аккаунт просто открыл Яндекс и ничего не искал. Не считается провалом.
@@ -1752,9 +1799,17 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
         client = _build_avito_client(driver, wait, account, cfg, db_manager)
 
         # ── Stage 0: Yandex warmup ──────────────────────────────────────
+        # Warmup — это «прогрев» истории браузера через нейтральный сайт
+        # (антифингерпринт), а не критическая часть пайплайна. Если он
+        # упал из-за капчи Yandex или их изменения DOM — это плохо для
+        # behavioral camouflage, но НЕ должно убивать аккаунт. Логируем
+        # warning и едем дальше: цель — Avito, не Yandex.
         if not client.warmup_yandex(num_queries=2):
-            log(account_name, "CRITICAL: Warmup failed. Check your IP/Proxy.")
-            return
+            log(
+                account_name,
+                "WARN: Warmup failed (Yandex captcha/selectors). "
+                "Продолжаю без прогрева — fingerprint слабее обычного.",
+            )
 
         # ── Stage 1: Login (B4 native → cookies → manual phone/password) ──
         # G1: 3-уровневая логика инкапсулирована в client.login().

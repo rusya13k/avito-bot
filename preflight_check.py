@@ -137,20 +137,45 @@ def check_openai(r: Result):
 
 def check_adspower(r: Result):
     url = (os.getenv("ADSPOWER_API_URL") or "http://local.adspower.net:50325").rstrip("/")
+    api_key = (os.getenv("ADSPOWER_API_KEY") or "").strip()
+    # AdsPower-конвенция (см. bot.AdsPowerAPI): Authorization: Bearer <key>.
+    # Без ключа AdsPower с включённой защитой API вернёт "Require api-key".
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    key_state = "с ADSPOWER_API_KEY" if api_key else "без ADSPOWER_API_KEY"
     try:
         import requests
 
         # Запрашиваем список профилей с маленьким page_size — быстрая проверка
-        resp = requests.get(f"{url}/api/v1/user/list", params={"page_size": 1}, timeout=3)
+        resp = requests.get(
+            f"{url}/api/v1/user/list",
+            params={"page_size": 1},
+            headers=headers,
+            timeout=3,
+        )
         data = resp.json()
         if data.get("code") == 0:
-            total = data.get("data", {}).get("page", {}).get("count", "?")
-            r.ok("AdsPower API", f"OK ({url}, профилей: {total})")
+            # Реальная схема ответа: {"data": {"list": [...], "page": int, "page_size": int}, ...}.
+            # Поле "page" — номер текущей страницы (int), а не dict. Поэтому
+            # пытаемся читать total из явных полей, иначе показываем хотя бы
+            # размер текущей страницы.
+            d = data.get("data", {}) or {}
+            total = d.get("total") or d.get("count") or len(d.get("list") or [])
+            r.ok("AdsPower API", f"OK ({url}, профилей в ответе: {total}, {key_state})")
         else:
-            r.fail(
-                "AdsPower API",
-                f"ответ ошибочный: {data.get('msg', data)}",
-            )
+            msg = data.get("msg", str(data))
+            if "api-key" in msg.lower() or "api key" in msg.lower():
+                if api_key:
+                    r.fail(
+                        "AdsPower API",
+                        f"ключ невалиден: {msg} (url={url})",
+                    )
+                else:
+                    r.fail(
+                        "AdsPower API",
+                        f"требуется ADSPOWER_API_KEY (в .env пусто, url={url})",
+                    )
+            else:
+                r.fail("AdsPower API", f"ответ ошибочный: {msg}")
     except requests.exceptions.ConnectionError:
         r.fail(
             "AdsPower API",
