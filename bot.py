@@ -1472,22 +1472,58 @@ def get_random_proxy():
         return None
 
 
+def _load_proxies_pool() -> list[str]:
+    """T18: читает proxies.txt и возвращает список (без рандомизации).
+
+    Используется в `_apply_account_proxy` для probe-rotation: сначала
+    шаффлим, потом перебираем кандидатов через probe. Сохранили также
+    `get_random_proxy` (backward-compat для legacy-пути / тестов).
+    """
+    try:
+        path = Path("proxies.txt")
+        if not path.exists():
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+    except OSError:
+        return []
+
+
 def _apply_account_proxy(
     adspower: "AdsPowerAPI",
     user_id: str,
     account: dict,
     account_name: str,
+    cfg: dict | None = None,
 ) -> str | None:
     """
-    A1: Выбирает и применяет прокси для AdsPower-профиля.
+    A1 + T18: Выбирает и применяет прокси для AdsPower-профиля.
 
     Порядок:
-      1. Поле "proxy" из accounts.json (per-account).
+      1. Поле "proxy" из accounts.json (per-account, приоритет).
       2. Случайный прокси из proxies.txt (глобальный fallback).
       3. Если ничего нет — логирует ERROR (E4 → TG) и возвращает None.
 
-    Возвращает строку прокси, который удалось применить, или None.
+    T18 (если `cfg.proxy_probe_enabled=True`, default): перед применением
+    через AdsPower делается HTTP-probe (api.ipify.org через прокси) с
+    auto-rotation — мёртвые/чужие прокси отбрасываются и пробуем следующий.
+    Это спасает от запуска профиля через нерабочий прокси и от длинных
+    AdsPower-таймаутов.
+
+    Args:
+        cfg: глобальный config.json. Если None — probe выключен (legacy
+            путь, используется в существующих тестах test_proxy.py).
+
+    Returns:
+        Строку прокси, который удалось применить, или None.
     """
+    # cfg=None — legacy-путь для back-compat (используется в тестах
+    # test_proxy.py + в местах, которые ещё не передают cfg).
+    # cfg=dict (даже пустой) → probe ON по дефолту.
+    if cfg is not None and bool(cfg.get("proxy_probe_enabled", True)):
+        return _apply_account_proxy_with_probe(adspower, user_id, account, account_name, cfg)
+
+    # Legacy path (probe disabled): прежнее поведение для back-compat.
     account_proxy = account.get("proxy")
 
     if account_proxy:
@@ -1509,6 +1545,85 @@ def _apply_account_proxy(
         'Добавь поле "proxy" в accounts.json или заполни proxies.txt.',
         account_name,
     )
+    return None
+
+
+def _apply_account_proxy_with_probe(
+    adspower: "AdsPowerAPI",
+    user_id: str,
+    account: dict,
+    account_name: str,
+    cfg: dict,
+) -> str | None:
+    """T18: версия `_apply_account_proxy` с probe + auto-rotation.
+
+    1. Собираем кандидатов: per-account proxy → шаффленный proxies.txt.
+    2. `pick_healthy_proxy` пробует probe по очереди до `max_attempts`.
+    3. Первый прошедший probe — применяем через AdsPower.
+    4. Все провалились → ERROR + return None.
+    """
+    from proxy_health import pick_healthy_proxy
+
+    timeout = float(cfg.get("proxy_probe_timeout_sec", 10.0))
+    probe_url = cfg.get("proxy_probe_url", "https://api.ipify.org?format=json")
+    expected_country = cfg.get("proxy_expected_country") or None
+    max_attempts = int(cfg.get("proxy_max_probe_attempts", 5))
+    scheme = cfg.get("proxy_probe_scheme", "socks5h")
+
+    # Собираем кандидатов: per-account первым, потом proxies.txt.
+    candidates: list[str] = []
+    seen: set[str] = set()
+    account_proxy = account.get("proxy")
+    if account_proxy and account_proxy not in seen:
+        candidates.append(account_proxy)
+        seen.add(account_proxy)
+
+    pool = _load_proxies_pool()
+    random.shuffle(pool)
+    for p in pool:
+        if p not in seen:
+            candidates.append(p)
+            seen.add(p)
+
+    if not candidates:
+        _bot_logger.error(
+            "[%s] A1: Нет доступного прокси — ни per-account, ни в proxies.txt. "
+            "Аккаунт пропущен для защиты от блокировки. "
+            'Добавь поле "proxy" в accounts.json или заполни proxies.txt.',
+            account_name,
+        )
+        return None
+
+    chosen, result = pick_healthy_proxy(
+        candidates,
+        timeout=timeout,
+        probe_url=probe_url,
+        expected_country=expected_country,
+        max_attempts=max_attempts,
+        scheme=scheme,
+        log_prefix=f"[{account_name}] A1: ",
+    )
+
+    if chosen is None:
+        last_err = result.error if result else "no_candidates"
+        _bot_logger.error(
+            "[%s] A1: Все %d попыток probe прокси провалились. "
+            "Последняя ошибка: %s. Аккаунт пропущен.",
+            account_name,
+            min(max_attempts, len(candidates)),
+            last_err,
+        )
+        return None
+
+    if update_profile_proxy(adspower, user_id, chosen):
+        log(
+            account_name,
+            f"A1: Healthy proxy applied (ip={result.ip}, "
+            f"latency={result.latency_ms:.0f}ms, country={result.country or '?'})",
+        )
+        return chosen
+
+    log(account_name, "A1: Probe прошёл, но AdsPower update_proxy failed")
     return None
 
 
@@ -1713,15 +1828,58 @@ def _check_health_and_log(account_name: str, db_manager: DatabaseManager) -> Non
         pass  # C1 не должен блокировать запуск
 
 
-def _connect_with_retry(adspower: "AdsPowerAPI", user_id: str, account_name: str) -> tuple | None:
+def _pick_rotation_proxy(cfg: dict | None, exclude: set[str] | None = None) -> str | None:
+    """T18: подбирает прокси для rotation-fallback при connection failure.
+
+    Если probe enabled (cfg.proxy_probe_enabled, default True) — пытается
+    через `pick_healthy_proxy` (HTTP-probe → живой). Иначе legacy:
+    случайный из proxies.txt без проверки.
+
+    `exclude` — прокси, которые уже пробовали (текущий мёртвый); не берём
+    их повторно.
+    """
+    if cfg is not None and bool(cfg.get("proxy_probe_enabled", True)):
+        from proxy_health import pick_healthy_proxy
+
+        pool = _load_proxies_pool()
+        random.shuffle(pool)
+        if exclude:
+            pool = [p for p in pool if p not in exclude]
+        if not pool:
+            return None
+        chosen, _result = pick_healthy_proxy(
+            pool,
+            timeout=float(cfg.get("proxy_probe_timeout_sec", 10.0)),
+            probe_url=cfg.get("proxy_probe_url", "https://api.ipify.org?format=json"),
+            expected_country=cfg.get("proxy_expected_country") or None,
+            max_attempts=int(cfg.get("proxy_max_probe_attempts", 5)),
+            scheme=cfg.get("proxy_probe_scheme", "socks5h"),
+            log_prefix="rotation: ",
+        )
+        return chosen
+
+    # Legacy: random без probe.
+    return get_random_proxy()
+
+
+def _connect_with_retry(
+    adspower: "AdsPowerAPI",
+    user_id: str,
+    account_name: str,
+    cfg: dict | None = None,
+) -> tuple | None:
     """Запуск AdsPower-профиля + WebDriver-подключение с попытками.
 
     На каждом провале — ротируем прокси из общего пула proxies.txt и
-    останавливаем профиль перед следующей попыткой. Возвращает
-    (driver, wait) при успехе, либо None если все попытки исчерпаны
-    (вызывающий должен сделать early return).
+    останавливаем профиль перед следующей попыткой. T18: при включённом
+    probe (default через `cfg`) ротация выбирает заведомо живой прокси
+    через `pick_healthy_proxy`, а не случайный мёртвый из pool.
+
+    Возвращает (driver, wait) при успехе, либо None если все попытки
+    исчерпаны (вызывающий должен сделать early return).
     """
     max_retries = 2
+    tried_proxies: set[str] = set()
     for attempt in range(max_retries + 1):
         try:
             log(account_name, f"Starting profile (Attempt {attempt + 1})...")
@@ -1736,9 +1894,12 @@ def _connect_with_retry(adspower: "AdsPowerAPI", user_id: str, account_name: str
             raise Exception("Connection failed")
         except Exception as e:
             log(account_name, f"Connection fail: {e}. Rotating proxy...")
-            new_proxy = get_random_proxy()
+            new_proxy = _pick_rotation_proxy(cfg, exclude=tried_proxies)
             if new_proxy and update_profile_proxy(adspower, user_id, new_proxy):
+                tried_proxies.add(new_proxy)
                 log(account_name, f"Proxy updated to {new_proxy[:15]}...")
+            elif new_proxy is None and cfg is not None:
+                log(account_name, "Rotation: probe не нашёл живого прокси.")
             adspower.stop_profile(user_id)
             if attempt == max_retries:
                 return None
@@ -2007,16 +2168,17 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
     _apply_warmup_if_new(account, account_name)
     _check_health_and_log(account_name, db_manager)
 
-    # ── A1: Per-account proxy setup ──────────────────────────────────────
+    # ── A1 + T18: Per-account proxy setup with health probe ─────────────
     # Приоритет: 1) поле "proxy" в accounts.json, 2) случайный из proxies.txt.
-    # Если прокси нет совсем — ERROR в TG (E4) и пропускаем аккаунт, чтобы
-    # несколько аккаунтов с одного IP не склеились и не были забанены вместе.
-    if _apply_account_proxy(adspower, user_id, account, account_name) is None:
+    # T18: перед apply делается HTTP-probe (api.ipify.org через прокси);
+    # если timeout / non-200 / wrong country — пробуем следующий кандидат.
+    # Если ни один не прошёл — ERROR в TG (E4) и пропускаем аккаунт.
+    if _apply_account_proxy(adspower, user_id, account, account_name, cfg) is None:
         return
 
     try:
-        # ── Connect (с retry + ротацией прокси) ─────────────────────────
-        connect_result = _connect_with_retry(adspower, user_id, account_name)
+        # ── Connect (с retry + T18 probe-driven ротацией прокси) ────────
+        connect_result = _connect_with_retry(adspower, user_id, account_name, cfg)
         if connect_result is None:
             return
         driver, wait = connect_result
@@ -2107,14 +2269,14 @@ def run_big_warmup_for_account(
     driver = None
     result = {"ok": False, "stats": None, "error": None}
 
-    # ── A1: proxy setup ──────────────────────────────────────────────────
-    if _apply_account_proxy(adspower, user_id, account, account_name) is None:
+    # ── A1 + T18: proxy setup with health probe ────────────────────────
+    if _apply_account_proxy(adspower, user_id, account, account_name, cfg) is None:
         result["error"] = "no proxy"
         return result
 
     try:
-        # ── Connect ─────────────────────────────────────────────────────
-        connect_result = _connect_with_retry(adspower, user_id, account_name)
+        # ── Connect (с T18 probe-driven ротацией) ───────────────────────
+        connect_result = _connect_with_retry(adspower, user_id, account_name, cfg)
         if connect_result is None:
             result["error"] = "connect failed"
             return result

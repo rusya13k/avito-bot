@@ -3,6 +3,8 @@
 # ломают совместимость в minor-релизах.
 selenium==4.41.0
 webdriver-manager==4.0.2
-requests==2.33.1
+# T18: extras [socks] подтягивают pysocks — нужен для proxy_health.probe_proxy
+# через socks5h:// (AdsPower использует SOCKS5).
+requests[socks]==2.33.1
 pyTelegramBotAPI==4.32.0
 openai==2.33.0

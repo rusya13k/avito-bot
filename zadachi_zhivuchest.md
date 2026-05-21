@@ -492,10 +492,72 @@ smoke-import OK.
 
 ---
 
-### T18 — Proxy health probe + auto-rotation  `status: pending`
+### T18 — Proxy health probe + auto-rotation  `status: done`
 
-Перед каждым циклом: ping `api.ipify.org` через прокси. Timeout / wrong
-country / banned IP → НЕ запускать профиль, попробовать другой.
+Раньше прокси применялся «наобум»: `_apply_account_proxy` вызывал
+AdsPower API без проверки, а потом `_connect_with_retry` уже ловил
+selenium-таймауты, тратя 30+ сек на мёртвый прокси.
+
+- **Новый модуль `proxy_health.py`** — pure-функции без побочных
+  эффектов кроме HTTP. Public API:
+  - `parse_proxy(s)` → `(host, port, user, pass)`. Поддерживает
+    `host:port`, `host:port:user:pass`, `user:pass@host:port`,
+    `scheme://...` (схема отбрасывается).
+  - `build_proxy_url(s, scheme="socks5h")` → URL для requests
+    proxies dict, с url-encoded user/pass.
+  - `redact_proxy(s)` → `host:port` (без креденшелов) для логов.
+  - `probe_proxy(s, *, timeout, probe_url, expected_country, ...)`
+    → `ProbeResult(ok, ip, country, latency_ms, error)`. Делает
+    GET `api.ipify.org` через прокси (через `socks5h://` по
+    дефолту — DNS резолвится на стороне прокси). Парсит ответ
+    (JSON `{"ip"}` или `{"origin"}` для httpbin, или plain text).
+    Опционально дёргает geo-сервис (`ip-api.com`) для проверки
+    страны — несовпадение валит probe; если geo сам не ответил —
+    soft-pass (не валим из-за внешнего сервиса).
+  - `pick_healthy_proxy(candidates, ...)` → перебирает кандидатов,
+    возвращает `(proxy_str, ProbeResult)` для первого живого, или
+    `(None, last_result)`. Учитывает `max_attempts` (default 5).
+- **Интеграция в `bot.py::_apply_account_proxy`** — добавлен
+  опциональный параметр `cfg`. Если `cfg=None` — legacy путь
+  (back-compat для существующих тестов / вызовов). Если `cfg=dict`
+  и `proxy_probe_enabled` (default True) — собираем кандидатов
+  (per-account первый + шаффленный proxies.txt, дедуп) и
+  через `pick_healthy_proxy` находим живой. AdsPower update_proxy
+  вызывается только для прошедшего probe — никаких «вслепую».
+- **Также в `_connect_with_retry`** — на rotation после connect
+  failure используется новый `_pick_rotation_proxy(cfg, exclude)`,
+  который тоже probe-driven. Параметр `exclude` не даёт повторно
+  пробовать уже мёртвый прокси из текущей сессии.
+- **Опции в config.json** (все опциональны, дефолты в коде):
+  `proxy_probe_enabled` (default true),
+  `proxy_probe_timeout_sec` (default 10),
+  `proxy_probe_url` (default `https://api.ipify.org?format=json`),
+  `proxy_expected_country` (default null — не проверять; `"RU"` —
+  валим probe если IP не в РФ),
+  `proxy_max_probe_attempts` (default 5),
+  `proxy_probe_scheme` (default `socks5h`).
+- **`requirements.txt`** — `requests` теперь с `[socks]` extras
+  (подтягивает `pysocks` для socks5h поддержки в requests).
+
+**Тесты** — 51 шт. покрывают:
+- `tests/test_proxy_health.py` (45 шт.): parse_proxy для всех форматов
+  (host:port, креды, @-нотация, schema-prefix, password с ':',
+  invalid → ValueError); build_proxy_url с/без auth, кастомная схема,
+  url-encoding спецсимволов; redact_proxy маскирует креды; probe_proxy
+  success path (JSON `ip`, JSON `origin`, plain text), failure paths
+  (parse, timeout, ConnectionError, RequestException, non-200,
+  no_ip, ip_banned), country check (match/mismatch/case-insensitive/
+  softpass-on-geo-fail/snake_case `country_code` поле); pick_healthy_proxy
+  first-works/skip-dead/all-fail/respects-max-attempts/empty-candidates;
+  редактирование лога (нет пароля в логе).
+- `tests/test_proxy.py` (+11 шт.): probe disabled/enabled пути в
+  `_apply_account_proxy`, прокидка cfg-параметров,
+  per-account первый кандидат, dedup пер-account vs proxies.txt,
+  fail-all → ERROR, no-candidates → ERROR, AdsPower-fail-after-probe;
+  `_pick_rotation_proxy` legacy/probe/exclude/empty/all-fail.
+
+**Verify**: `ruff check .` ✓, `pytest tests/ -q` → 718 passed,
+smoke-import OK.
 
 ---
 
