@@ -49,6 +49,7 @@ from logging_setup import (
     setup_logging,
 )
 from stealth import apply_stealth as _apply_stealth
+from tab_switch import new_tab_for_listing as _new_tab_for_listing
 
 # Random queries for Yandex warmup
 YANDEX_QUERIES = [
@@ -1148,13 +1149,12 @@ def find_and_view_commercial_listings(
     # F2: случайное число листингов [1, max_listings_per_search] с весами.
     _n = _weighted_listing_count(max_n=max_listings_per_search)
     log(account_name, f"  F2: листингов в этом запросе={_n}")
-    hrefs = [
-        lnk.get_attribute("href")
-        for lnk in random.sample(links, min(_n, len(links)))
-        if lnk.get_attribute("href")
-    ]
+    # T11: сохраняем (href, element) пары — element нужен для Ctrl+Click,
+    # href — для fallback safe_get и для проверки is_new по БД.
+    sampled = random.sample(links, min(_n, len(links)))
+    targets = [(lnk.get_attribute("href"), lnk) for lnk in sampled if lnk.get_attribute("href")]
 
-    for i, href in enumerate(hrefs, 1):
+    for i, (href, link_elem) in enumerate(targets, 1):
         if _tg.stop_event.is_set():
             break
         # A3: если внутри предыдущей итерации словили капчу — выходим.
@@ -1166,25 +1166,45 @@ def find_and_view_commercial_listings(
             )
             break
         try:
-            log(account_name, f"  Processing listing {i}/{len(hrefs)}: {href}")
-            if not safe_get(driver, href, account_name):
-                break
+            log(account_name, f"  Processing listing {i}/{len(targets)}: {href}")
 
             # C3-bridge + D4: считаем новым только если в БД его действительно
             # ещё нет, причём сравниваем по нормализованному URL (без query/utm).
-            # Иначе один и тот же листинг, прилетевший дважды с разными UTM,
-            # дважды считался бы как "new".
             is_new = db_manager.is_new_listing(normalize_listing_url(href))
 
-            listing_data = extract_listing_data(driver, wait, account_name, log)
-            save_listing_to_db(listing_data, db_manager, log, account_name)
+            # T11: ~30% — Ctrl+Click → новая вкладка → читаем → закрываем.
+            # 70% — обычная навигация safe_get + driver.back. Это даёт
+            # естественное распределение «открыл в новой вкладке vs тут же».
+            use_new_tab = random.random() < 0.30
+            opened_in_tab = False
+            if use_new_tab:
+                with _new_tab_for_listing(driver, link_elem, stop_event=_tg.stop_event) as ok:
+                    if ok:
+                        opened_in_tab = True
+                        log(account_name, "  T11: открыли в новой вкладке (Ctrl+Click)")
+                        listing_data = extract_listing_data(driver, wait, account_name, log)
+                        save_listing_to_db(listing_data, db_manager, log, account_name)
 
-            processed_count += 1
-            if listing_data and is_new:
-                new_listings_count += 1
+                        processed_count += 1
+                        if listing_data and is_new:
+                            new_listings_count += 1
+                # context exit: вкладка закрыта, мы снова на search-page.
+                hp(1.5, 3.5)
 
-            driver.back()
-            hp(1.5, 3.5)
+            if not opened_in_tab:
+                # Fallback (или 70% базовый flow): safe_get + driver.back.
+                if not safe_get(driver, href, account_name):
+                    break
+
+                listing_data = extract_listing_data(driver, wait, account_name, log)
+                save_listing_to_db(listing_data, db_manager, log, account_name)
+
+                processed_count += 1
+                if listing_data and is_new:
+                    new_listings_count += 1
+
+                driver.back()
+                hp(1.5, 3.5)
         except Exception as e:
             error_count += 1
             log(account_name, f"  Error: {str(e)[:50]}")
@@ -2009,6 +2029,88 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
                 # настоящие баги, не глотаем.
                 pass
         adspower.stop_profile(user_id)
+
+
+def run_big_warmup_for_account(
+    account: dict,
+    cfg: dict,
+    adspower: AdsPowerAPI,
+    *,
+    num_sites: int | None = None,
+    with_yandex_search: bool = True,
+) -> dict:
+    """T12: standalone big_warmup для одного аккаунта (без парсинга/messenger).
+
+    Делается lifecycle:
+        1. apply proxy (как в run_thread) — если прокси не выдан, ВЫХОДИМ
+           с error (T12 без proxy — стрельба в ногу).
+        2. AdsPower start_profile → connect_to_sphere → apply_stealth.
+        3. big_warmup(driver, num_sites=10, with_yandex_search=True).
+           Это ~15-30 минут (3-5 сайтов × 30-90s + Yandex queries).
+        4. driver.quit + AdsPower stop_profile.
+
+    Args:
+        account: dict из accounts.json.
+        cfg: глобальный config.json (для legacy proxy fallback).
+        adspower: AdsPowerAPI инстанс.
+        num_sites: сколько сайтов посетить (default ~10 для большого прогрева).
+        with_yandex_search: True → ещё и Yandex queries.
+
+    Returns:
+        Stats dict: {"ok": bool, "stats": {...big_warmup stats...},
+                     "error": str | None}
+    """
+    from warmup import big_warmup
+
+    account_name = account["name"]
+    user_id = account.get("user_id")
+    driver = None
+    result = {"ok": False, "stats": None, "error": None}
+
+    # ── A1: proxy setup ──────────────────────────────────────────────────
+    if _apply_account_proxy(adspower, user_id, account, account_name) is None:
+        result["error"] = "no proxy"
+        return result
+
+    try:
+        # ── Connect ─────────────────────────────────────────────────────
+        connect_result = _connect_with_retry(adspower, user_id, account_name)
+        if connect_result is None:
+            result["error"] = "connect failed"
+            return result
+        driver, _wait = connect_result
+
+        log(account_name, f"T12: starting big_warmup ({num_sites or 10} sites)...")
+        stats = big_warmup(
+            driver,
+            account_name=account_name,
+            num_sites=num_sites if num_sites is not None else 10,
+            with_yandex_search=with_yandex_search,
+            log_func=log,
+        )
+        log(
+            account_name,
+            f"T12: big_warmup finished — sites_visited="
+            f"{stats.get('sites_visited', 0)}, "
+            f"failed={stats.get('sites_failed', 0)}, "
+            f"yandex_ok={stats.get('yandex_ok')}, "
+            f"duration={stats.get('duration_seconds', 0.0):.0f}s",
+        )
+        result["ok"] = True
+        result["stats"] = stats
+    except Exception as exc:
+        get_account_logger(_bot_logger.name, account_name).exception("T12: big_warmup crashed")
+        result["error"] = f"{type(exc).__name__}: {exc!s:.120}"
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except WebDriverException:
+                pass
+        if user_id:
+            adspower.stop_profile(user_id)
+
+    return result
 
 
 def _load_cfg():

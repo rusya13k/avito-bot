@@ -120,6 +120,8 @@ def kb_account_detail(idx: int) -> InlineKeyboardMarkup:
     m.add(
         InlineKeyboardButton("🍪 Обновить куки", callback_data=f"acc_cookies_{idx}"),
         InlineKeyboardButton("🆔 Изменить AdsPower ID", callback_data=f"acc_userid_{idx}"),
+        # T12: запуск большого прогрева (10 нейтральных сайтов + Yandex).
+        InlineKeyboardButton("🔥 Большой прогрев", callback_data=f"acc_bigwarmup_{idx}"),
         InlineKeyboardButton("🗑 Удалить", callback_data=f"acc_del_{idx}"),
         InlineKeyboardButton("◀️ Назад", callback_data="accounts_menu"),
     )
@@ -196,6 +198,9 @@ class TelegramController:
         # перечитывает только если файл был изменён извне.
         self._cfg_cache: dict | None = None
         self._cfg_cache_mtime: float = 0.0
+        # T12: набор имён аккаунтов, для которых сейчас крутится фоновый
+        # большой прогрев. Защита от двойного запуска.
+        self._big_warmup_running: set[str] = set()
         self._setup()
 
     # ── Утилиты ──────────────────────────────────────────────────────────────
@@ -1190,6 +1195,175 @@ class TelegramController:
             self._send(cid, f"Аккаунт '{acc_name}' не найден.", kb_back("accounts_menu"))
         self._show_accounts(cid, call.message)
 
+    # ── T12: Большой прогрев аккаунта ────────────────────────────────────
+
+    def _cb_acc_bigwarmup_confirm(self, call):
+        """T12: подтверждение запуска большого прогрева (acc_bigwarmup_<idx>).
+
+        Открывает kb_confirm. На "✅ Да" ─ дёргается _cb_acc_bigwarmup_ok.
+        """
+        cid = call.message.chat.id
+        try:
+            idx = int(call.data.split("_")[-1])
+        except ValueError:
+            self._send(cid, "Некорректный индекс аккаунта.")
+            return
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        name = accs[idx]["name"]
+        if name in self._big_warmup_running:
+            self._send(
+                cid,
+                f"⚠️ Большой прогрев для '{name}' уже идёт.",
+                kb_account_detail(idx),
+            )
+            return
+        # Если основной цикл бота крутится для этого аккаунта — нельзя:
+        # AdsPower-профиль будет занят, start_profile упадёт.
+        if any(t.is_alive() and t.name == f"acc-{name}" for t in active_threads):
+            self._send(
+                cid,
+                (
+                    f"⚠️ Аккаунт '{name}' сейчас работает в основном цикле бота.\n"
+                    f"Останови бота через ⏹ и затем запусти прогрев."
+                ),
+                kb_account_detail(idx),
+            )
+            return
+        self._edit_or_send(
+            cid,
+            call.message.message_id,
+            (
+                f"🔥 Запустить большой прогрев для '{name}'?\n\n"
+                f"• ~10 нейтральных сайтов + Yandex queries\n"
+                f"• Длительность: ~15-30 минут\n"
+                f"• AdsPower-профиль будет занят на это время\n"
+                f"• Не запускай основной цикл бота для этого аккаунта,\n"
+                f"  пока идёт прогрев"
+            ),
+            kb_confirm(f"acc_bigwarmup_ok_{idx}", f"acc_detail_{idx}"),
+        )
+
+    def _cb_acc_bigwarmup_ok(self, call):
+        """T12: подтверждённый запуск (acc_bigwarmup_ok_<idx>) — в фоне."""
+        cid = call.message.chat.id
+        try:
+            idx = int(call.data.split("_")[-1])
+        except ValueError:
+            self._send(cid, "Некорректный индекс аккаунта.")
+            return
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        account = accs[idx]
+        name = account["name"]
+        if name in self._big_warmup_running:
+            self._send(cid, f"⚠️ Прогрев для '{name}' уже идёт.")
+            return
+        self._big_warmup_running.add(name)
+        self._send(
+            cid,
+            (
+                f"🔥 Большой прогрев для '{name}' запущен в фоне (~15-30 минут).\n"
+                f"Уведомлю в этот чат по завершении."
+            ),
+            kb_account_detail(idx),
+        )
+        threading.Thread(
+            target=self._run_big_warmup,
+            args=(account,),
+            daemon=True,
+            name=f"tg-bigwarmup-{name}",
+        ).start()
+
+    def _run_big_warmup(self, account: dict):
+        """T12: фоновая задача — крутит run_big_warmup_for_account и шлёт notify."""
+        name = account["name"]
+        try:
+            # Ленивый импорт: bot.py тащит много (Selenium, AdsPower) и при
+            # старте контроллера может быть ещё не готов.
+            from bot import AdsPowerAPI, run_big_warmup_for_account
+
+            cfg = self._cfg()
+            adspower = AdsPowerAPI(cfg["adspower_api_url"], cfg.get("adspower_api_key"))
+            result = run_big_warmup_for_account(account, cfg, adspower)
+            if result.get("ok"):
+                stats = result.get("stats") or {}
+                visited = int(stats.get("sites_visited", 0))
+                failed = int(stats.get("sites_failed", 0))
+                total = visited + failed
+                self.notify(
+                    "✅ Большой прогрев '{name}' завершён.\n"
+                    "  sites_visited: {visited}/{total}\n"
+                    "  yandex_ok: {yan}\n"
+                    "  duration: {dur:.0f}s".format(
+                        name=name,
+                        visited=visited,
+                        total=total or visited,
+                        yan=stats.get("yandex_ok"),
+                        dur=float(stats.get("duration_seconds", 0.0)),
+                    )
+                )
+            else:
+                self.notify(
+                    f"❌ Большой прогрев '{name}' не сработал: "
+                    f"{result.get('error') or 'unknown error'}"
+                )
+        except Exception:
+            logger.exception("big_warmup background task failed")
+            self.notify(f"❌ Большой прогрев '{name}' упал — см. логи.")
+        finally:
+            self._big_warmup_running.discard(name)
+
+    def _cmd_bigwarmup(self, message):
+        """T12: /bigwarmup <name> — запустить большой прогрев в фоне."""
+        if not self._allowed(message.from_user.id):
+            self.bot.reply_to(message, "Нет доступа.")
+            return
+        parts = (message.text or "").split()
+        if len(parts) < 2:
+            self.bot.reply_to(
+                message,
+                (
+                    "Использование: /bigwarmup <имя_аккаунта>\n"
+                    "Запускает ~10-сайтовый прогрев + Yandex (15-30 минут) в фоне."
+                ),
+            )
+            return
+        name = parts[1]
+        accs = self._accounts()
+        account = next((a for a in accs if a["name"] == name), None)
+        if account is None:
+            self.bot.reply_to(message, f"Аккаунт '{name}' не найден.")
+            return
+        if name in self._big_warmup_running:
+            self.bot.reply_to(message, f"⚠️ Прогрев '{name}' уже идёт.")
+            return
+        if any(t.is_alive() and t.name == f"acc-{name}" for t in active_threads):
+            self.bot.reply_to(
+                message,
+                f"⚠️ Аккаунт '{name}' сейчас работает в основном цикле бота. "
+                f"Останови бота и запусти прогрев заново.",
+            )
+            return
+        self._big_warmup_running.add(name)
+        self.bot.reply_to(
+            message,
+            (
+                f"🔥 Большой прогрев для '{name}' запущен в фоне (~15-30 минут).\n"
+                f"Уведомлю по завершении."
+            ),
+        )
+        threading.Thread(
+            target=self._run_big_warmup,
+            args=(account,),
+            daemon=True,
+            name=f"tg-bigwarmup-{name}",
+        ).start()
+
     # ── Прокси ──────────────────────────────────────────────────────────────
 
     def _cb_proxy_add(self, call):
@@ -1379,6 +1553,10 @@ class TelegramController:
         prefix_handlers = (
             ("acc_del_ok_", self._cb_acc_del_ok),
             ("acc_del_", self._cb_acc_del_confirm),
+            # T12: bigwarmup_ok_ должен идти ПЕРЕД bigwarmup_, иначе
+            # acc_bigwarmup_ok_5 заматчится как acc_bigwarmup_ с idx="ok".
+            ("acc_bigwarmup_ok_", self._cb_acc_bigwarmup_ok),
+            ("acc_bigwarmup_", self._cb_acc_bigwarmup_confirm),
             ("acc_detail_", self._cb_acc_detail),
             ("acc_cookies_", self._cb_acc_cookies),
             ("acc_userid_", self._cb_acc_userid),
@@ -1443,6 +1621,7 @@ class TelegramController:
         bot.message_handler(commands=["lastcaptcha"])(self._cmd_lastcaptcha)
         bot.message_handler(commands=["health"])(self._cmd_health)
         bot.message_handler(commands=["warmup"])(self._cmd_warmup)
+        bot.message_handler(commands=["bigwarmup"])(self._cmd_bigwarmup)
         bot.message_handler(commands=["skipday"])(self._cmd_skipday)
 
         # ── Текстовый ввод / документы (S2 Stage 2: dispatch by state) ──────
