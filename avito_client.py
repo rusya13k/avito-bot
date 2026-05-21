@@ -114,10 +114,10 @@ class AvitoClient:
                 за browse. Default: 4.
             max_listings_per_browse: F2 — верхняя граница числа листингов
                 за одну категорию в browse. Default: 4.
-            messenger_config: F5 — kwargs для AvitoMessenger (min_reply_age_min,
+            messenger_config: F5/T5 — kwargs для AvitoMessenger (min_reply_age_min,
                 max_reply_age_min, reply_delay_mu, reply_delay_sigma,
-                ignore_new_dialog_chance). Прокидывается через **dict в
-                process_messages → AvitoMessenger.__init__. None / {} —
+                ignore_new_dialog_chance, persona). Прокидывается через **dict
+                в process_messages → AvitoMessenger.__init__. None / {} —
                 использовать дефолты AvitoMessenger.
         """
         self.driver = driver

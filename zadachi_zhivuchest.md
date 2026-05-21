@@ -83,69 +83,156 @@ Avito (раньше был `return` = смерть потока).
 
 ---
 
-### T5 — Realistic typing 2.0 — burst + опечатки  `status: pending`
+### T5 — Realistic typing 2.0 — burst + опечатки  `status: done`
 
-`human_type` сейчас равномерно-медленный. Улучшения:
-- **Бёрсты**: 3-5 символов по 50-100ms подряд, потом пауза 200-400ms.
-- **Опечатки**: ~5-8% слов с ошибкой + исправление BACKSPACE.
-- **Скорость на цифрах/символах**: чуть медленнее (shift/numpad).
-- **Длинные слова чуть быстрее** (моторная память).
+Старая `human_type` была равномерно-медленной (uniform sleep per char) —
+антифрод детектил по гистограмме. Сделано:
 
-**Реализация**: переписать `bot.py:305` `human_type()` + миграция всех
-вызовов (`bot.py`, `avito_messenger.py`, `outbound_messenger.py`).
-Может задействовать `account.persona` для «темпа печати».
+- **Новый модуль `human_typing.py`** с публичным API
+  `type_human(element, text, *, speed_range, speed_multiplier, typo_rate,
+  enable_bursts, enable_typos, stop_event) -> bool`.
+- **Бёрсты**: пачки по 3-5 символов с задержкой 50-200ms, отдых
+  180-380ms между бёрстами. Иногда (~5%) — «задумчивая» пауза 300-800ms.
+- **Опечатки** (`typo_rate=0.06` по умолчанию): для слов ≥ 3 символов с
+  QWERTY/ЙЦУКЕН-соседом — печатается «не та» буква, замечается через
+  100-400ms, BACKSPACE, правильная буква. Регистр сохраняется.
+- **Цифры / пунктуация ×1.5-2.0** медленнее обычных букв (shift/numpad).
+- **Длинные слова (≥ 8 символов) ×0.85** — моторная память.
+- **Persona-driven темп**: `persona_speed_multiplier(persona_id)` —
+  словарь по PERSONAS из outbound_messenger. Молодые (`retail_starter`,
+  `ecommerce_warehouse`, `fitness_studio`) → 0.95×; нейтральные
+  (`cafe_owner`, ...) → 1.0×; «солидные» (`investor`, `clinic_medical`,
+  `tatarstan_developer`) → 1.10-1.20×.
 
-**Verify**: тесты на распределение задержек (среднее WPM 30-60),
-наличие BACKSPACE в `events` иногда.
+Миграция всех точек ввода:
 
----
+| Файл | Что изменилось |
+|---|---|
+| `bot.py:305` | `human_type` — тонкая обёртка в `_type_human`. Сохранена сигнатура `(element, text, speed_range=...)`. Новые kwargs `speed_multiplier`, `enable_typos`. |
+| `bot.py:1245, 1306` | `perform_login` — `enable_typos=False` для phone/password (BACKSPACE рискован для валидаторов). |
+| `avito_messenger.py:138` | `human_type` → `_type_human`. `AvitoMessenger.__init__` принимает `persona`, держит `self.typing_speed_multiplier`. `_send_message` передаёт его в `human_type`. |
+| `outbound_messenger.py:516-520` | inline-loop с `time.sleep(0.03..0.09)` заменён на `_type_human(speed_multiplier=persona_speed_multiplier(self.persona_id))`. |
+| `bot.py:_build_avito_client` | прокидывает `persona` в `messenger_config` (T5). |
 
-### T6 — Mouse movements (Bezier-траектория)  `status: pending`
+`stop_event` поддерживается во всех точках — `/stop` прерывает typing
+по сэмплам ≤ 100ms.
 
-Сейчас все клики через `execute_script("arguments[0].click();", el)`
-= телепорт без курсора. Avito видит «click без mousemove» — сильный
-сигнал бота.
+**Тесты** (`tests/test_human_typing.py`, 30 шт.): полнота ввода;
+BACKSPACE при `typo_rate=1.0`; отсутствие BACKSPACE при `typos=False`
+или `typo_rate=0`; цифры/пунктуация медленнее букв; длинные слова
+быстрее коротких; speed_multiplier масштабирует total sleep ~линейно;
+stop_event прерывает на любом этапе; WPM в диапазоне 25-80;
+persona_speed_multiplier для known/unknown/empty.
 
-**Реализация**:
-- Доработать `human_click` (`bot.py:?`): курсор движется через 3-5
-  промежуточных точек по Bezier-кривой к цели.
-- 10-30px jitter вокруг цели на hover.
-- Иногда наводимся → передумываем → уходим в сторону → возвращаемся.
-
-**Verify**: console-injection логгер mousemove events, посчитать
-плотность (≥10-30 events на клик).
-
----
-
-### T7 — `navigator.webdriver` маскировка через CDP  `status: pending`
-
-`connect_to_sphere` (`bot.py:217`) ничего не инжектит. AdsPower
-скорее всего сам маскирует, но **проверить** — Avito может детектить.
-
-**Реализация**: после `webdriver.Chrome(...)`:
-```python
-driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-    "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-})
-```
-
-**Verify**: до правки запустить `driver.execute_script("return navigator.webdriver")` → должно быть `True` или `None`. После — гарантированно `undefined`.
+**Verify**: `ruff check .` ✓, `pytest tests/ -q` → 489 passed,
+smoke-import OK.
 
 ---
 
-### T8 — Cleanup Selenium-маркеров в DOM  `status: pending`
+### T6 — Mouse movements (Bezier-траектория)  `status: done`
 
-Chromedriver инжектит `window.cdc_*` глобалы — палево. AdsPower должен
-маскировать, но проверить.
+Раньше клики были двух видов: `element.click()` (Selenium-телепорт,
+mousemove не отправляется) и `execute_script("arguments[0].click();", el)`
+(JS-клик без вообще каких-либо event'ов мыши). Теперь все клики идут
+через `human_mouse.human_click()`:
 
-**Реализация**: CDP-инжект:
-```js
-['cdc_adoQpoasnfa76pfcZLmcfl_Array',
- 'cdc_adoQpoasnfa76pfcZLmcfl_Promise',
- 'cdc_adoQpoasnfa76pfcZLmcfl_Symbol'].forEach(k => delete window[k]);
-```
+- **Новый модуль `human_mouse.py`** с публичным API
+  `human_move_to(driver, element, *, steps_range, curvature, jitter_px,
+  pause_range, overshoot_chance, stop_event)` и
+  `human_click(driver, element, *, scroll_into_view, hesitate_chance,
+  pre_click_pause, post_click_pause, stop_event)`.
+- **Bezier-траектория**: `bezier_path(start, end, num_points, curvature)`
+  даёт N точек квадратичной Bezier-кривой со случайным изгибом
+  (±curvature × distance, перпендикулярно прямой start→end).
+- **Реализация** через Selenium 4 W3C-pointer API:
+  `actions.w3c_actions.pointer_action.move_to_location(x, y)` — это
+  абсолютные viewport-координаты; каждая точка → настоящее `mousemove`
+  событие в браузере.
+- **15-30 промежуточных mousemove** на каждый клик (`steps_range=(15,30)`).
+- **Jitter ±3 px** вокруг центра элемента (`_element_viewport_target`
+  с safety-margin, чтобы клик не уходил за рамки rect).
+- **Overshoot/correction**: 10% шанс — курсор «промахивается» на 8-20px
+  дальше цели и возвращается через мини-Bezier (4 точки, curvature 0.05).
+- **Hesitate**: 10% шанс «прицеливания» — курсор дёрнулся в сторону
+  ±30/±20 px, паузнул, вернулся к цели. Имитирует «прицелился, перевёл
+  взгляд, кликнул».
+- **Last-position tracking**: `_LAST_POS` per `id(driver)` — следующий
+  клик стартует с реальной позиции, а не телепортируется. После
+  `driver.get()` позицию можно сбросить через `reset_last_pos(driver)`,
+  но это не критично — Bezier всё равно построится.
+- **Fallback цепочка** в `human_click`: ActionChains-click → native
+  `element.click()` → JS `execute_script(arguments[0].click())`. Никогда
+  не raise. Это критично для legacy мест — старая семантика сохранена.
+- **stop_event** поддерживается на каждом mousemove и между фазами.
 
-**Verify**: `driver.execute_script("return Object.keys(window).filter(k => k.startsWith('cdc_'))")` → `[]`.
+Миграция всех точек клика:
+
+| Файл | Что изменилось |
+|---|---|
+| `bot.py:move_click` | Стал тонкой обёрткой над `human_click(...)` — старая ActionChains-телепорт-реализация удалена. Все 4 вызова `move_click(...)` (избранное, Позвонить, login submit ×2) автоматически получили Bezier. |
+| `bot.py:scroll_gallery` | `execute_script("arguments[0].click();", btns[0])` → `_human_click(driver, btns[0])`. |
+| `bot.py:perform_login` | `phone_input.click()` и `password_input.click()` → `_human_click(...)`. |
+| `commercial_parser.py:get_phone` | `phone_btn.click()` (самый палевный клик) → `_human_click(driver, phone_btn)`. |
+| `avito_messenger.py:process_messages` | `execute_script("arguments[0].click();", dialog)` → `_human_click(...)`. |
+| `avito_messenger.py:_send_message` | `input_box.click()` и `send_btn.click()` → `_human_click(...)`. |
+| `outbound_messenger.py:_open_chat_overlay` | `btn.click()` + JS-fallback → один `_human_click(...)` (он сам делает scrollIntoView и fallback'и). |
+| `outbound_messenger.py:_type_and_send` | `input_el.click()` и `send_el.click()` → `_human_click(...)`. |
+| `warmup.py:_random_click_link` | `target.click()` → `_human_click(driver, target)`. |
+
+**Тесты** (`tests/test_human_mouse.py`, 29 шт.): endpoint-инварианты
+Bezier; кол-во точек строго в `steps_range`; finest-jitter держит точку
+внутри rect; `_LAST_POS` запоминается → следующий путь стартует с неё;
+overshoot добавляет ≥3 точек; `stop_event` прерывает; рекавери на
+WebDriverException (move_to → False, click → fallback'ы); все три
+пути fallback тестированы.
+
+**Verify**: `ruff check .` ✓, `pytest tests/ -q` → 518 passed,
+smoke-import OK.
+
+---
+
+### T7 — `navigator.webdriver` маскировка через CDP  `status: done`
+
+После `webdriver.Chrome(...)` в `connect_to_sphere` (`bot.py:219`)
+теперь регистрируется stealth-скрипт через
+`Page.addScriptToEvaluateOnNewDocument` — он выполняется ДО любого JS
+каждой загружаемой страницы. Скрипт переопределяет
+`navigator.webdriver` через `Object.defineProperty` так, чтобы геттер
+возвращал `undefined` (как в обычном Chrome без WebDriver).
+
+**Реализация**: новый модуль `stealth.py` с публичным API:
+
+- `apply_stealth(driver) -> bool` — регистрирует скрипт через CDP.
+  Никогда не raise; вернёт False если драйвер не поддерживает CDP
+  или CDP-вызов упал. Вызывается из `connect_to_sphere` после
+  `webdriver.Chrome(...)`.
+- `verify_stealth(driver) -> dict[str, Any]` — диагностика для
+  ручной проверки: возвращает `{"webdriver": ..., "cdc_keys": [...],
+  "user_agent": ...}` после запроса соответствующих свойств у
+  текущей страницы.
+
+**Verify**: `verify_stealth(driver)` после первого `driver.get(...)`
+должен показать `{"webdriver": None, ...}` (None ≡ undefined в JSON).
+
+---
+
+### T8 — Cleanup Selenium-маркеров в DOM  `status: done`
+
+В том же stealth-скрипте (T7) — на каждом тике (0ms / 50ms / 200ms
+после первого выполнения, плюс immediately) делаем
+`Object.getOwnPropertyNames(window).filter(k => k.startsWith('cdc_'))`
+и удаляем. Multi-tick нужен потому, что chromedriver может инжектить
+свои `cdc_adoQpoasnfa76pfcZLmcfl_*` глобалы ПОСЛЕ выполнения
+stealth-скрипта (порядок не гарантирован).
+
+**Verify**: `verify_stealth(driver)["cdc_keys"]` → `[]`.
+
+**Тесты** (`tests/test_stealth.py`, 10 шт.): CDP вызывается с
+правильной командой; скрипт содержит `navigator.webdriver` /
+`undefined` / `defineProperty` / `cdc_` / `delete` / `startsWith`;
+драйвер без CDP → False; WebDriverException → False (без raise);
+RuntimeError тоже → False; `verify_stealth` корректно работает с
+чистым/грязным браузером и устойчив к ошибкам `execute_script`.
 
 ---
 
@@ -287,11 +374,13 @@ timings, scroll velocity). Сравнить с ботом, померить dive
 
 ## Минимальный must-have пакет (на сейчас)
 
-1. T1 (typing speed fix) — 30 минут
-2. T5 (typing 2.0 — burst + опечатки) — 1-2 часа
-3. T4 (big warmup) — 2-3 часа
-4. T6 (mouse movements) — 2-3 часа
-5. T7 (stealth JS) — 30 минут
-6. T13 (WebRTC проверка) — 5 минут
+1. T1 (typing speed fix) — 30 минут ✓ done
+2. T5 (typing 2.0 — burst + опечатки) — 1-2 часа ✓ done
+3. T4 (big warmup) — 2-3 часа ✓ done
+4. T6 (mouse movements) — 2-3 часа ✓ done
+5. T7 (stealth JS — navigator.webdriver) — 30 минут ✓ done
+6. T8 (stealth JS — cdc_* cleanup) — 30 минут ✓ done
+7. T13 (WebRTC проверка) — 5 минут
 
-Покрывает ~80% улучшений живучести.
+Покрывает ~80% улучшений живучести. Осталось сделать T13 (это ручная
+проверка настройки AdsPower-профиля, не код).

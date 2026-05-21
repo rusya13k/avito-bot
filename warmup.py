@@ -37,6 +37,8 @@ from typing import Any
 
 from selenium.webdriver.common.by import By
 
+from human_mouse import human_click as _human_click
+
 logger = logging.getLogger(__name__)
 
 
@@ -181,9 +183,9 @@ def _click_random_link(driver, account_name: str, log_func: Callable) -> bool:
     try:
         target_url = target.get_attribute("href") or "<no-href>"
         log_func(account_name, f"    big_warmup click: {target_url[:80]}")
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", target)
-        time.sleep(random.uniform(0.4, 1.0))
-        target.click()
+        # T6: human_click сам делает scrollIntoView + Bezier-движение +
+        # fallback'и (native → JS click).
+        _human_click(driver, target)
         time.sleep(random.uniform(2.0, 5.0))  # немного "прочитали"
         # Возвращаемся обратно — иначе следующий сайт безответно перегрузит state.
         try:

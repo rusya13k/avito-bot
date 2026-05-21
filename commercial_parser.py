@@ -12,6 +12,7 @@ import tg_bot as _tg
 from account_state import account_state
 from captcha_detect import detect_phone_captcha
 from human_delay import human_delay
+from human_mouse import human_click as _human_click
 
 # E1: модульный logger. Раньше парсер писал только через переданный
 # log_func (account-aware строки в TG-буфер). Теперь критичные ошибки —
@@ -314,7 +315,9 @@ def _try_show_phone(driver, account_name: str, log_func, listing_data: dict) -> 
         phone_btn = driver.find_element(
             By.XPATH, "//button[@data-marker='item-contact-bar/call-button']"
         )
-        phone_btn.click()
+        # T6: «Показать телефон» — самое палевное действие, кликаем
+        # через Bezier-движение курсора + jitter, не «телепорт-click».
+        _human_click(driver, phone_btn, stop_event=_tg.stop_event)
         # A3: cooldown 30-90 сек после клика (ранее было 0.8-1.6с).
         # Реальный пользователь не кликает "Показать телефон" каждые 2 секунды.
         # uniform (более равномерный), чтобы не быть предсказуемым.

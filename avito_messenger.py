@@ -12,6 +12,9 @@ from selenium.webdriver.support.ui import WebDriverWait
 import tg_bot as _tg
 from account_state import account_state as _astate
 from human_delay import human_delay as _human_delay
+from human_mouse import human_click as _human_click
+from human_typing import persona_speed_multiplier
+from human_typing import type_human as _type_human
 from llm_sanitizer import sanitize_llm_reply
 
 logger = logging.getLogger(__name__)
@@ -134,17 +137,22 @@ def build_visitor_id(*, dom_uid=None, channel_id=None, visitor_name=None, listin
     return "unknown"
 
 
-def human_type(element, text):
-    """Type text character-by-character; abort early on global stop."""
-    for ch in text:
-        if _stopping():
-            return False
-        element.send_keys(ch)
-        if random.random() < 0.05:
-            time.sleep(random.uniform(0.3, 0.7))
-        else:
-            time.sleep(random.uniform(0.05, 0.20))
-    return True
+def human_type(element, text, *, speed_multiplier: float = 1.0) -> bool:
+    """T5: реалистичный typing с бёрстами + опечатками (через human_typing).
+
+    Сохраняет старый bool-контракт: True = допечатало, False = прервано stop_event.
+
+    Args:
+        speed_multiplier: множитель задержек (persona-driven). 1.0 = default.
+    """
+    return _type_human(
+        element,
+        text,
+        speed_range=(0.05, 0.20),
+        speed_multiplier=speed_multiplier,
+        enable_typos=True,
+        stop_event=_tg.stop_event,
+    )
 
 
 # F11: Variable number of dialogs to process per messenger-cycle.
@@ -193,6 +201,9 @@ class AvitoMessenger:
         # неинтересно, проигнорил». State хранится in-memory в account_state
         # и сбрасывается при рестарте — это допустимо.
         ignore_new_dialog_chance: float = 0.05,
+        # T5: persona — для подбора темпа печати (молодой/инвестор/...).
+        # None / неизвестная persona → multiplier 1.0 (нейтрально).
+        persona: str | None = None,
     ):
         self.driver = driver
         self.wait = wait
@@ -205,6 +216,9 @@ class AvitoMessenger:
         self.reply_delay_mu = float(reply_delay_mu)
         self.reply_delay_sigma = float(reply_delay_sigma)
         self.ignore_new_dialog_chance = float(ignore_new_dialog_chance)
+        # T5: persona-driven typing speed multiplier.
+        self.persona = persona
+        self.typing_speed_multiplier = persona_speed_multiplier(persona)
 
     def process_messages(self, log_func):
         """Main entry point for processing new messages"""
@@ -290,8 +304,8 @@ class AvitoMessenger:
                     f"Processing dialog with {visitor_name} (dom_uid={dom_uid or '-'})...",
                 )
 
-                # Click on the dialog
-                self.driver.execute_script("arguments[0].click();", dialog)
+                # T6: human-like click по карточке диалога вместо JS-телепорта.
+                _human_click(self.driver, dialog, stop_event=_tg.stop_event)
                 hp(2, 4)
 
                 # После клика URL может содержать channel_id — это самый
@@ -585,9 +599,11 @@ class AvitoMessenger:
                     (By.XPATH, "//*[@data-marker='messenger/input-field']")
                 )
             )
-            input_box.click()
+            # T6: human-like focus вместо одиночного click без mousemove.
+            _human_click(self.driver, input_box, stop_event=_tg.stop_event)
             hp(0.5, 1)
-            if not human_type(input_box, text):
+            # T5: persona-driven typing speed (молодой быстрее, инвестор медленнее).
+            if not human_type(input_box, text, speed_multiplier=self.typing_speed_multiplier):
                 # Stop signaled mid-typing — do NOT send a half-typed message.
                 return False
             hp(0.5, 1)
@@ -597,7 +613,8 @@ class AvitoMessenger:
 
             # C5: кнопка send иногда отрендерена не сразу после ввода текста.
             send_btn = _wf(self.driver, "//*[@data-marker='messenger/send-button']", timeout=3)
-            send_btn.click()
+            # T6: human-like click по Send.
+            _human_click(self.driver, send_btn, stop_event=_tg.stop_event)
             hp(1, 2)
             return True
         except Exception as e:

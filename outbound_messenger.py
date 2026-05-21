@@ -26,10 +26,8 @@ Anti-fingerprinting:
 
 import logging
 import random
-import time
 
 from selenium.common.exceptions import (
-    ElementClickInterceptedException,
     StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
@@ -42,6 +40,9 @@ import tg_bot as _tg
 from account_state import account_state as _astate
 from captcha_detect import detect_phone_captcha
 from human_delay import human_delay as _human_delay
+from human_mouse import human_click as _human_click
+from human_typing import persona_speed_multiplier
+from human_typing import type_human as _type_human
 from llm_sanitizer import sanitize_llm_reply
 
 logger = logging.getLogger(__name__)
@@ -458,14 +459,11 @@ class OutboundMessenger:
                 btn = WebDriverWait(self.driver, 3).until(
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
-                # Скроллим чтобы кнопка точно была видна — иначе click перехватится.
-                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
                 _human_delay(0.5, 1.5, stop_event=_tg.stop_event)
-                try:
-                    btn.click()
-                except (ElementClickInterceptedException, StaleElementReferenceException):
-                    # Иногда мешает sticky-header — кликаем через JS.
-                    self.driver.execute_script("arguments[0].click();", btn)
+                # T6: human_click сам делает scrollIntoView + Bezier-движение
+                # курсора + fallback'и (native click → JS click). Это закрывает
+                # старый кейс с ElementClickInterceptedException / sticky-header.
+                _human_click(self.driver, btn, stop_event=_tg.stop_event)
                 _human_delay(2, 4, stop_event=_tg.stop_event)
                 return True
             except TimeoutException:
@@ -503,21 +501,27 @@ class OutboundMessenger:
             log_func(self.account_name, "H1: chat-input не найден после клика.")
             return False
 
-        try:
-            input_el.click()
-            _human_delay(0.4, 1.2, stop_event=_tg.stop_event)
-        except Exception:
-            pass
+        # T6: human-like focus вместо одиночного click без mousemove.
+        _human_click(self.driver, input_el, stop_event=_tg.stop_event)
+        _human_delay(0.4, 1.2, stop_event=_tg.stop_event)
 
-        # Типим по-человечески: 30-90 ms между символами.
-        # А3-style: люди не вставляют 200 символов в input одним click'ом —
-        # анти-fingerprinting боится «мгновенно появившийся текст».
+        # T5: реалистичный typing — бёрсты + опечатки + persona-driven темп.
+        # Раньше: уравномерно 30-90ms/char (антифрод детектил по гистограмме).
+        # Теперь: type_human() с бёрстами 3-5 символов, отдыхом 180-380ms,
+        # 5-8% слов с опечаткой+backspace. Persona-id берётся из аккаунта
+        # (см. self.persona_id) и через persona_speed_multiplier превращается
+        # в множитель задержек (молодой → 0.95, инвестор → 1.20).
         try:
-            for ch in text:
-                if _stopping():
-                    return False
-                input_el.send_keys(ch)
-                time.sleep(random.uniform(0.03, 0.09))
+            speed_mul = persona_speed_multiplier(self.persona_id)
+            if not _type_human(
+                input_el,
+                text,
+                speed_range=(0.05, 0.20),
+                speed_multiplier=speed_mul,
+                enable_typos=True,
+                stop_event=_tg.stop_event,
+            ):
+                return False
         except StaleElementReferenceException:
             log_func(self.account_name, "H1: input стал stale во время ввода — скип.")
             return False
@@ -548,12 +552,11 @@ class OutboundMessenger:
             log_func(self.account_name, "H1: кнопка Отправить не найдена.")
             return False
 
-        try:
-            send_el.click()
-        except (ElementClickInterceptedException, StaleElementReferenceException):
-            self.driver.execute_script("arguments[0].click();", send_el)
-        except Exception as exc:
-            log_func(self.account_name, f"H1: ошибка клика Send: {exc}")
+        # T6: human_click сам делает scrollIntoView + Bezier-движение +
+        # fallback'и (native click → JS click) — старая обвязка с
+        # ElementClickInterceptedException больше не нужна.
+        if not _human_click(self.driver, send_el, stop_event=_tg.stop_event):
+            log_func(self.account_name, "H1: не удалось кликнуть Send (все 3 пути упали).")
             return False
 
         _human_delay(2, 5, stop_event=_tg.stop_event)

@@ -37,6 +37,8 @@ from commercial_realestate_config import (
 )
 from database import DatabaseManager
 from human_delay import human_delay as _human_delay
+from human_mouse import human_click as _human_click
+from human_typing import type_human as _type_human
 from llm_classifier import LLMClassifier
 from logging_setup import (
     get_account_logger,
@@ -44,6 +46,7 @@ from logging_setup import (
     install_tg_buffer_handler,
     setup_logging,
 )
+from stealth import apply_stealth as _apply_stealth
 
 # Random queries for Yandex warmup
 YANDEX_QUERIES = [
@@ -241,6 +244,15 @@ def connect_to_sphere(debug_port: int) -> webdriver.Chrome:
         _bot_logger.warning("Standard driver install failed: %s. Trying fallback...", e)
         driver = webdriver.Chrome(options=options)
 
+    # T7 + T8: stealth-скрипт через CDP — маскируем navigator.webdriver и
+    # чистим cdc_* глобалы. Регистрируется ДО первой driver.get(), чтобы
+    # сработал на всех будущих страницах.
+    if not _apply_stealth(driver):
+        _bot_logger.warning(
+            "T7/T8: stealth-инъекция не применилась (CDP недоступен?) — "
+            "AdsPower обязан замаскировать navigator.webdriver сам."
+        )
+
     return driver
 
 
@@ -302,13 +314,33 @@ def hp(lo=0.5, hi=1.5, *, distribution="normal"):
     return _human_delay(lo, hi, distribution=distribution, stop_event=_tg.stop_event)
 
 
-def human_type(element, text, speed_range=(0.05, 0.25)):
-    for ch in text:
-        element.send_keys(ch)
-        if random.random() < 0.1:
-            time.sleep(random.uniform(0.5, 1.5))
-        else:
-            time.sleep(random.uniform(*speed_range))
+def human_type(
+    element,
+    text,
+    speed_range=(0.05, 0.25),
+    *,
+    speed_multiplier=1.0,
+    enable_typos=True,
+):
+    """T5: делегируется в human_typing.type_human (бёрсты + опечатки).
+
+    Сохраняет backward-compatible сигнатуру (element, text, speed_range=...).
+    Новые опциональные kwargs:
+        speed_multiplier — общий множитель задержек (persona-driven).
+        enable_typos — для логин-форм лучше False (backspace может ломать
+            валидаторы).
+
+    Возвращает True если допечатало до конца, False если прервано stop_event
+    (TG /stop).
+    """
+    return _type_human(
+        element,
+        text,
+        speed_range=speed_range,
+        speed_multiplier=speed_multiplier,
+        enable_typos=enable_typos,
+        stop_event=_tg.stop_event,
+    )
 
 
 def random_mouse_move(driver):
@@ -333,14 +365,17 @@ def random_mouse_move(driver):
 
 
 def move_click(driver, element):
-    try:
-        actions = ActionChains(driver)
-        actions.move_to_element_with_offset(element, random.randint(-4, 4), random.randint(-3, 3))
-        actions.pause(random.uniform(0.2, 0.5))
-        actions.click()
-        actions.perform()
-    except Exception:
-        driver.execute_script("arguments[0].click();", element)
+    """T6: «человеческий» клик через Bezier-движение курсора + jitter.
+
+    Раньше: один move_to_element_with_offset (telepport-style move) + click.
+    Теперь: 15-30 промежуточных mousemove'ов по Bezier-кривой, ±3px
+    jitter вокруг центра, изредка overshoot/correction. Fallback на
+    native click и JS click при ошибках.
+
+    Сохранена сигнатура и семантика «никогда не raise» — все вызовы
+    места `move_click(driver, element)` продолжают работать.
+    """
+    _human_click(driver, element, stop_event=_tg.stop_event)
 
 
 def human_scroll(driver, direction="down", iters=None):
@@ -393,9 +428,8 @@ def scroll_gallery(driver, wait):
         )
         if not btns or not btns[0].is_displayed():
             break
-        try:
-            driver.execute_script("arguments[0].click();", btns[0])
-        except Exception:
+        # T6: human-like click вместо JS-телепорта.
+        if not _human_click(driver, btns[0], stop_event=_tg.stop_event):
             break
         hp(3, 7)
 
@@ -1212,7 +1246,8 @@ def perform_login(driver, wait, account_name, phone, password):
         phone_input = wait.until(
             EC.presence_of_element_located((By.XPATH, "//input[@name='login']"))
         )
-        phone_input.click()
+        # T6: human-like focus вместо «click без mousemove».
+        _human_click(driver, phone_input, stop_event=_tg.stop_event)
         hp(0.8, 1.5)
 
         phone_input.send_keys(Keys.CONTROL + "a")
@@ -1220,7 +1255,8 @@ def perform_login(driver, wait, account_name, phone, password):
         hp(0.5, 1.0)
 
         # Логин-инпуты обычно вводят аккуратнее — чуть медленнее (~100-350ms/char).
-        human_type(phone_input, phone, speed_range=(0.10, 0.35))
+        # T5: enable_typos=False — backspace может ломать валидаторы phone-input'а.
+        human_type(phone_input, phone, speed_range=(0.10, 0.35), enable_typos=False)
         hp(1.5, 2.5)
 
         # 2. Submit phone (на этом шаге Avito может попросить SMS/captcha
@@ -1276,10 +1312,13 @@ def perform_login(driver, wait, account_name, phone, password):
             return False
 
         log(account_name, "  Entering password (slow mode)...")
-        password_input.click()
+        # T6: human-like focus вместо «click без mousemove».
+        _human_click(driver, password_input, stop_event=_tg.stop_event)
         hp(0.8, 1.5)
         # Пароль вводят чуть медленнее обычного текста (~100-350ms/char).
-        human_type(password_input, password, speed_range=(0.10, 0.35))
+        # T5: enable_typos=False — для пароля лишний BACKSPACE рискован
+        # (форма может тригнуть валидацию / показать «неверный пароль»).
+        human_type(password_input, password, speed_range=(0.10, 0.35), enable_typos=False)
         hp(1.5, 2.5)
 
         # 4. Final submit
@@ -1675,6 +1714,12 @@ def _build_avito_client(driver, wait, account: dict, cfg: dict, db_manager: Data
         val = account.get(full_key, cfg.get(full_key))
         if val is not None:
             messenger_cfg[key] = float(val)
+
+    # T5: persona в мессенджере — для подбора темпа печати (молодой/инвестор).
+    # Та же persona что в outbound_messenger (consistency), либо None.
+    persona = account.get("persona") or cfg.get("persona")
+    if persona:
+        messenger_cfg["persona"] = persona
 
     return AvitoClient(
         driver,
