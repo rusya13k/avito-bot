@@ -311,17 +311,80 @@ interest за пределами [0, 1] кламп'ится.
 
 ---
 
-### T11 — Tab switching (Ctrl+Click)  `status: pending`
+### T11 — Tab switching (Ctrl+Click)  `status: done`
 
-Сейчас всё в одной вкладке. ~30% кликов через Ctrl+Click → новая
-вкладка → driver.switch_to → close.
+Раньше всё открывалось в одной вкладке (`safe_get` + `driver.back`),
+что давало ~0% `window.open` events — антифрод-аномалия. Теперь ~30%
+листингов открываются через Ctrl+Click → новая вкладка → close.
+
+- **Новый модуль `tab_switch.py`** с публичным API:
+  - `open_in_new_tab_via_click(driver, element, *, stop_event)` —
+    `ActionChains.key_down(CTRL) + click + key_up(CTRL)`; новая
+    `window_handle` ловится через diff с 3-секундным дедлайном;
+    после успеха — `switch_to.window(new_handle)`. На любом сбое →
+    False (caller использует fallback).
+  - `close_current_tab(driver)` — закрывает текущую вкладку,
+    переключается на первую из оставшихся. Защита от случая «одна
+    вкладка» (не закрываем, иначе браузер).
+  - `new_tab_for_listing(driver, element, *, stop_event)` —
+    контекст-менеджер. `with new_tab_for_listing(...) as ok: ...` —
+    `ok=True` если открыли в новой вкладке, `ok=False` → caller
+    делает fallback на `safe_get` + `driver.back`. На finally
+    закрытие вкладки гарантировано (в т.ч. при exception внутри).
+- **Интеграция в `bot.py:find_and_view_commercial_listings`**:
+  `random.random() < 0.30` решает, открывать в новой вкладке или
+  обычной навигацией. Сохранён parity по metrics (`processed_count`,
+  `new_listings_count` инкрементируются в обеих ветках).
+
+**Тесты** (`tests/test_tab_switch.py`, 11 шт.): happy path; нет
+новой handle → False (без switch); `ActionChains.perform()` крашится
+→ False; `stop_event` прерывает; пустые handles → False;
+`close_current_tab` со старой вкладкой; one-tab safeguard; finally
+закрывает вкладку даже при exception внутри контекста.
+
+**Verify**: `ruff check .` ✓, `pytest tests/ -q` → 583 passed,
+smoke-import OK.
 
 ---
 
-### T12 — TG-кнопка «🔥 Большой прогрев»  `status: pending`
+### T12 — TG-кнопка «🔥 Большой прогрев»  `status: done`
 
-В `tg_bot.py` добавить кнопку для запуска 30-60 минутного мультисайтового
-warmup БЕЗ парсинга/ответов. Полезно после простоев/смены прокси.
+Раньше big_warmup был доступен только в начале `run_thread` для
+новых аккаунтов. Теперь — ручной запуск из TG для любого аккаунта
+(после простоев / смены прокси / получения капчи).
+
+- **Helper `bot.run_big_warmup_for_account(account, cfg, adspower)`** —
+  полный standalone lifecycle: apply proxy (`_apply_account_proxy`) →
+  AdsPower `start_profile` + connect → `warmup.big_warmup(num_sites=10,
+  with_yandex_search=True)` → driver.quit + `stop_profile`. Возвращает
+  dict `{"ok": bool, "stats": {...big_warmup stats...},
+  "error": str | None}`.
+- **TG-кнопка в `kb_account_detail`** — `🔥 Большой прогрев`, callback
+  `acc_bigwarmup_<idx>`.
+- **TG-команда `/bigwarmup <name>`** — то же самое из CLI.
+- **Двухшаговое подтверждение**: `acc_bigwarmup_<idx>` → kb_confirm с
+  предупреждением о длительности (15-30 мин) и блокировке профиля →
+  `acc_bigwarmup_ok_<idx>` → старт.
+- **Запуск в `threading.Thread(daemon=True)`** — TG-handler не
+  блокируется. По завершении — `self.notify(...)` с
+  `sites_visited/sites_failed/yandex_ok/duration`.
+- **Защита от двойного запуска**: `self._big_warmup_running: set[str]`
+  хранит имена аккаунтов с активным фоновым прогревом.
+- **Защита от коллизии**: если в `active_threads` есть thread с
+  именем `acc-<name>` — отказ (AdsPower-профиль уже занят основным
+  циклом).
+
+**Тесты** (`tests/test_tg_bigwarmup.py`, 18 шт.): кнопка
+присутствует в kb_account_detail; prefix-routing `acc_bigwarmup_ok_`
+выигрывает у `acc_bigwarmup_`; не путается с `acc_detail_`/`acc_del_`;
+confirm-step показывает kb_confirm; блок при already running;
+блок при active thread; OK-step стартует daemon-thread; double-run
+guard; happy path background task; failure path; exception clears
+state; `/bigwarmup` no-args/unknown/active-thread/no-access; команда
+зарегистрирована в `_setup`.
+
+**Verify**: `ruff check .` ✓, `pytest tests/ -q` → 590 passed,
+smoke-import OK.
 
 ---
 
@@ -379,10 +442,54 @@ country / banned IP → НЕ запускать профиль, попробов
 
 ---
 
-### T19 — Stagger cycle pauses (lognormal + долгие перерывы)  `status: pending`
+### T19 — Stagger cycle pauses (lognormal + долгие перерывы)  `status: done`
 
-Сейчас `Цикл завершён. Пауза 88 мин` — фиксированно. Реализовать:
-- Lognormal 30-180 мин с длинными перерывами 4-8h 1-2 раза/день («обед/ужин»).
+Раньше пауза между циклами была `random.uniform(pause_min*60,
+pause_max*60)` (по умолчанию uniform 30-90 мин) — равномерная коробка
+без длинных перерывов. Гистограмма пауз — равномерная, fingerprinting
+видит «как из генератора».
+
+- **Новый модуль `cycle_pause.py`** с public API
+  `pick_cycle_pause(account, cfg, *, account_state, account_name,
+  now=None, rng=None) -> tuple[float, str]`. Pure-функция (через
+  параметры `now`/`rng` тестируется детерминированно). Side effect —
+  при выборе long break дёргает `account_state.record_long_break`.
+- **Lognormal** для обычных пауз — sample вычисляется как
+  `random.lognormvariate(0, 0.4) * mid * 0.7`, clamp в [pause_min,
+  pause_max*2] минут. Это даёт пик ~средины, длинный правый хвост,
+  минимум pause_min.
+- **Long breaks «обед/ужин»**: 1-2 раза в день — uniform 120-300 мин
+  (2-5 часов). Вероятность выпадения:
+  - В окне обеда (12:00-14:00) или ужина (18:00-21:00) → 30%.
+  - Вне окна → 5% (всё равно бывает, моторная пауза «отвлёкся»).
+  Лимит `long_breaks_per_day=2` по умолчанию.
+- **Per-account/cfg overrides**: `session_pause_min/max`,
+  `long_break_min_min/max_min`, `long_breaks_per_day`,
+  `long_break_chance_in_window/out_window`.
+- **State**: счётчик `long_breaks_today`/`long_breaks_date` в
+  `_Entry` + методы `account_state.count_long_breaks_today(name)` и
+  `account_state.record_long_break(name)` с авто-сбросом per-day.
+  `record_long_break` вызывается ДО `sleep` — даже при крэше/рестарте
+  бот не «забудет», что уже отдыхал.
+- **Интеграция в `bot._run_main_loop`** — заменили
+  `pause_secs = random.uniform(...)` + `distribution="uniform"` на
+  `pick_cycle_pause(...)`. Лог отличает «Длинный перерыв» от
+  «Цикл завершён».
+
+**Тесты** (`tests/test_cycle_pause.py`, 39 шт.): _is_meal_window
+для всех 24 часов; LUNCH/DINNER не пересекаются; _resolve приоритет
+account > cfg > default + skip None; lognormal floor/upper/long-tail/
+zero-range; uniform range/zero-range; regular path при
+limit_reached/long_breaks_per_day=0; regular pause в нужном
+диапазоне; long_break при chance=1.0 + lunch; regular при chance=0;
+long break в out-window реже чем в in-window (×3+); record_long_break
+вызывается; dinner window тоже триггерит; account overrides длительности;
+cfg fallback; defaults без config; integration с настоящим
+AccountState: счётчик растёт, авто-сброс при смене даты,
+независимые счётчики per-account.
+
+**Verify**: `ruff check .` ✓, `pytest tests/ -q` → 629 passed,
+smoke-import OK.
 
 ---
 

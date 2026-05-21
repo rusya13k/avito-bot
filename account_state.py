@@ -208,6 +208,12 @@ class _Entry:
     # вызове is_dead_day; все последующие вызовы возвращают то же решение.
     dead_day_decision: dict = field(default_factory=dict)
 
+    # ── T19: длинные перерывы «обед/ужин» ────────────────────────────────
+    # Сколько long-break'ов взято сегодня — счётчик для лимита 1-2/день.
+    # Сбрасывается при смене календарной даты.
+    long_breaks_date: str = ""  # "YYYY-MM-DD"
+    long_breaks_today: int = 0
+
 
 class AccountState:
     """
@@ -470,6 +476,39 @@ class AccountState:
         today = time.strftime("%Y-%m-%d")
         with self._lock:
             self._get(account_name).dead_day_decision = {"date": today, "is_dead": True}
+
+    # ──────────────────────────────────────────────────────────────────────
+    # T19: длинные перерывы «обед/ужин» — счётчик за календарный день
+    # ──────────────────────────────────────────────────────────────────────
+
+    def count_long_breaks_today(self, account_name: str) -> int:
+        """T19: сколько длинных перерывов уже взято сегодня.
+
+        Авто-сброс счётчика при смене даты. Используется в `cycle_pause`
+        для решения, можно ли ещё взять long-break (лимит обычно 2/день).
+        """
+        today = time.strftime("%Y-%m-%d")
+        with self._lock:
+            entry = self._get(account_name)
+            if entry.long_breaks_date != today:
+                entry.long_breaks_date = today
+                entry.long_breaks_today = 0
+            return entry.long_breaks_today
+
+    def record_long_break(self, account_name: str) -> None:
+        """T19: инкрементировать счётчик long-break'ов на сегодня.
+
+        Вызывается из `cycle_pause.pick_cycle_pause` сразу после решения
+        взять длинный перерыв, ДО самого `sleep` — чтобы при рестарте
+        бот не «забыл» что уже отдыхал.
+        """
+        today = time.strftime("%Y-%m-%d")
+        with self._lock:
+            entry = self._get(account_name)
+            if entry.long_breaks_date != today:
+                entry.long_breaks_date = today
+                entry.long_breaks_today = 0
+            entry.long_breaks_today += 1
 
     # ──────────────────────────────────────────────────────────────────────
     # F5b: «навсегда игнорированные» диалоги (5% от новых)

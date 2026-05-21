@@ -35,6 +35,7 @@ from commercial_realestate_config import (
     COMMERCIAL_SEARCH_FILTERS,
     MILLION_CITIES,
 )
+from cycle_pause import pick_cycle_pause
 from database import DatabaseManager
 from human_delay import human_delay as _human_delay
 from human_mouse import human_click as _human_click
@@ -1942,14 +1943,27 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
             if _tg.stop_event.is_set():
                 break
 
-        # ── A4: Session pause ───────────────────────────────────────────
-        # После каждого цикла бот делает паузу. Прерывается на stop-сигнал.
-        pause_secs = random.uniform(pause_min * 60, pause_max * 60)
-        next_time = time.strftime("%H:%M", time.localtime(time.time() + pause_secs))
-        log(
-            account_name,
-            f"Цикл завершён. Следующий запуск в ~{next_time} (пауза {pause_secs / 60:.0f} мин).",
+        # ── A4 + T19: Session pause ─────────────────────────────────────
+        # Раньше: uniform [pause_min, pause_max] минут — слишком регулярно.
+        # T19: lognormal по умолчанию + шанс длинного перерыва «обед/ужин»
+        # (1-2 раза в день по 2-5 часов в часах 12-14 / 18-21).
+        # cycle_pause.pick_cycle_pause возвращает (seconds, label) и сам
+        # инкрементирует счётчик long-break'ов через account_state.
+        pause_secs, pause_label = pick_cycle_pause(
+            account, cfg, account_state=account_state, account_name=account_name
         )
+        next_time = time.strftime("%H:%M", time.localtime(time.time() + pause_secs))
+        if pause_label == "long_break":
+            log(
+                account_name,
+                f"T19: Длинный перерыв «обед/ужин» — {pause_secs / 60:.0f} мин, до ~{next_time}.",
+            )
+        else:
+            log(
+                account_name,
+                f"Цикл завершён. Следующий запуск в ~{next_time} "
+                f"(пауза {pause_secs / 60:.0f} мин).",
+            )
         _human_delay(pause_secs, pause_secs, stop_event=_tg.stop_event, distribution="uniform")
 
 
