@@ -756,68 +756,134 @@ def _do_profile_check(driver, account_name: str) -> None:
         hp(20, 40)
 
 
-def yandex_warmup(driver, wait, account_name, num_queries=2):
-    log(account_name, "=== Enhanced Thematic Yandex Warmup ===")
+# T2: актуальные селекторы результатов Yandex SERP. Список из нескольких
+# вариантов на случай smooth-rollouts разметки (Yandex иногда раскатывает
+# A/B по разным регионам/устройствам). Достаточно совпадения ОДНОГО из них.
+_YANDEX_RESULT_SELECTORS = [
+    "li.serp-item",  # классический контейнер органики
+    "[data-fast-name='organic']",  # новый data-атрибут для блоков выдачи
+    "[data-fast-tag*='organic']",
+    ".OrganicTitle",  # титлы органических результатов
+    ".OrganicTitle-LinkText",
+    ".organic__url-text",  # домены под заголовком
+    "ul.serp-list > li",
+    "[role='main'] [role='listitem']",
+]
 
-    if not safe_get(driver, "https://ya.ru", account_name):
+_YANDEX_REGION_MOSCOW = 213
+
+
+def _yandex_search_url(query: str, region_id: int = _YANDEX_REGION_MOSCOW) -> str:
+    """T2: формирует прямой URL поисковой выдачи Yandex (минуя homepage).
+
+    homepage ya.ru на коммерческих прокси часто отдаёт капчу ДО ввода запроса.
+    Direct-search (`/search/?text=...&lr=...`) на 100% обходит этот шаг.
+    Параметр lr=213 — Москва, что согласуется с типовыми RU-прокси.
+    """
+    from urllib.parse import quote_plus
+
+    return f"https://yandex.ru/search/?text={quote_plus(query)}&lr={region_id}"
+
+
+def _is_yandex_captcha(driver) -> bool:
+    """T2: рано детектим капчу Yandex (URL/title) до того, как _wait_yandex_results
+    выбросит TimeoutException через 15s.
+
+    Распространённые маркеры:
+    - URL содержит `/showcaptcha` или `captcha=` (SmartCaptcha)
+    - title содержит «Ой!» / «captcha» / «Подтвердите»
+    """
+    try:
+        url = (driver.current_url or "").lower()
+    except Exception:
+        url = ""
+    if "/showcaptcha" in url or "captcha=" in url:
+        return True
+    try:
+        title = (driver.title or "").lower()
+    except Exception:
+        title = ""
+    if any(m in title for m in ("ой!", "captcha", "подтвердите")):
+        return True
+    return False
+
+
+def _wait_yandex_results(driver, timeout: int = 15) -> bool:
+    """T2: ждёт появления хотя бы одного элемента из _YANDEX_RESULT_SELECTORS.
+
+    Возвращает True если результаты появились, False — иначе (не бросает
+    TimeoutException — yandex_warmup сам решит, считать ли это провалом).
+    """
+    selector = ", ".join(_YANDEX_RESULT_SELECTORS)
+    try:
+        WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+        )
+        return True
+    except TimeoutException:
         return False
+
+
+def yandex_warmup(driver, wait, account_name, num_queries=2):
+    """T2: direct-search вместо homepage-flow.
+
+    Раньше: ya.ru → найти search box → typing-loop → submit → ждать SERP.
+    Проблемы:
+      1. ya.ru на коммерческих прокси отдаёт /showcaptcha сразу.
+      2. Селекторы `serp-item`/`organic` устарели — Yandex поменял разметку.
+
+    Теперь: GET yandex.ru/search/?text=...&lr=213 → детект капчи →
+    список актуальных селекторов → scroll. Поведение проще, надёжнее,
+    обходит homepage-captcha.
+
+    Параметр `wait` оставлен для обратной совместимости (используется
+    извне через `client.warmup_yandex`).
+    """
+    _ = wait  # обратная совместимость API
+
+    log(account_name, "=== Enhanced Thematic Yandex Warmup (direct-search) ===")
 
     # F4: смешиваем тематические (70%), общие (25%) и пропуски (5%).
     queries = _pick_queries(num_queries)
+
+    # F4: если queries пустой (все слоты попали в 5%-пропуск) — это нормально:
+    # аккаунт просто «не искал ничего» в этом цикле. Не считается провалом.
+    if not queries:
+        log(account_name, "Warmup completed (idle — no queries this time).")
+        return True
+
     success_count = 0
+    captcha_count = 0
 
     for q_idx, query in enumerate(queries, 1):
         log(account_name, f"  Query {q_idx}: «{query}»")
 
         try:
-            # Robust way to find and focus search box
-            selectors = [
-                "textarea.search3__input",
-                "input.search3__input",
-                "#text",
-                "[name='text']",
-            ]
-            box = None
-            for sel in selectors:
-                try:
-                    box = WebDriverWait(driver, 5).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-                    )
-                    if box:
-                        break
-                except:
-                    continue
-
-            if not box:
+            url = _yandex_search_url(query)
+            if not safe_get(driver, url, account_name):
+                log(account_name, "    safe_get failed (block/empty/timeout).")
                 continue
 
-            # Force focus and clear via JS to avoid 'not interactable'
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", box)
-            hp(1, 2)
-            driver.execute_script("arguments[0].focus();", box)
-            hp(0.5, 1)
+            # T2: рано детектим капчу (ещё до wait_yandex_results timeout 15s).
+            if _is_yandex_captcha(driver):
+                captcha_count += 1
+                log(account_name, "    Yandex captcha detected — пропускаю query.")
+                continue
 
-            # Human typing — реалистичная скорость 50-250ms/char + «задумчивые»
-            # паузы (раньше тут был tupой 0.5-1.5s/char ≈ 8-12 WPM).
-            human_type(box, query)
+            if not _wait_yandex_results(driver, timeout=15):
+                # На SERP не появились результаты — либо разметка опять
+                # поменялась, либо это была капча (детект мог не сработать
+                # на новых маркерах). Перепроверяем капчу ещё раз.
+                if _is_yandex_captcha(driver):
+                    captcha_count += 1
+                    log(account_name, "    Yandex captcha (post-wait) — пропускаю.")
+                else:
+                    log(account_name, "    SERP results not found (markup changed?).")
+                continue
 
-            hp(1, 2)
-            box.send_keys(Keys.RETURN)
-
-            # Check results
-            WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located(
-                    (
-                        By.XPATH,
-                        "//li[contains(@class,'serp-item')] | //a[contains(@class,'organic')]",
-                    )
-                )
-            )
             success_count += 1
 
-            # Interaction and bridge logic...
-            # (Rest of the logic: bridge_to_avito or random click)
-            # For brevity in replace tool, I'm focusing on the fix
+            # Behavioural: scroll по результатам, как живой пользователь.
             hp(5, 10)
             human_scroll(driver, "down", iters=random.randint(2, 4))
 
@@ -838,17 +904,18 @@ def yandex_warmup(driver, wait, account_name, num_queries=2):
                 f"| url={page_url} | title={page_title}",
             )
 
-    # F4: если queries пустой (все слоты попали в 5%-пропуск) — это нормально:
-    # аккаунт просто открыл Яндекс и ничего не искал. Не считается провалом.
-    if not queries:
-        log(account_name, "Warmup completed (idle — no queries this time).")
-        return True
-
     if success_count == 0:
-        log(account_name, "  Warmup FAILED: No successful queries.")
+        if captcha_count > 0:
+            log(account_name, f"  Warmup FAILED: все {captcha_count} запросов → captcha.")
+        else:
+            log(account_name, "  Warmup FAILED: No successful queries.")
         return False
 
-    log(account_name, f"Warmup completed ({success_count} queries successful).")
+    log(
+        account_name,
+        f"Warmup completed ({success_count} queries successful, "
+        f"{captcha_count} captcha).",
+    )
     return True
 
 

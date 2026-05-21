@@ -118,3 +118,194 @@ def test_yandex_warmup_pick_queries_called_with_num():
         yandex_warmup(driver, MagicMock(), "acc1", num_queries=3)
 
     mock_pick.assert_called_once_with(3)
+
+
+# ── T2: direct-search URL + капча-детект ──────────────────────────────────
+
+
+def test_yandex_search_url_basic():
+    """T2: _yandex_search_url формирует /search/?text=...&lr=213."""
+    from bot import _yandex_search_url
+
+    url = _yandex_search_url("офис в москве")
+    assert url.startswith("https://yandex.ru/search/?text=")
+    assert "lr=213" in url
+    # urlencode-safe
+    assert " " not in url
+    assert "%D0" in url or "+" in url  # cyrillic encoded
+
+
+def test_yandex_search_url_quote_special_chars():
+    """T2: спецсимволы (&, =) корректно экранированы."""
+    from bot import _yandex_search_url
+
+    url = _yandex_search_url("a & b = c")
+    # & и = не должны ломать query string
+    text_part = url.split("text=", 1)[1].split("&lr=", 1)[0]
+    assert "&" not in text_part, f"& не экранирован: {url}"
+    assert "%26" in text_part or "+" in text_part
+
+
+def test_yandex_search_url_custom_region():
+    """T2: region_id опционален (default Москва=213)."""
+    from bot import _yandex_search_url
+
+    url = _yandex_search_url("test", region_id=2)
+    assert "lr=2" in url
+
+
+def test_is_yandex_captcha_url_showcaptcha():
+    """T2: /showcaptcha в URL → True."""
+    from bot import _is_yandex_captcha
+
+    driver = MagicMock()
+    driver.current_url = "https://yandex.ru/showcaptcha?cc=1"
+    driver.title = ""
+    assert _is_yandex_captcha(driver) is True
+
+
+def test_is_yandex_captcha_url_query_param():
+    """T2: captcha= в query string → True."""
+    from bot import _is_yandex_captcha
+
+    driver = MagicMock()
+    driver.current_url = "https://yandex.ru/search/?text=foo&captcha=abc"
+    driver.title = ""
+    assert _is_yandex_captcha(driver) is True
+
+
+def test_is_yandex_captcha_title_marker():
+    """T2: title содержит «Ой!»/«captcha»/«Подтвердите» → True."""
+    from bot import _is_yandex_captcha
+
+    for title in ("Ой!", "Я не робот - captcha", "Подтвердите, что вы человек"):
+        driver = MagicMock()
+        driver.current_url = "https://yandex.ru/search/?text=foo"
+        driver.title = title
+        assert _is_yandex_captcha(driver) is True, f"title={title!r}"
+
+
+def test_is_yandex_captcha_clean():
+    """T2: на нормальном SERP — False."""
+    from bot import _is_yandex_captcha
+
+    driver = MagicMock()
+    driver.current_url = "https://yandex.ru/search/?text=hello&lr=213"
+    driver.title = "hello — Яндекс: нашлось 12 млн результатов"
+    assert _is_yandex_captcha(driver) is False
+
+
+def test_is_yandex_captcha_handles_driver_errors():
+    """T2: если current_url/title бросают, _is_yandex_captcha возвращает False."""
+    from bot import _is_yandex_captcha
+
+    driver = MagicMock()
+    driver.current_url = property(lambda self: (_ for _ in ()).throw(RuntimeError("disconnected")))
+    driver.title = ""
+    # Должна не упасть, а вернуть False
+    assert _is_yandex_captcha(driver) is False
+
+
+def test_yandex_warmup_uses_direct_search_url():
+    """T2: yandex_warmup идёт сразу на /search/, минуя homepage ya.ru."""
+    from bot import yandex_warmup
+
+    driver = MagicMock()
+    driver.current_url = "https://yandex.ru/search/?text=test&lr=213"
+    driver.title = "test — Яндекс"
+
+    with (
+        patch("bot.safe_get", return_value=True) as mock_get,
+        patch("bot._pick_queries", return_value=["офис в москве"]),
+        patch("bot._wait_yandex_results", return_value=True),
+        patch("bot._is_yandex_captcha", return_value=False),
+        patch("bot.hp"),
+        patch("bot.human_scroll"),
+    ):
+        result = yandex_warmup(driver, MagicMock(), "acc1", num_queries=1)
+
+    assert result is True
+    # Должен быть вызов safe_get с URL /search/?text=...
+    urls_called = [call.args[1] for call in mock_get.call_args_list]
+    assert any("/search/?text=" in u for u in urls_called), (
+        f"yandex_warmup не использует direct-search URL. URLs: {urls_called}"
+    )
+    # И НЕ должно быть GET на голый ya.ru/homepage.
+    assert not any(u in ("https://ya.ru", "https://ya.ru/") for u in urls_called), (
+        f"yandex_warmup всё ещё ходит на homepage ya.ru: {urls_called}"
+    )
+
+
+def test_yandex_warmup_skips_query_on_captcha():
+    """T2: при детекте капчи query пропускается, не выбрасывается timeout."""
+    from bot import yandex_warmup
+
+    driver = MagicMock()
+
+    with (
+        patch("bot.safe_get", return_value=True),
+        patch("bot._pick_queries", return_value=["q1", "q2"]),
+        patch("bot._is_yandex_captcha", return_value=True),
+        patch("bot._wait_yandex_results") as mock_wait,
+        patch("bot.hp"),
+        patch("bot.human_scroll"),
+    ):
+        result = yandex_warmup(driver, MagicMock(), "acc1", num_queries=2)
+
+    # Все query → captcha → success_count=0 → return False.
+    assert result is False
+    # _wait_yandex_results НЕ должен быть вызван (рано детектим капчу).
+    mock_wait.assert_not_called()
+
+
+def test_yandex_warmup_returns_true_on_idle():
+    """T2: пустой queries list → idle warmup → True (как раньше)."""
+    from bot import yandex_warmup
+
+    driver = MagicMock()
+
+    with (
+        patch("bot._pick_queries", return_value=[]),
+        patch("bot.safe_get", return_value=True) as mock_get,
+    ):
+        result = yandex_warmup(driver, MagicMock(), "acc1", num_queries=2)
+
+    assert result is True
+    # idle → safe_get вообще не вызывается (нет HTTP-запросов).
+    mock_get.assert_not_called()
+
+
+def test_yandex_warmup_success_when_results_found():
+    """T2: SERP с результатами → success_count > 0 → True."""
+    from bot import yandex_warmup
+
+    driver = MagicMock()
+    driver.current_url = "https://yandex.ru/search/?text=test&lr=213"
+    driver.title = "test — Яндекс"
+
+    with (
+        patch("bot.safe_get", return_value=True),
+        patch("bot._pick_queries", return_value=["q1"]),
+        patch("bot._is_yandex_captcha", return_value=False),
+        patch("bot._wait_yandex_results", return_value=True) as mock_wait,
+        patch("bot.hp"),
+        patch("bot.human_scroll"),
+    ):
+        result = yandex_warmup(driver, MagicMock(), "acc1", num_queries=1)
+
+    assert result is True
+    mock_wait.assert_called()
+
+
+def test_wait_yandex_results_uses_actual_selectors():
+    """T2: _wait_yandex_results использует обновлённый CSS-список (не только serp-item)."""
+    import bot
+
+    sels = bot._YANDEX_RESULT_SELECTORS
+    # Должно быть >= 4 альтернатив для устойчивости к A/B-разметкам Yandex.
+    assert len(sels) >= 4, f"мало альтернативных селекторов: {sels}"
+    # Старый xpath `//li[contains(@class,'serp-item')]` заменён на CSS — больше не используется.
+    assert all(not s.startswith("//") for s in sels), f"найден XPath селектор: {sels}"
+    # Должны быть упоминания и старого, и нового data-атрибута для устойчивости.
+    s = " ".join(sels)
+    assert "serp-item" in s or "data-fast-name" in s or "OrganicTitle" in s

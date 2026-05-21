@@ -36,7 +36,7 @@
 
 ---
 
-### T2 — Yandex warmup селекторы устарели  `status: pending`
+### T2 — Yandex warmup селекторы устарели  `status: done`
 
 `bot.py:809-816` ждёт `//li[contains(@class,'serp-item')] | //a[contains(@class,'organic')]` — на текущем Яндексе CSS поменялся.
 Плюс на коммерческих прокси Яндекс сразу показывает `/showcaptcha`.

@@ -34,15 +34,10 @@ def _count_human_type_calls(func) -> int:
 
 
 # ── T1.1: yandex_warmup ───────────────────────────────────────────────────
-
-
-def test_yandex_warmup_uses_human_type():
-    """T1: yandex_warmup должен вводить query через human_type, не через slow loop."""
-    src = _src(bot.yandex_warmup)
-    # Должен быть как минимум один вызов human_type для query.
-    assert "human_type(" in src, (
-        "yandex_warmup больше не использует human_type — регресс к slow-loop?"
-    )
+# T2 заменил homepage-flow с typing на direct-search URL — поэтому human_type
+# в yandex_warmup больше не нужен. Оставляем лишь regression на slow-loop:
+# если кто-то опять решит делать typing в input Yandex'а — не делать это
+# через time.sleep(random.uniform(0.5, 1.5)).
 
 
 def test_yandex_warmup_has_no_grandma_loop():
