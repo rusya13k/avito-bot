@@ -38,6 +38,8 @@ from commercial_realestate_config import (
 from database import DatabaseManager
 from human_delay import human_delay as _human_delay
 from human_mouse import human_click as _human_click
+from human_scroll import compute_reading_dwell as _compute_reading_dwell
+from human_scroll import human_scroll as _human_scroll
 from human_typing import type_human as _type_human
 from llm_classifier import LLMClassifier
 from logging_setup import (
@@ -379,17 +381,21 @@ def move_click(driver, element):
 
 
 def human_scroll(driver, direction="down", iters=None):
-    if iters is None:
-        iters = random.randint(3, 7)
-    for _ in range(iters):
-        amount = random.randint(150, 500) * (1 if direction == "down" else -1)
-        if direction == "down" and random.random() < 0.2:
-            driver.execute_script(f"window.scrollBy(0, -{random.randint(50, 130)});")
-            hp(0.3, 0.7)
-        driver.execute_script(f"window.scrollBy(0, {amount});")
-        hp(0.3, 1.1)
-        if random.random() < 0.25:
-            hp(1, 3)
+    """T9: тонкая обёртка над human_scroll.human_scroll.
+
+    Раньше: ровные scrollBy-jump'ы по 150-500px каждый, пауза 0.3-1.1s.
+    Теперь: inertia-свайпы 300-900px по cubic ease-out, reading-паузы
+    адаптивные по объёму видимого текста, 15% шанс back-scroll.
+
+    Сохраняем старую сигнатуру (direction, iters) для обратной
+    совместимости — параметр `iters` маппится на `swipes`.
+    """
+    _human_scroll(
+        driver,
+        direction=direction,
+        swipes=iters,
+        stop_event=_tg.stop_event,
+    )
 
 
 def slow_scroll_to(driver, element):
@@ -473,6 +479,31 @@ def check_block(driver, account_name):
     return False
 
 
+def _read_listing_meta(driver) -> tuple[str, int]:
+    """T10: достать description-text и image_count из текущего листинга.
+
+    Возвращает (description, image_count). На любую ошибку → ("", 0)
+    — caller получит «короткий» dwell. Эта функция is best-effort: DOM
+    Авито меняется, и если оба маркера не найдены — мы просто
+    подставляем небольшой default, не падаем.
+    """
+    description = ""
+    image_count = 0
+    try:
+        desc_el = driver.find_element(By.XPATH, "//div[@data-marker='item-description']")
+        description = (desc_el.text or "").strip()
+    except Exception:
+        pass
+    try:
+        # Каждое изображение в галерее имеет data-marker='image-frame'
+        # или image-frame/N. Считаем штук.
+        imgs = driver.find_elements(By.XPATH, "//*[@data-marker='image-frame']")
+        image_count = len(imgs)
+    except Exception:
+        pass
+    return description, image_count
+
+
 def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.05):
     """
     F1: favorite_rate — вероятность «Добавить в избранное» (default 8%).
@@ -480,11 +511,15 @@ def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.
     Оба параметра конфигурируются через config.json / accounts.json
     (ключи view_listing_favorite_rate / view_listing_call_rate).
 
-    F9: dwell_time распределён по lognormal (5-120 секунд, пик ~20-30s).
-    Дополнительно interest-score:
-      • 15% листингов «очень интересные» — +60..300s дополнительного чтения.
-      • 20% «совсем неинтересные» — закрываем рано (return True), без
-        scroll/favorite/call. Имитирует «открыл, не моё, закрыл».
+    T10: dwell_time теперь зависит от контента —
+    `compute_reading_dwell(description, image_count, interest)`. Раньше
+    F9 lognormal не учитывал, что на странице (пустой список или
+    1500-символьное описание + 15 фото). Теперь:
+      • interest ∈ [0, 1] выбирается рандомно: 20% «совсем не моё» (≤0.2),
+        15% «очень интересно» (≥0.7), остальные 65% — нейтрально (0.3-0.7).
+      • dwell ∝ base × log(text+1) × (1 + 0.04·images) × (0.5 + interest).
+      • Клампим в [5, 300] сек.
+      • 20% «совсем не моё» — возвращаемся рано (без scroll/favorite/call).
     """
     if check_block(driver, account_name):
         return False
@@ -496,22 +531,40 @@ def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.
     except Exception:
         return True
 
-    # F9: lognormal dwell — реалистичный «прочитать заголовок и фото».
-    # mean ~ 20-30s, длинный хвост до 2 мин (заинтересованный пользователь).
-    dwell_time = hp(5, 120, distribution="lognormal")
-    log(account_name, f"  Viewing listing (dwell time: {dwell_time:.1f}s)...")
+    # T10: достаём контент перед dwell calculation.
+    description, image_count = _read_listing_meta(driver)
 
-    # F9: interest score — после первого взгляда решаем, насколько интересно.
-    if random.random() < 0.15:
-        # 15% — очень интересный листинг: дополнительные 1-5 минут чтения.
-        extra = random.uniform(60, 300)
-        log(account_name, f"  F9: интересный листинг — читаем ещё ~{extra:.0f}s")
-        hp(extra, extra)
-    elif random.random() < 0.20:
-        # 20% — закрываем рано (без scroll/photos/favorite/call).
-        # return True — не считаем это ошибкой, просто «не моё».
-        log(account_name, "  F9: неинтересно, закрываем")
+    # T10: interest score — ширина 3-уровневая, чтобы было разнообразие.
+    interest_roll = random.random()
+    if interest_roll < 0.20:
+        interest = random.uniform(0.0, 0.20)  # совсем не моё
+    elif interest_roll < 0.35:
+        interest = random.uniform(0.70, 1.00)  # очень интересно
+    else:
+        interest = random.uniform(0.30, 0.70)  # нейтрально
+
+    dwell_time = _compute_reading_dwell(
+        description=description,
+        image_count=image_count,
+        interest=interest,
+    )
+    log(
+        account_name,
+        f"  Viewing listing (dwell={dwell_time:.1f}s, "
+        f"text={len(description)} chars, imgs={image_count}, "
+        f"interest={interest:.2f})...",
+    )
+
+    # T10/F9: совсем неинтересно → закрываем рано.
+    if interest < 0.10:
+        log(account_name, "  T10: неинтересно, закрываем")
         return True
+
+    # T10: общий dwell-time распределяем по dwell_time, не одной паузой —
+    # внутри будут ещё scroll/mouse_move/pause-фазы. На стартовый «осмотр»
+    # тратим 30% от плана.
+    initial_glance = max(2.0, dwell_time * 0.3)
+    hp(initial_glance, initial_glance)
 
     # F10: галерея смотрится не каждый раз (60% probability). Реальный
     # пользователь часто смотрит только первое фото и идёт дальше.
@@ -533,9 +586,12 @@ def view_listing(driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.
             try:
                 desc = driver.find_element(By.XPATH, "//div[@data-marker='item-description']")
                 slow_scroll_to(driver, desc)
-                # F9: чтение описания — lognormal 15-90s. Объект на 5-15 млн
-                # рублей читается дольше, чем uniform 3-7s.
-                hp(15, 90, distribution="lognormal")
+                # T10: чтение описания пропорционально его длине + interest.
+                # Берём 50% от рассчитанного dwell — это «активное» чтение
+                # описания (остальные 50% уходят на initial_glance + scroll
+                # фазы).
+                reading_share = max(3.0, dwell_time * 0.5)
+                hp(reading_share, reading_share)
             except:
                 pass
         hp(1, 3)
