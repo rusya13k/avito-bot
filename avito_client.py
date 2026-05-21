@@ -307,6 +307,35 @@ class AvitoClient:
             num_queries=num_queries,
         )
 
+    def big_warmup(
+        self,
+        *,
+        num_sites: int | None = None,
+        with_yandex_search: bool = True,
+        yandex_queries: int = 1,
+    ) -> dict:
+        """T4: мульти-сайтовый прогрев (3-5 нейтральных сайтов + опц. Yandex).
+
+        Wrapper над warmup.big_warmup. См. документацию там же.
+
+        Полезно:
+        - После долгих простоев / смены прокси (сбрасываем "холодный" history).
+        - При создании нового аккаунта (B1 warmup-mode).
+        - По кнопке /warmup в TG (T12).
+
+        Возвращает stats dict, см. warmup.big_warmup.
+        """
+        from warmup import big_warmup
+
+        return big_warmup(
+            self.driver,
+            self.account_name,
+            num_sites=num_sites,
+            log_func=self.log,
+            with_yandex_search=with_yandex_search,
+            yandex_queries=yandex_queries,
+        )
+
     def browse_commercial_categories(self, *args, **kwargs) -> Any:
         """
         Открытие коммерческих категорий + ввод keyword'а.
@@ -372,8 +401,7 @@ class AvitoClient:
         elif _alert == "100":
             # C2: лимит только что исчерпан — однократный WARNING (de-dup по дате).
             logger.warning(
-                "[%s] C2: дневной лимит листингов исчерпан (%d/%d). "
-                "Поиск остановлен до завтра.",
+                "[%s] C2: дневной лимит листингов исчерпан (%d/%d). Поиск остановлен до завтра.",
                 self.account_name,
                 _used_listings,
                 _lim,
