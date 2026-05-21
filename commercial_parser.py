@@ -308,7 +308,9 @@ def _try_show_phone(driver, account_name: str, log_func, listing_data: dict) -> 
     if detect_phone_captcha(driver, log_func=log_func, account_name=account_name):
         log_func(account_name, "Капча обнаружена ДО клика 'Показать телефон' — пропускаем")
         listing_data[_CAPTCHA_FLAG] = True
-        account_state.mark_captcha(account_name)
+        # T17: phone-page капча, но клик ещё НЕ был — это «листинг-уровень»
+        # (не наш клик триггерил). Менее опасно, чем пост-клик ниже.
+        account_state.mark_captcha(account_name, captcha_type="avito_listing")
         return
 
     try:
@@ -333,7 +335,9 @@ def _try_show_phone(driver, account_name: str, log_func, listing_data: dict) -> 
             "!!! Капча после клика 'Показать телефон' — аккаунт уйдёт в cooldown",
         )
         listing_data[_CAPTCHA_FLAG] = True
-        account_state.mark_captcha(account_name)
+        # T17: avito_phone — самый опасный тип (×2 multiplier).
+        # Сам бот спровоцировал клик, и Avito ответил капчей.
+        account_state.mark_captcha(account_name, captcha_type="avito_phone")
         return
 
     try:

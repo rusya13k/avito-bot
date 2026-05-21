@@ -804,21 +804,32 @@ _CYCLE_KINDS_WARMUP: dict[str, float] = {
 }
 
 
-def _pick_cycle_kind(account: dict, cfg: dict, *, is_warmup: bool = False) -> str:
+def _pick_cycle_kind(
+    account: dict,
+    cfg: dict,
+    *,
+    is_warmup: bool = False,
+    outbound_disabled: bool = False,
+) -> str:
     """F8: выбирает тип сегодняшнего цикла.
 
     Чистая функция (без обращения к account_state) — для лёгкой
-    тестируемости. Флаг `is_warmup` пробрасывается из run_thread, который
-    сам опрашивает account_state.is_in_warmup().
+    тестируемости. Флаги `is_warmup` / `outbound_disabled` пробрасываются
+    из run_thread, который сам опрашивает account_state.is_in_warmup() /
+    account_state.is_outbound_disabled().
 
     Override для НЕ-warmup-режима:
         1. account["cycle_distribution"]   (per-account, accounts.json)
         2. cfg["cycle_distribution"]       (глобальный, config.json)
         3. _CYCLE_KINDS_DEFAULT            (хард-кодед)
 
+    T17: если `outbound_disabled=True` — вес outbound_only зануляется,
+    его «масса» перераспределяется на остальные kinds пропорционально.
+    Так бот после Avito-капчи 24h НЕ пишет первым.
+
     Returns:
         Один из ключей словаря весов: "full" / "messenger_only" /
-        "browse_only" / "profile_check".
+        "browse_only" / "profile_check" / "outbound_only".
     """
     if is_warmup:
         weights = _CYCLE_KINDS_WARMUP
@@ -828,6 +839,9 @@ def _pick_cycle_kind(account: dict, cfg: dict, *, is_warmup: bool = False) -> st
             or cfg.get("cycle_distribution")
             or _CYCLE_KINDS_DEFAULT
         )
+    # T17: после Avito-капчи outbound запрещён на 24h.
+    if outbound_disabled and weights.get("outbound_only", 0):
+        weights = {k: (0.0 if k == "outbound_only" else float(v)) for k, v in weights.items()}
     kinds = list(weights.keys())
     probs = [float(weights[k]) for k in kinds]
     # random.choices гарантирует выбор хотя бы одного, если суммa > 0.
@@ -1885,11 +1899,23 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
         # A3/A4: сбрасываем сессионные phone-счётчики в начале цикла.
         account_state.start_new_session(account_name)
 
-        # ── F8: выбор типа цикла ─────────────────────────────────────────
+        # ── F8 + T17: выбор типа цикла ───────────────────────────────────
         # Не каждый цикл должен быть «полным» (browse + parse + messenger).
         # Реальный пользователь чаще заходит просто проверить мессенджер
         # или полистать профиль. См. _pick_cycle_kind для деталей.
-        kind = _pick_cycle_kind(account, cfg, is_warmup=account_state.is_in_warmup(account_name))
+        # T17: если после недавней Avito-капчи outbound заблокирован —
+        # _pick_cycle_kind зануляет его вес, не выпадет никогда.
+        outbound_disabled = account_state.is_outbound_disabled(account_name)
+        if outbound_disabled:
+            until_ts = account_state.get_outbound_disabled_until(account_name)
+            until_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(until_ts))
+            log(account_name, f"T17: outbound заблокирован после Avito-капчи (до {until_str})")
+        kind = _pick_cycle_kind(
+            account,
+            cfg,
+            is_warmup=account_state.is_in_warmup(account_name),
+            outbound_disabled=outbound_disabled,
+        )
         log(account_name, f"F8: cycle kind = {kind}")
 
         if kind == "full":

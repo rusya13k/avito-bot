@@ -397,7 +397,8 @@ class OutboundMessenger:
         # 3. Pre-click captcha check.
         if detect_phone_captcha(self.driver, log_func=log_func, account_name=self.account_name):
             log_func(self.account_name, "H1: капча на странице листинга — скип.")
-            _astate.mark_captcha(self.account_name)
+            # T17: листинг-уровень капча. Триггерит outbound-disable на 24h.
+            _astate.mark_captcha(self.account_name, captcha_type="avito_listing")
             return False
 
         # 4. Открываем chat-overlay.
@@ -565,7 +566,9 @@ class OutboundMessenger:
         # после первого outbound — это самый детектируемый момент.
         if detect_phone_captcha(self.driver, log_func=log_func, account_name=self.account_name):
             log_func(self.account_name, "H1: КАПЧА после Send — записываем как captcha.")
-            _astate.mark_captcha(self.account_name)
+            # T17: avito_message_send — outbound спровоцировал капчу.
+            # Кроме обычных штрафов, выключит outbound на 24h (см. mark_captcha).
+            _astate.mark_captcha(self.account_name, captcha_type="avito_message_send")
             return False
 
         return True

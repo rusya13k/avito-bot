@@ -62,6 +62,37 @@ logger = logging.getLogger(__name__)
 # configure_from_cfg(cfg) на старте.
 DEFAULT_CAPTCHA_COOLDOWN_MINUTES = 30
 
+# ── T17: Smarter captcha cooldown политики ────────────────────────────────
+# Type-specific cooldown multipliers. Avito phone-капча самая опасная
+# (привязка телефона к аккаунту), Yandex SmartCaptcha обычно прокси-issue
+# (часто прокси известен Яндексу) — короткий cooldown.
+#
+# Принцип: effective_minutes = base * MULTIPLIER[type].
+# Override через config.json["captcha_cooldown_multipliers"]: {"avito_phone":2}.
+CAPTCHA_COOLDOWN_MULTIPLIERS: dict[str, float] = {
+    "avito_phone": 2.0,  # клик "Показать телефон" → капча
+    "avito_listing": 1.5,  # капча на странице листинга / в browse
+    "avito_message_send": 1.5,  # H1: капча после отправки outbound
+    "yandex_search": 0.5,  # Yandex SmartCaptcha — обычно прокси-issue
+    "generic": 1.0,  # default — для существующих вызовов
+}
+
+# T17: после Avito-капчи outbound (proactive контакты собственникам)
+# отключается на N часов — outbound значительно опаснее обычного browse,
+# и любой сигнал «капча есть» означает «сегодня не время писать первым».
+# Yandex-капча НЕ блокирует outbound (прокси-issue, не аккаунт).
+# Override через config.json["outbound_disable_hours_after_captcha"].
+OUTBOUND_DISABLE_HOURS_AFTER_CAPTCHA = 24.0
+
+# Какие captcha_type триггерят outbound disable. По умолчанию — все, КРОМЕ
+# yandex_search.
+_CAPTCHA_TYPES_DISABLE_OUTBOUND: set[str] = {
+    "avito_phone",
+    "avito_listing",
+    "avito_message_send",
+    "generic",
+}
+
 # ── A2: Дневные бюджеты ───────────────────────────────────────────────────
 # Глобальные дефолты. Переопределяются через config.json (ключи
 # daily_budget_listings / daily_budget_messages / daily_budget_phone)
@@ -131,6 +162,62 @@ def configure_from_cfg(cfg: dict) -> None:
                     raw_budget,
                     DEFAULT_DAILY_BUDGET[action],
                 )
+
+    # T17: type-specific cooldown multipliers из config.json.
+    # Формат: "captcha_cooldown_multipliers": {"avito_phone": 2.0, ...}.
+    # Только известные типы из CAPTCHA_COOLDOWN_MULTIPLIERS подхватываются —
+    # неизвестные ignored с warning'ом.
+    raw_mult = cfg.get("captcha_cooldown_multipliers")
+    if raw_mult is not None:
+        if isinstance(raw_mult, dict):
+            for type_name, raw_value in raw_mult.items():
+                if type_name not in CAPTCHA_COOLDOWN_MULTIPLIERS:
+                    logger.warning(
+                        "captcha_cooldown_multipliers: неизвестный тип %r — ignored",
+                        type_name,
+                    )
+                    continue
+                try:
+                    value = float(raw_value)
+                    if value <= 0:
+                        logger.warning(
+                            "captcha_cooldown_multipliers[%s]=%r <= 0 — ignored",
+                            type_name,
+                            raw_value,
+                        )
+                        continue
+                    CAPTCHA_COOLDOWN_MULTIPLIERS[type_name] = value
+                    logger.info("captcha_cooldown_multipliers[%s] = %.2f", type_name, value)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "captcha_cooldown_multipliers[%s]=%r не парсится — ignored",
+                        type_name,
+                        raw_value,
+                    )
+        else:
+            logger.warning("captcha_cooldown_multipliers=%r не dict — ignored", raw_mult)
+
+    # T17: длительность outbound-disable после Avito-капчи.
+    global OUTBOUND_DISABLE_HOURS_AFTER_CAPTCHA
+    raw_dis = cfg.get("outbound_disable_hours_after_captcha")
+    if raw_dis is not None:
+        try:
+            value = float(raw_dis)
+            if value < 0:
+                logger.warning(
+                    "outbound_disable_hours_after_captcha=%r < 0 — оставляю %.1f",
+                    raw_dis,
+                    OUTBOUND_DISABLE_HOURS_AFTER_CAPTCHA,
+                )
+            else:
+                OUTBOUND_DISABLE_HOURS_AFTER_CAPTCHA = value
+                logger.info("outbound_disable_hours_after_captcha = %.1f h", value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "outbound_disable_hours_after_captcha=%r не парсится — оставляю %.1f",
+                raw_dis,
+                OUTBOUND_DISABLE_HOURS_AFTER_CAPTCHA,
+            )
 
 
 @dataclass
@@ -214,6 +301,12 @@ class _Entry:
     long_breaks_date: str = ""  # "YYYY-MM-DD"
     long_breaks_today: int = 0
 
+    # ── T17: outbound-disable после Avito-капчи ──────────────────────────
+    # unix-time, до которого outbound (proactive контакты собственникам)
+    # запрещён. 0 = не запрещён. Yandex-капча НЕ обновляет это поле —
+    # это считается прокси-проблемой, а не аккаунт-сигналом.
+    outbound_disabled_until: float = 0.0
+
 
 class AccountState:
     """
@@ -272,6 +365,7 @@ class AccountState:
         self,
         account_name: str,
         cooldown_minutes: float | None = None,
+        captcha_type: str = "generic",
     ) -> float:
         """
         Помечает, что аккаунт попал на капчу. Сдвигает cooldown_until
@@ -281,10 +375,24 @@ class AccountState:
           - >= 3 → long-cooldown 4-8 ч (override переданного cooldown_minutes).
           - >= 5 → cooldown до следующего календарного дня + бюджеты вдвое.
 
+        T17: смарт-политика по типу капчи.
+          - effective_minutes умножается на CAPTCHA_COOLDOWN_MULTIPLIERS[type]
+            (avito_phone=2.0 опаснее, yandex_search=0.5 — обычно прокси).
+          - Если type ∈ {avito_phone, avito_listing, avito_message_send,
+            generic} — обновляем outbound_disabled_until на 24h вперёд.
+          - Yandex-капча — НЕ блокирует outbound.
+
         cooldown_minutes:
           - явное значение -> используем его (если не перебивается B4);
           - None (по умолчанию) -> per-account override (set_account_cooldown_minutes),
             иначе глобальный DEFAULT_CAPTCHA_COOLDOWN_MINUTES.
+
+        captcha_type:
+          - "avito_phone" — клик «Показать телефон» (мост опасный).
+          - "avito_listing" — капча на странице листинга / browse.
+          - "avito_message_send" — капча после отправки outbound-сообщения.
+          - "yandex_search" — Yandex SmartCaptcha (обычно прокси-issue).
+          - "generic" — default для существующих вызовов.
 
         Возвращает unix-time момента окончания cooldown'а.
         """
@@ -293,7 +401,7 @@ class AccountState:
             entry = self._get(account_name)
 
             # Базовый cooldown (из аргумента / per-account override / global default)
-            effective_minutes = (
+            base_minutes = (
                 cooldown_minutes
                 if cooldown_minutes is not None
                 else (
@@ -302,6 +410,12 @@ class AccountState:
                     else DEFAULT_CAPTCHA_COOLDOWN_MINUTES
                 )
             )
+
+            # T17: type-multiplier — Avito phone опаснее (×2.0), Yandex
+            # обычно прокси-issue (×0.5). Применяется ТОЛЬКО к short-cooldown
+            # ветке; B4 long-cooldown / day-cooldown остаются жёсткими.
+            multiplier = CAPTCHA_COOLDOWN_MULTIPLIERS.get(captcha_type, 1.0)
+            effective_minutes = base_minutes * multiplier
 
             # B4: обновляем список timestamps и считаем капчи за 24ч
             entry.captcha_timestamps.append(now)
@@ -343,16 +457,50 @@ class AccountState:
                 new_until = now + effective_minutes * 60.0
                 entry.cooldown_until = max(entry.cooldown_until, new_until)
 
+            # T17: outbound disable. Yandex-капча — НЕ блокирует outbound
+            # (это прокси-issue, не аккаунт-сигнал).
+            if (
+                captcha_type in _CAPTCHA_TYPES_DISABLE_OUTBOUND
+                and OUTBOUND_DISABLE_HOURS_AFTER_CAPTCHA > 0
+            ):
+                disable_until = now + OUTBOUND_DISABLE_HOURS_AFTER_CAPTCHA * 3600.0
+                entry.outbound_disabled_until = max(entry.outbound_disabled_until, disable_until)
+
             entry.captcha_hits += 1
             entry.last_captcha_at = now
             logger.warning(
-                "[%s] CAPTCHA hit #%d (24h: %d) -> cooldown until %s",
+                "[%s] CAPTCHA hit #%d (24h: %d, type=%s) -> cooldown until %s",
                 account_name,
                 entry.captcha_hits,
                 hits_24h,
+                captcha_type,
                 time.strftime("%H:%M:%S", time.localtime(entry.cooldown_until)),
             )
             return entry.cooldown_until
+
+    # ──────────────────────────────────────────────────────────────────────
+    # T17: outbound disable после Avito-капчи
+    # ──────────────────────────────────────────────────────────────────────
+
+    def is_outbound_disabled(self, account_name: str) -> bool:
+        """T17: True, если outbound запрещён (после недавней Avito-капчи).
+
+        Используется в `_pick_cycle_kind` для зануления веса outbound_only,
+        и в `OutboundMessenger.run_cycle` для early return.
+        """
+        with self._lock:
+            entry = self._entries.get(account_name)
+            if entry is None:
+                return False
+            return entry.outbound_disabled_until > time.time()
+
+    def get_outbound_disabled_until(self, account_name: str) -> float:
+        """T17: unix-time когда заканчивается outbound-disable (0 = нет)."""
+        with self._lock:
+            entry = self._entries.get(account_name)
+            if entry is None:
+                return 0.0
+            return entry.outbound_disabled_until
 
     def clear_cooldown(self, account_name: str) -> None:
         """Снять cooldown (например, после ручного решения капчи)."""
