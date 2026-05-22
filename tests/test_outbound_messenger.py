@@ -14,9 +14,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from outbound_messenger import (
+    _PITCH_PERSONAS,
     PERSONAS,
     OutboundMessenger,
     _generate_first_message,
+    _is_pitch_persona,
     _pick_persona_for_account,
 )
 
@@ -122,6 +124,95 @@ def test_generate_first_message_sanitizer_rejects_phone():
     listing = {"title": "Офис"}
     result = _generate_first_message(llm, listing, "small_business_office")
     assert result is None  # sanitizer отрезал
+
+
+# ── pitch-mode (tatarstan_developer) ─────────────────────────────────────
+
+
+def test_pitch_personas_contains_tatarstan_developer():
+    """tatarstan_developer должен быть помечен как pitch-persona,
+    иначе будет использован неподходящий rent-prompt (требует ссылки
+    на объект, лимит 1-3 предложения и т.д.)."""
+    assert "tatarstan_developer" in _PITCH_PERSONAS
+    assert _is_pitch_persona("tatarstan_developer") is True
+    assert _is_pitch_persona("small_business_office") is False
+
+
+def test_pitch_persona_uses_pitch_prompt():
+    """Для pitch-персоны (tatarstan_developer) должен загружаться
+    pitch-prompt, в котором есть инструкции про «15 готовых арендных
+    бизнесов» и партнёрство — а не обычный rent-prompt."""
+    llm = MagicMock()
+    llm.client = MagicMock()
+    llm.model = "gpt-3.5-turbo"
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = (
+        "Здравствуйте. Занимаюсь строительством небольших ТЦ, есть 15 готовых "
+        "арендных бизнесов в Татарстане, ищу финансовых партнёров. "
+        "Окупаемость 6-8 лет. Интересно обсудить?"
+    )
+    llm.client.chat.completions.create.return_value = response
+
+    listing = {
+        "title": "Помещение свободного назначения",
+        "category": "коммерческая недвижимость",
+        "location": "Москва",
+        "area": 200.0,
+        "price": 500000,
+        "description": "...",
+    }
+    result = _generate_first_message(llm, listing, "tatarstan_developer")
+    assert result is not None
+
+    # Проверяем что в system prompt передан pitch-вариант
+    call = llm.client.chat.completions.create.call_args
+    messages = call.kwargs.get("messages") or call.args[0] if call.args else call.kwargs["messages"]
+    system_content = messages[0]["content"]
+    user_content = messages[1]["content"]
+
+    # System prompt — pitch-версия (содержит ключевые маркеры)
+    assert "15 готовых арендных бизнесов" in system_content
+    assert "финансовых партнёров" in system_content or "финансового партнёра" in system_content
+    assert "Татарстан" in system_content
+
+    # User prompt — pitch-версия (без area/price/description, без рекомендации
+    # привязываться к объекту)
+    assert "контекст не критичен" in user_content
+    # persona_description в user-prompt всё равно передаётся
+    assert PERSONAS["tatarstan_developer"] in user_content
+
+
+def test_rent_persona_uses_rent_prompt():
+    """Для обычной (rent) персоны грузится исходный rent-prompt
+    с обязательной ссылкой на объект."""
+    llm = MagicMock()
+    llm.client = MagicMock()
+    llm.model = "gpt-3.5-turbo"
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = "Привет! Площадь 50 м интересна, можно посмотреть?"
+    llm.client.chat.completions.create.return_value = response
+
+    listing = {
+        "title": "Офис 50 м",
+        "category": "офис",
+        "location": "Москва",
+        "area": 50.0,
+        "price": 80000,
+        "description": "офис в центре",
+    }
+    result = _generate_first_message(llm, listing, "small_business_office")
+    assert result is not None
+
+    call = llm.client.chat.completions.create.call_args
+    messages = call.kwargs.get("messages") or call.args[0] if call.args else call.kwargs["messages"]
+    system_content = messages[0]["content"]
+
+    # rent-prompt — содержит требование сослаться на объект
+    assert "Сослаться на объект" in system_content or "объекта" in system_content
+    # rent-prompt НЕ должен содержать pitch-специфичные маркеры
+    assert "15 готовых арендных бизнесов" not in system_content
 
 
 def test_generate_first_message_strips_quotes():

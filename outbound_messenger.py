@@ -117,7 +117,7 @@ PERSONAS: dict[str, str] = {
     "tatarstan_developer": (
         "девелопер из Татарстана, занимаюсь строительством и сдачей небольших торговых центров. "
         "Уже есть 15 готовых арендных бизнесов. Ищу финансовых партнеров для строительства новых объектов. "
-        "Средняя окупаемость 6-8 лет. Интересует партнерство."
+        "Средняя окупаемость 6-8 лет. Интересует партнерство, не аренда конкретного объекта."
     ),
     "family_business": (
         "семейный бизнес, ищу небольшое помещение. "
@@ -144,6 +144,44 @@ _APPROACH_HINTS = [
     "сначала упомянуть деталь объявления, потом вопрос",
     "представиться чем интересуюсь, что важно — короткой строкой",
 ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pitch-mode: персоны, которые НЕ откликаются на конкретный объект, а делают
+# B2B-питч собственнику (партнёрство, инвестиции). Отдельные prompts +
+# отдельные стилистические подсказки (длиннее, формальнее, без привязки к
+# деталям объявления). Добавляешь персону сюда → используется pitch-prompt.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PITCH_PERSONAS: frozenset[str] = frozenset(
+    {
+        "tatarstan_developer",
+    }
+)
+
+_PITCH_FORMALITY_LEVELS = [
+    "вежливо-деловой (полное «Здравствуйте», без канцеляризмов и без «уважаемые»)",
+    "нейтрально-уверенный (как опытный предприниматель — ёмко и по делу)",
+]
+
+_PITCH_LENGTH_HINTS = [
+    "стандарт (3-4 предложения: представление + предложение + вопрос)",
+    "развёрнутый (4-5 предложений с одной дополнительной деталью)",
+]
+
+_PITCH_APPROACH_HINTS = [
+    "сразу к питчу: представился — изложил предложение — задал вопрос",
+    "сначала вежливое «Здравствуйте.», затем что делаешь и что ищешь, в конце — открытый вопрос",
+    "представление как ёмкая характеристика того, чем занимаешься, и сразу — поиск партнёров",
+]
+
+
+def _is_pitch_persona(persona_id: str) -> bool:
+    """H1: вернёт True, если для этой персоны нужно использовать pitch-mode
+    promptы (B2B-предложение партнёрства), а не обычный rent-mode (отклик
+    арендатора на объявление). См. _PITCH_PERSONAS.
+    """
+    return persona_id in _PITCH_PERSONAS
 
 
 def _pick_persona_for_account(account: dict) -> str:
@@ -181,16 +219,30 @@ def _generate_first_message(llm_classifier, listing: dict, persona_id: str) -> s
         return None
 
     persona_description = PERSONAS.get(persona_id, "")
-    formality = random.choice(_FORMALITY_LEVELS)
-    length = random.choice(_LENGTH_HINTS)
-    approach = random.choice(_APPROACH_HINTS)
+    is_pitch = _is_pitch_persona(persona_id)
+
+    if is_pitch:
+        formality = random.choice(_PITCH_FORMALITY_LEVELS)
+        length = random.choice(_PITCH_LENGTH_HINTS)
+        approach = random.choice(_PITCH_APPROACH_HINTS)
+        system_prompt_name = "outbound_first_message_pitch.system.txt"
+        user_prompt_name = "outbound_first_message_pitch.user.txt"
+    else:
+        formality = random.choice(_FORMALITY_LEVELS)
+        length = random.choice(_LENGTH_HINTS)
+        approach = random.choice(_APPROACH_HINTS)
+        system_prompt_name = "outbound_first_message.system.txt"
+        user_prompt_name = "outbound_first_message.user.txt"
 
     try:
         # Lazy import чтобы не плодить циклические зависимости.
         from llm_classifier import _load_prompt
 
-        system_message = _load_prompt("outbound_first_message.system.txt")
-        user_prompt = _load_prompt("outbound_first_message.user.txt").format(
+        system_message = _load_prompt(system_prompt_name)
+        # Pitch-prompt не использует area/price/description (B2B-питч не
+        # завязан на детали объявления), но передаём их форматтеру всегда —
+        # шаблон сам решит, какие плейсхолдеры взять.
+        user_prompt = _load_prompt(user_prompt_name).format(
             title=listing.get("title", "—"),
             category=listing.get("category", "коммерческая недвижимость"),
             location=listing.get("location", "—"),
