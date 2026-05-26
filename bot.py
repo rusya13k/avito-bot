@@ -195,6 +195,27 @@ class AdsPowerAPI:
             # вернул не-JSON.
             return False
 
+    def is_profile_running(self, user_id: str) -> bool:
+        """Проверяет, запущен ли профиль в AdsPower прямо сейчас."""
+        try:
+            params = {"user_id": user_id}
+            headers = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            r = requests.get(
+                self._url("/api/v1/browser/active"),
+                params=params,
+                headers=headers,
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json()
+            if data.get("code") != 0:
+                return False
+            return data.get("data", {}).get("status") == "Active"
+        except (requests.RequestException, ValueError):
+            return False
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Selenium helpers
@@ -309,13 +330,13 @@ def load_cookies(driver: webdriver.Chrome, cookies_path: str, domain: str):
 # с прерыванием по stop_event. Реализация в human_delay.py (импортирован выше).
 
 
-def hp(lo=0.5, hi=1.5, *, distribution="normal"):
+def hp(lo=0.5, hi=1.5, *, distribution="normal", stop_event=None):
     """
     Backward-compatible wrapper: старые вызовы hp(lo, hi) теперь идут через
     human_delay c distribution='normal' и поддержкой раннего выхода по
     stop_event (TG /stop).
     """
-    return _human_delay(lo, hi, distribution=distribution, stop_event=_tg.stop_event)
+    return _human_delay(lo, hi, distribution=distribution, stop_event=stop_event)
 
 
 def human_type(
@@ -325,6 +346,7 @@ def human_type(
     *,
     speed_multiplier=1.0,
     enable_typos=True,
+    stop_event=None,
 ):
     """T5: делегируется в human_typing.type_human (бёрсты + опечатки).
 
@@ -343,7 +365,7 @@ def human_type(
         speed_range=speed_range,
         speed_multiplier=speed_multiplier,
         enable_typos=enable_typos,
-        stop_event=_tg.stop_event,
+        stop_event=stop_event,
     )
 
 
@@ -368,7 +390,7 @@ def random_mouse_move(driver):
         pass
 
 
-def move_click(driver, element):
+def move_click(driver, element, stop_event=None):
     """T6: «человеческий» клик через Bezier-движение курсора + jitter.
 
     Раньше: один move_to_element_with_offset (telepport-style move) + click.
@@ -379,10 +401,10 @@ def move_click(driver, element):
     Сохранена сигнатура и семантика «никогда не raise» — все вызовы
     места `move_click(driver, element)` продолжают работать.
     """
-    _human_click(driver, element, stop_event=_tg.stop_event)
+    _human_click(driver, element, stop_event=stop_event)
 
 
-def human_scroll(driver, direction="down", iters=None):
+def human_scroll(driver, direction="down", iters=None, stop_event=None):
     """T9: тонкая обёртка над human_scroll.human_scroll.
 
     Раньше: ровные scrollBy-jump'ы по 150-500px каждый, пауза 0.3-1.1s.
@@ -396,7 +418,7 @@ def human_scroll(driver, direction="down", iters=None):
         driver,
         direction=direction,
         swipes=iters,
-        stop_event=_tg.stop_event,
+        stop_event=stop_event,
     )
 
 
@@ -416,12 +438,12 @@ def slow_scroll_to(driver, element):
 # ── Gallery ──────────────────────────────────────────────────────────────────
 
 
-def scroll_gallery(driver, wait):
+def scroll_gallery(driver, wait, stop_event=None):
     try:
         wait.until(EC.presence_of_element_located((By.XPATH, "//*[@data-marker='image-frame']")))
     except Exception:
         return
-    hp(3, 7)
+    hp(3, 7, stop_event=stop_event)
     # F10: число пролистываний — случайное (1..12) вместо фикс 20. Реальный
     # пользователь часто смотрит первые 1-3 фото и закрывает; иногда листает
     # все. Фиксированные 20 — паттерн.
@@ -437,9 +459,9 @@ def scroll_gallery(driver, wait):
         if not btns or not btns[0].is_displayed():
             break
         # T6: human-like click вместо JS-телепорта.
-        if not _human_click(driver, btns[0], stop_event=_tg.stop_event):
+        if not _human_click(driver, btns[0], stop_event=stop_event):
             break
-        hp(3, 7)
+        hp(3, 7, stop_event=stop_event)
 
 
 # ── View listing ──────────────────────────────────────────────────────────────
@@ -1080,7 +1102,7 @@ def browse_commercial_categories(
         _city_prefix = "/" + random.choice(_cities)
 
     for cat in chosen:
-        url = "https://www.avito.ru" + _city_prefix + cat
+        url = f"https://www.avito.ru{_city_prefix}{cat}?user=1"
         log(account_name, f"  Category: {cat}")
         if not safe_get(driver, url, account_name):
             continue
@@ -1159,7 +1181,7 @@ def find_and_view_commercial_listings(
     min_price = _sf.get("price_min") if _sf.get("price_min") is not None else config["min_price"]
     max_price = _sf.get("price_max")
 
-    url = f"https://www.avito.ru/{city}{category_path}?pmin={min_price}"
+    url = f"https://www.avito.ru/{city}{category_path}?user=1&pmin={min_price}"
     if max_price is not None:
         url += f"&pmax={max_price}"
 
@@ -1185,7 +1207,7 @@ def find_and_view_commercial_listings(
     targets = [(lnk.get_attribute("href"), lnk) for lnk in sampled if lnk.get_attribute("href")]
 
     for i, (href, link_elem) in enumerate(targets, 1):
-        if _tg.stop_event.is_set():
+        if _tg.is_stop_requested(account_name):
             break
         # A3: если внутри предыдущей итерации словили капчу — выходим.
         if account_state.is_cooled_down(account_name):
@@ -1208,7 +1230,9 @@ def find_and_view_commercial_listings(
             use_new_tab = random.random() < 0.30
             opened_in_tab = False
             if use_new_tab:
-                with _new_tab_for_listing(driver, link_elem, stop_event=_tg.stop_event) as ok:
+                with _new_tab_for_listing(
+                    driver, link_elem, stop_event=_tg.get_account_stop_event(account_name)
+                ) as ok:
                     if ok:
                         opened_in_tab = True
                         log(account_name, "  T11: открыли в новой вкладке (Ctrl+Click)")
@@ -1353,7 +1377,7 @@ def perform_login(driver, wait, account_name, phone, password):
             EC.presence_of_element_located((By.XPATH, "//input[@name='login']"))
         )
         # T6: human-like focus вместо «click без mousemove».
-        _human_click(driver, phone_input, stop_event=_tg.stop_event)
+        _human_click(driver, phone_input, stop_event=_tg.get_account_stop_event(account_name))
         hp(0.8, 1.5)
 
         phone_input.send_keys(Keys.CONTROL + "a")
@@ -1419,7 +1443,7 @@ def perform_login(driver, wait, account_name, phone, password):
 
         log(account_name, "  Entering password (slow mode)...")
         # T6: human-like focus вместо «click без mousemove».
-        _human_click(driver, password_input, stop_event=_tg.stop_event)
+        _human_click(driver, password_input, stop_event=_tg.get_account_stop_event(account_name))
         hp(0.8, 1.5)
         # Пароль вводят чуть медленнее обычного текста (~100-350ms/char).
         # T5: enable_typos=False — для пароля лишний BACKSPACE рискован
@@ -1617,6 +1641,8 @@ def _apply_account_proxy_with_probe(
         max_attempts=max_attempts,
         scheme=scheme,
         log_prefix=f"[{account_name}] A1: ",
+        cache_get=account_state.get_cached_probe,
+        cache_set=account_state.set_cached_probe,
     )
 
     if chosen is None:
@@ -1627,6 +1653,9 @@ def _apply_account_proxy_with_probe(
             account_name,
             min(max_attempts, len(candidates)),
             last_err,
+        )
+        _tg._send_message(
+            f"⚠️ Для аккаунта {account_name} не найден рабочий прокси. Проверьте proxies.txt."
         )
         return None
 
@@ -1870,6 +1899,8 @@ def _pick_rotation_proxy(cfg: dict | None, exclude: set[str] | None = None) -> s
             max_attempts=int(cfg.get("proxy_max_probe_attempts", 5)),
             scheme=cfg.get("proxy_probe_scheme", "socks5h"),
             log_prefix="rotation: ",
+            cache_get=account_state.get_cached_probe,
+            cache_set=account_state.set_cached_probe,
         )
         return chosen
 
@@ -1890,16 +1921,50 @@ def _connect_with_retry(
     probe (default через `cfg`) ротация выбирает заведомо живой прокси
     через `pick_healthy_proxy`, а не случайный мёртвый из pool.
 
+    Если профиль уже запущен — пробуем stop + poll и повторяем start.
     Возвращает (driver, wait) при успехе, либо None если все попытки
     исчерпаны (вызывающий должен сделать early return).
     """
     max_retries = 2
     tried_proxies: set[str] = set()
     for attempt in range(max_retries + 1):
+        if _tg.is_stop_requested(account_name):
+            return None
         try:
             log(account_name, f"Starting profile (Attempt {attempt + 1})...")
             debug_port = adspower.start_profile(user_id)
-            time.sleep(5)
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "already running" in msg or "already run" in msg:
+                log(account_name, "Profile already running — stopping and retrying...")
+                adspower.stop_profile(user_id)
+                for _ in range(10):
+                    if _tg.is_stop_requested(account_name):
+                        return None
+                    time.sleep(1)
+                    if not adspower.is_profile_running(user_id):
+                        break
+                else:
+                    _bot_logger.warning(
+                        "[%s] Profile still running after stop, waiting another 5s...",
+                        account_name,
+                    )
+                    time.sleep(5)
+                if attempt < max_retries:
+                    continue
+            return None
+        except Exception as e:
+            log(account_name, f"start_profile failed: {e}")
+            return None
+
+        # polling sleep с проверкой stop_event (5 раз по 1с)
+        for _ in range(5):
+            if _tg.is_stop_requested(account_name):
+                adspower.stop_profile(user_id)
+                return None
+            time.sleep(1)
+
+        try:
             driver = connect_to_sphere(debug_port)
             wait = WebDriverWait(driver, 15)
 
@@ -1988,6 +2053,18 @@ def _build_avito_client(driver, wait, account: dict, cfg: dict, db_manager: Data
     if persona:
         messenger_cfg["persona"] = persona
 
+    # H1: per-account outbound config (max_per_cycle, listing_min_age_hours, etc.)
+    outbound_cfg = {}
+    for key in (
+        "outbound_max_per_cycle",
+        "outbound_listing_min_age_hours",
+        "outbound_between_messages_min_sec",
+        "outbound_between_messages_max_sec",
+    ):
+        val = account.get(key)
+        if val is not None:
+            outbound_cfg[key] = val
+
     return AvitoClient(
         driver,
         wait,
@@ -2002,6 +2079,7 @@ def _build_avito_client(driver, wait, account: dict, cfg: dict, db_manager: Data
         max_categories_per_browse=max_cats,
         max_listings_per_browse=max_browse_listings,
         messenger_config=messenger_cfg or None,
+        outbound_config=outbound_cfg or None,
     )
 
 
@@ -2025,7 +2103,7 @@ def _sleep_until_tomorrow(account: dict, cfg: dict, account_name: str) -> None:
         f"F7: сегодня dead-day — спим {wait_secs / 3600:.1f} ч до завтра {start_hour:02d}:00.",
     )
     slept = 0.0
-    while slept < wait_secs and not _tg.stop_event.is_set():
+    while slept < wait_secs and not _tg.get_account_stop_event(account_name).is_set():
         chunk = min(60.0, wait_secs - slept)
         time.sleep(chunk)
         slept += chunk
@@ -2034,7 +2112,7 @@ def _sleep_until_tomorrow(account: dict, cfg: dict, account_name: str) -> None:
 def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) -> None:
     """Основной цикл: F7 dead-day → F6 prob → F8 cycle dispatch → A4 пауза.
 
-    Гоняем пока не выставлен _tg.stop_event. Каждый «цикл» — это либо
+    Гоняем пока не выставлен _tg.get_account_stop_event(account_name). Каждый «цикл» — это либо
     один из 4-х F8-вариантов (full/messenger_only/browse_only/profile_check),
     либо пропуск (F7 dead-day / F6 неудачный бросок). После каждого цикла
     — A4 пауза 30-90 мин (per-account overridable через session_pause_*).
@@ -2042,7 +2120,11 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
     pause_min = float(account.get("session_pause_min", cfg.get("session_pause_min", 30)))
     pause_max = float(account.get("session_pause_max", cfg.get("session_pause_max", 90)))
 
-    while not _tg.stop_event.is_set():
+    while not _tg.is_stop_requested():
+        # Per-account stop event — проверяем чаще для быстрого выхода
+        if _tg.is_stop_requested(account_name):
+            break
+
         # ── F7: dead-day — пропускаем сегодняшний день целиком ─────────
         if account_state.is_dead_day(account_name):
             _sleep_until_tomorrow(account, cfg, account_name)
@@ -2067,7 +2149,7 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
             _human_delay(
                 sleep_min * 60,
                 sleep_min * 60,
-                stop_event=_tg.stop_event,
+                stop_event=_tg.get_account_stop_event(account_name),
                 distribution="uniform",
             )
             continue
@@ -2095,25 +2177,20 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
         log(account_name, f"F8: cycle kind = {kind}")
 
         if kind == "full":
-            log(account_name, "  Ready to work. Selecting categories...")
-            hp(4, 10)
-            client.browse_commercial_categories()
-            if _tg.stop_event.is_set():
-                break
-
+            # J4: skip redundant browse — find_and_view already does category + city search
             processed, new_listings, errors = client.find_and_view_commercial_listings()
             log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
-            if _tg.stop_event.is_set():
+            if _tg.is_stop_requested(account_name):
                 break
 
             client.process_messages()
-            if _tg.stop_event.is_set():
+            if _tg.is_stop_requested(account_name):
                 break
 
         elif kind == "messenger_only":
             # F8: только мессенджер. Имитирует «зашёл с пуша/прочитать».
             client.process_messages()
-            if _tg.stop_event.is_set():
+            if _tg.is_stop_requested(account_name):
                 break
 
         elif kind == "browse_only":
@@ -2121,18 +2198,18 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
             log(account_name, "  Browse-only cycle...")
             hp(4, 10)
             client.browse_commercial_categories()
-            if _tg.stop_event.is_set():
+            if _tg.is_stop_requested(account_name):
                 break
 
             processed, new_listings, errors = client.find_and_view_commercial_listings()
             log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
-            if _tg.stop_event.is_set():
+            if _tg.is_stop_requested(account_name):
                 break
 
         elif kind == "profile_check":
             # F8: «зашёл просто посмотреть свой профиль». Без LLM/сообщений.
             _do_profile_check(driver, account_name)
-            if _tg.stop_event.is_set():
+            if _tg.is_stop_requested(account_name):
                 break
 
         elif kind == "outbound_only":
@@ -2142,7 +2219,7 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
             # per-account через accounts.json. В warmup outbound_only
             # никогда не выпадает (вес 0 в _CYCLE_KINDS_WARMUP).
             client.run_outbound_cycle(account=account)
-            if _tg.stop_event.is_set():
+            if _tg.is_stop_requested(account_name):
                 break
 
         # ── A4 + T19: Session pause ─────────────────────────────────────
@@ -2176,7 +2253,12 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
                 f"Цикл завершён. Следующий запуск в ~{next_time} "
                 f"(пауза {pause_secs / 60:.0f} мин).",
             )
-        _human_delay(pause_secs, pause_secs, stop_event=_tg.stop_event, distribution="uniform")
+        _human_delay(
+            pause_secs,
+            pause_secs,
+            stop_event=_tg.get_account_stop_event(account_name),
+            distribution="uniform",
+        )
 
 
 def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: DatabaseManager):
@@ -2187,6 +2269,11 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
     account_name = account["name"]
     user_id = account.get("user_id")
     driver = None
+
+    # Guard: user_id (adspower_id) обязателен
+    if not user_id:
+        _bot_logger.error("No adspower_id for account %s", account_name)
+        return
 
     # ── Pre-cycle setup ───────────────────────────────────────────────────
     _apply_per_account_overrides(account)
@@ -2211,17 +2298,23 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
         # ── Build AvitoClient (G1 фасад над selenium-flow) ──────────────
         client = _build_avito_client(driver, wait, account, cfg, db_manager)
 
-        # ── Stage 0: Yandex warmup ──────────────────────────────────────
-        # Warmup — это «прогрев» истории браузера через нейтральный сайт
-        # (антифингерпринт), а не критическая часть пайплайна. Если он
-        # упал из-за капчи Yandex или их изменения DOM — это плохо для
-        # behavioral camouflage, но НЕ должно убивать аккаунт. Логируем
-        # warning и едем дальше: цель — Avito, не Yandex.
-        if not client.warmup_yandex(num_queries=2):
+        # ── Stage 0: Multi-site Warmup ──────────────────────────────────────
+        # T12: Используем усиленный multi-site прогрев (behavioral camouflage)
+        # вместо одиночного Yandex. Yandex поиск по-прежнему может вызываться
+        # внутри (если with_yandex_search=True), но при капче он не убьёт
+        # весь прогрев, а просто будет пропущен, перейдя к другим сайтам.
+        from warmup import big_warmup
+
+        warmup_sites = account.get("warmup_sites", cfg.get("warmup_sites", 3))
+        warmup_stats = big_warmup(
+            driver, account_name=account_name, num_sites=warmup_sites, with_yandex_search=True
+        )
+
+        if not warmup_stats or not warmup_stats.get("ok"):
             log(
                 account_name,
-                "WARN: Warmup failed (Yandex captcha/selectors). "
-                "Продолжаю без прогрева — fingerprint слабее обычного.",
+                f"WARN: Warmup warning/failure. Visited: {warmup_stats.get('sites_visited', 0)}. "
+                "Продолжаю с ослабленным fingerprint.",
             )
 
         # ── Stage 1: Login (B4 native → cookies → manual phone/password) ──
@@ -2233,7 +2326,7 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
         ):
             return
 
-        if _tg.stop_event.is_set():
+        if _tg.is_stop_requested(account_name):
             return
 
         # ── Main loop (F7/F6/F8 + A4 пауза) ─────────────────────────────
@@ -2421,13 +2514,46 @@ def _launch_commercial_bot_threads(cfg=None):
         _tg.add_log("Нет включённых аккаунтов для запуска (G2: проверь accounts.json).")
         return
 
-    adspower = AdsPowerAPI(cfg["adspower_api_url"], cfg.get("adspower_api_key"))
+    # Pre-flight ping: проверяем что AdsPower API доступен ДО создания потоков
+    adspower_url = cfg.get("adspower_api_url", "")
+    try:
+        requests.get(adspower_url.rstrip("/") + "/status", timeout=5)
+    except requests.RequestException:
+        msg = f"❌ AdsPower API недоступен по {adspower_url}. Запустите AdsPower и повторите."
+        _bot_logger.error(msg)
+        _tg._send_message(msg)
+        return
+
+    adspower = AdsPowerAPI(adspower_url, cfg.get("adspower_api_key"))
     db_manager = DatabaseManager()
 
     threads = []
+
+    # Pre-launch cleanup: Ensure all profiles are stopped before starting
+    _bot_logger.info("Performing pre-launch cleanup of AdsPower profiles...")
+    for acc in accounts:
+        user_id = acc.get("adspower_id")
+        if user_id:
+            try:
+                adspower.stop_profile(user_id)
+            except Exception as e:
+                _bot_logger.warning("Cleanup failed for profile %s: %s", user_id, e)
+            # Ждём фактической остановки профиля до 10 секунд
+            for _attempt in range(10):
+                if not adspower.is_profile_running(user_id):
+                    break
+                time.sleep(1)
+            else:
+                _bot_logger.warning(
+                    "Profile %s still running after stop — continuing anyway", user_id
+                )
+
     for acc in accounts:
         t = threading.Thread(
-            target=run_thread, args=(acc, cfg, adspower, db_manager), name=acc["name"], daemon=True
+            target=run_thread,
+            args=(acc, cfg, adspower, db_manager),
+            name="acc-" + acc["name"],
+            daemon=True,
         )
         threads.append(t)
         _tg.active_threads.append(t)
