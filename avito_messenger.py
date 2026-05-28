@@ -20,9 +20,9 @@ from llm_sanitizer import sanitize_llm_reply
 logger = logging.getLogger(__name__)
 
 
-def _stopping() -> bool:
+def _stopping(account_name: str) -> bool:
     """Was a global stop requested via the Telegram controller?"""
-    return _tg.stop_event.is_set()
+    return _tg.is_stop_requested(account_name)
 
 
 def _wf(driver, xpath, timeout=3):
@@ -39,34 +39,23 @@ def _wf(driver, xpath, timeout=3):
 # Реализация в human_delay.py (импортирован выше).
 
 
-def hp(lo=0.5, hi=1.5, *, distribution="normal"):
+def hp(lo=0.5, hi=1.5, *, distribution="normal", stop_event=None):
     """
     Backward-compatible wrapper: старые `hp(lo, hi)` теперь идут через
     human_delay с распределением normal и проверкой stop_event.
     """
-    return _human_delay(lo, hi, distribution=distribution, stop_event=_tg.stop_event)
+    return _human_delay(lo, hi, distribution=distribution, stop_event=stop_event)
 
 
-# B3: устойчивая идентификация визитёра (раньше visitor_id = visitor_name —
-# два визитёра с одинаковыми ФИО склеивались в один диалог).
-
-# Регексп выдёргивает ID канала/диалога из URL вида:
-#   /profile/messenger/channel/abc123def
-#   /profile/messenger/?channelId=abc123
-#   /profile/messenger/<channel_id>?...
 _AVITO_CHANNEL_RE = re.compile(r"/messenger/(?:channel/|c\d*/?|\?channelId=)?([A-Za-z0-9._-]{6,})")
 
 
 def _extract_avito_user_uid_from_dom(dialog_el):
     """
     Пытается достать стабильный user-id визитёра из элемента диалога.
-    Avito может использовать разные атрибуты — пробуем по очереди.
-
-    Returns: str ID или None.
     """
     if dialog_el is None:
         return None
-    # 1) data-* атрибуты на самом dialog-элементе
     for attr in ("data-uid", "data-user-id", "data-uid-from", "data-channel-id"):
         try:
             val = dialog_el.get_attribute(attr)
@@ -74,25 +63,21 @@ def _extract_avito_user_uid_from_dom(dialog_el):
                 return val.strip()
         except Exception:
             continue
-    # 2) Ссылка на профиль внутри карточки
     try:
         link = dialog_el.find_element(
             By.XPATH, ".//a[contains(@href, '/user/') or contains(@href, '/brands/')]"
         )
         href = link.get_attribute("href") or ""
-        # /user/<uid>/profile -> uid
         m = re.search(r"/user/([^/?]+)", href)
         if m:
             return f"user:{m.group(1)}"
     except Exception:
         pass
-    # 3) Аватар (src часто содержит стабильный хэш user-id)
     try:
         avatar = dialog_el.find_element(
             By.XPATH, ".//img[contains(@src, 'avito.st') or contains(@src, 'avatar')]"
         )
         src = avatar.get_attribute("src") or ""
-        # хэшируем src — он стабилен на сервере, но длинный
         if src:
             return f"avatar:{hashlib.sha1(src.encode('utf-8')).hexdigest()[:16]}"
     except Exception:
@@ -101,7 +86,6 @@ def _extract_avito_user_uid_from_dom(dialog_el):
 
 
 def _extract_channel_id_from_driver(driver):
-    """Берёт channel_id из текущего URL открытого чата, если он есть."""
     try:
         url = driver.current_url or ""
     except Exception:
@@ -113,19 +97,6 @@ def _extract_channel_id_from_driver(driver):
 
 
 def build_visitor_id(*, dom_uid=None, channel_id=None, visitor_name=None, listing_id=None) -> str:
-    """
-    Возвращает устойчивый visitor_id (B3).
-
-    Приоритет:
-        1) channel_id (стабильный со стороны Avito)
-        2) dom_uid (data-uid / user-href / avatar-hash)
-        3) composite: visitor_name + listing_id (slabый fallback, но лучше
-           чем чистое имя — два визитёра с одним ФИО, но по разным листингам
-           уже не склеятся).
-        4) visitor_name только как последняя соломинка.
-
-    Никогда не возвращает None — всегда строка (для UNIQUE-индексов в БД).
-    """
     if channel_id:
         return channel_id
     if dom_uid:
@@ -137,7 +108,7 @@ def build_visitor_id(*, dom_uid=None, channel_id=None, visitor_name=None, listin
     return "unknown"
 
 
-def human_type(element, text, *, speed_multiplier: float = 1.0) -> bool:
+def human_type(element, text, *, speed_multiplier: float = 1.0, stop_event=None) -> bool:
     """T5: реалистичный typing с бёрстами + опечатками (через human_typing).
 
     Сохраняет старый bool-контракт: True = допечатало, False = прервано stop_event.
@@ -151,7 +122,7 @@ def human_type(element, text, *, speed_multiplier: float = 1.0) -> bool:
         speed_range=(0.05, 0.20),
         speed_multiplier=speed_multiplier,
         enable_typos=True,
-        stop_event=_tg.stop_event,
+        stop_event=stop_event,
     )
 
 
@@ -222,12 +193,30 @@ class AvitoMessenger:
 
     def process_messages(self, log_func):
         """Main entry point for processing new messages"""
-        if _stopping():
+        if _stopping(self.account_name):
             return
         log_func(self.account_name, "Checking Avito messages...")
         try:
-            self.driver.get("https://www.avito.ru/profile/messenger")
-            hp(3, 5)
+            # J2: avoid full reload if already on messenger page
+            current_url = ""
+            try:
+                current_url = (self.driver.current_url or "").lower()
+            except Exception:
+                pass
+
+            if "/profile/messenger" not in current_url:
+                self.driver.get("https://www.avito.ru/profile/messenger")
+            else:
+                # Already on messenger — soft refresh: click reload or press F5
+                log_func(self.account_name, "  J2: already on messenger, soft refresh")
+                try:
+                    from selenium.webdriver.common.keys import Keys
+
+                    self.driver.find_element(By.TAG_NAME, "body").send_keys(Keys.F5)
+                except Exception:
+                    # Fallback: small JS reload
+                    self.driver.execute_script("window.location.reload()")
+                hp(1, 3, stop_event=_tg.get_account_stop_event(self.account_name))
 
             # Wait for dialogs to load
             try:
@@ -252,7 +241,7 @@ class AvitoMessenger:
             log_func(self.account_name, f"F11: planning to process {n_dialogs} dialog(s).")
 
             for i in range(n_dialogs):
-                if _stopping():
+                if _stopping(self.account_name):
                     log_func(self.account_name, "Stop requested — aborting messenger loop.")
                     return
                 # Re-find dialogs as the page might refresh
@@ -305,8 +294,10 @@ class AvitoMessenger:
                 )
 
                 # T6: human-like click по карточке диалога вместо JS-телепорта.
-                _human_click(self.driver, dialog, stop_event=_tg.stop_event)
-                hp(2, 4)
+                _human_click(
+                    self.driver, dialog, stop_event=_tg.get_account_stop_event(self.account_name)
+                )
+                hp(2, 4, stop_event=_tg.get_account_stop_event(self.account_name))
 
                 # После клика URL может содержать channel_id — это самый
                 # стабильный идентификатор, поэтому собираем visitor_id
@@ -325,7 +316,7 @@ class AvitoMessenger:
 
     def _handle_current_chat(self, visitor_name, log_func, dom_uid=None):
         """Processes the currently opened chat window"""
-        if _stopping():
+        if _stopping(self.account_name):
             return
         try:
             # Try to identify the listing this chat is about
@@ -410,7 +401,7 @@ class AvitoMessenger:
             )
 
             # Re-check stop before any outgoing action.
-            if _stopping():
+            if _stopping(self.account_name):
                 return
 
             # Check if the last message is from the visitor
@@ -434,7 +425,8 @@ class AvitoMessenger:
                     "title": listing_title,
                     "price": listing_price,
                     "description": listing_description,
-                    "visitor_name": visitor_name,
+                    "dialog_id": dialog_id,  # J1: для LLM-кэша
+                    "persona": self.persona,  # J1: для LLM-кэша
                 }
 
                 response_text = self.llm.generate_response(context, chat_history)
@@ -446,7 +438,7 @@ class AvitoMessenger:
                 # Avito — этот цикл пропустим, на следующем проходе LLM
                 # с большой вероятностью даст безопасный ответ.
                 clean_text, block_reason = sanitize_llm_reply(response_text)
-                if block_reason is not None:
+                if clean_text is None:
                     logger.warning(
                         "[%s] LLM response blocked (reason=%s, len=%d): %r",
                         self.account_name,
@@ -468,7 +460,7 @@ class AvitoMessenger:
                 response_text = clean_text  # очищенный (стрипнутый) текст
                 log_func(self.account_name, f"Generated response: {response_text}")
 
-                if _stopping():
+                if _stopping(self.account_name):
                     log_func(self.account_name, "Stop requested before send — skipping.")
                     return
 
@@ -600,7 +592,9 @@ class AvitoMessenger:
                 )
             )
             # T6: human-like focus вместо одиночного click без mousemove.
-            _human_click(self.driver, input_box, stop_event=_tg.stop_event)
+            _human_click(
+                self.driver, input_box, stop_event=_tg.get_account_stop_event(self.account_name)
+            )
             hp(0.5, 1)
             # T5: persona-driven typing speed (молодой быстрее, инвестор медленнее).
             if not human_type(input_box, text, speed_multiplier=self.typing_speed_multiplier):
@@ -614,7 +608,9 @@ class AvitoMessenger:
             # C5: кнопка send иногда отрендерена не сразу после ввода текста.
             send_btn = _wf(self.driver, "//*[@data-marker='messenger/send-button']", timeout=3)
             # T6: human-like click по Send.
-            _human_click(self.driver, send_btn, stop_event=_tg.stop_event)
+            _human_click(
+                self.driver, send_btn, stop_event=_tg.get_account_stop_event(self.account_name)
+            )
             hp(1, 2)
             return True
         except Exception as e:

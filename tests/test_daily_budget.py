@@ -166,6 +166,55 @@ def test_avito_client_listings_proceeds_if_within_budget():
     mock_fn.assert_called_once()
 
 
+def test_avito_client_browse_budget_guard():
+    """F12: browse_commercial_categories не открывает browse при исчерпанном listings-бюджете."""
+    from avito_client import AvitoClient
+
+    driver = MagicMock()
+    wait = MagicMock()
+    db = MagicMock()
+    log = MagicMock()
+
+    client = AvitoClient(driver, wait, "acc1", log_func=log, db_manager=db)
+
+    with (
+        patch("account_state.account_state") as mock_state,
+        patch("bot.browse_commercial_categories") as mock_fn,
+    ):
+        mock_state.check_daily_budget.return_value = False
+        result = client.browse_commercial_categories()
+
+    assert result is None
+    mock_state.check_daily_budget.assert_called_once_with("acc1", "listings", db)
+    mock_fn.assert_not_called()
+    log.assert_called_once()
+
+
+def test_avito_client_browse_proceeds_if_within_budget():
+    """F12: если listings-бюджет доступен — browse делегирует в bot.browse_commercial_categories."""
+    from avito_client import AvitoClient
+
+    driver = MagicMock()
+    wait = MagicMock()
+    db = MagicMock()
+
+    client = AvitoClient(driver, wait, "acc1", db_manager=db)
+
+    with (
+        patch("account_state.account_state") as mock_state,
+        patch("bot.browse_commercial_categories", return_value="ok") as mock_fn,
+    ):
+        mock_state.check_daily_budget.return_value = True
+        result = client.browse_commercial_categories(num_categories=1, ads_per_category=1)
+
+    assert result == "ok"
+    mock_state.check_daily_budget.assert_called_once_with("acc1", "listings", db)
+    mock_fn.assert_called_once()
+    assert mock_fn.call_args.args[:3] == (driver, wait, "acc1")
+    assert mock_fn.call_args.kwargs["num_categories"] == 1
+    assert mock_fn.call_args.kwargs["ads_per_category"] == 1
+
+
 def test_avito_client_messages_budget_guard():
     """A2: process_messages возвращает без работы при исчерпанном бюджете."""
     from avito_client import AvitoClient

@@ -141,6 +141,29 @@ def test_on_callback_blocks_when_not_allowed(tg_ctrl, monkeypatch):
     tg_ctrl.bot.answer_callback_query.assert_called_with("call-id", "Нет доступа.")
 
 
+def test_cb_run_clears_per_account_stop_events(tg_ctrl, monkeypatch):
+    """При нажатии ▶️ Запустить все per-account stop events очищаются."""
+    import tg_bot as _tg_mod
+
+    # Симулируем что какой-то аккаунт был остановлен
+    ev1 = _tg_mod.get_account_stop_event("acc1")
+    ev1.set()
+    ev2 = _tg_mod.get_account_stop_event("acc2")
+    ev2.set()
+
+    assert ev1.is_set()
+    assert ev2.is_set()
+
+    # Мокаем _run_callback и is_running чтобы _cb_run дошёл до очистки
+    tg_ctrl._run_callback = lambda: None
+    monkeypatch.setattr("tg_bot.is_running", lambda: False)
+
+    tg_ctrl._cb_run(_make_call(callback_data="run"))
+
+    assert not ev1.is_set()
+    assert not ev2.is_set()
+
+
 def test_on_callback_dispatches_exact_match(tg_ctrl, monkeypatch):
     """Exact match callback_data → вызывается соответствующий _cb_X."""
     called = []

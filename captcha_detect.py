@@ -235,7 +235,7 @@ def detect_sms_form(driver, log_func=None, account_name: str = "") -> bool:
 
 def _matches_sms_text(driver) -> str | None:
     try:
-        src = driver.page_source or ""
+        src = driver.execute_script("return document.body.innerText;") or ""
     except WebDriverException:
         return None
     for pattern in _SMS_TEXT_PATTERNS:

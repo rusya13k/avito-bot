@@ -88,16 +88,14 @@ def sanitize_llm_reply(text: str | None) -> tuple[str | None, str | None]:
 
     Returns:
         (clean_text, None)  — ответ безопасен, отправляем как есть.
-        (None, reason)      — обнаружен опасный паттерн, отказ.
+        (clean_text, reason) — обнаружен опасный паттерн, он был вырезан (заменён на [контакт скрыт]).
+        (None, reason)      — ответ отбраковывается полностью (пустой / слишком короткий / длинный).
 
     Возможные значения reason:
         "empty"          — None / пустая строка / только whitespace
         "too_short"      — длина < MIN_LEN
         "too_long"       — длина > MAX_LEN
-        "phone"          — найден телефонный номер
-        "messenger_url"  — найден URL мессенджера/соцсети
-        "tg_handle"      — найден @username
-        "email"          — найден email
+        "phone_redacted", "messenger_redacted", "tg_handle_redacted", "email_redacted" — вырезаны контакты
     """
     if text is None:
         return None, "empty"
@@ -110,15 +108,25 @@ def sanitize_llm_reply(text: str | None) -> tuple[str | None, str | None]:
     if len(stripped) > MAX_LEN:
         return None, "too_long"
 
-    # Проверки в порядке от наиболее частых к редким — но логически порядок
-    # неважен, мы возвращаемся сразу при первом срабатывании.
-    if _PHONE_RE.search(stripped):
-        return None, "phone"
-    if _MESSENGER_URL_RE.search(stripped):
-        return None, "messenger_url"
-    if _TG_HANDLE_RE.search(stripped):
-        return None, "tg_handle"
-    if _EMAIL_RE.search(stripped):
-        return None, "email"
+    # Заменяем опасные паттерны
+    reasons = []
 
-    return stripped, None
+    if _PHONE_RE.search(stripped):
+        stripped = _PHONE_RE.sub("[контакт скрыт]", stripped)
+        reasons.append("phone_redacted")
+
+    if _MESSENGER_URL_RE.search(stripped):
+        stripped = _MESSENGER_URL_RE.sub("[контакт скрыт]", stripped)
+        reasons.append("messenger_redacted")
+
+    if _TG_HANDLE_RE.search(stripped):
+        stripped = _TG_HANDLE_RE.sub("[контакт скрыт]", stripped)
+        reasons.append("tg_handle_redacted")
+
+    if _EMAIL_RE.search(stripped):
+        stripped = _EMAIL_RE.sub("[контакт скрыт]", stripped)
+        reasons.append("email_redacted")
+
+    reason = "_and_".join(reasons) if reasons else None
+
+    return stripped, reason

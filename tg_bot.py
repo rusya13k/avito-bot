@@ -23,18 +23,61 @@ logger = logging.getLogger(__name__)
 # Общее состояние (разделяется с bot.py)
 # ══════════════════════════════════════════════════════════════════════════════
 
-log_buffer: deque = deque(maxlen=200)
-active_threads: list = []
+# Global event for shutting down the entire bot
 stop_event = threading.Event()
+# Per-account stop events: account_name -> threading.Event
+account_stop_events: dict[str, threading.Event] = {}
+
+# Per-account log buffers: account_name -> deque
+account_log_buffers: dict[str, deque] = {}
+# Global log buffer for system messages
+log_buffer: deque = deque(maxlen=200)
+
+active_threads: list = []
 _tg_controller = None  # устанавливается в main() из bot.py
 
 
-def add_log(line: str):
+def get_account_stop_event(account_name: str) -> threading.Event:
+    if account_name not in account_stop_events:
+        account_stop_events[account_name] = threading.Event()
+    return account_stop_events[account_name]
+
+
+def clear_account_stop_event(account_name: str) -> None:
+    """Явно сбрасывает per-account stop event (используется при TG /start)."""
+    ev = account_stop_events.get(account_name)
+    if ev is not None:
+        ev.clear()
+
+
+def is_stop_requested(account_name: str | None = None) -> bool:
+    if stop_event.is_set():
+        return True
+    if account_name and get_account_stop_event(account_name).is_set():
+        return True
+    return False
+
+
+def add_log(line: str, account_name: str | None = None):
     log_buffer.append(line)
+    if account_name:
+        if account_name not in account_log_buffers:
+            account_log_buffers[account_name] = deque(maxlen=200)
+        account_log_buffers[account_name].append(line)
 
 
 def is_running() -> bool:
     return any(t.is_alive() for t in active_threads)
+
+
+def _send_message(text: str) -> None:
+    """Отправляет сообщение админу через TG-контроллер (если настроен)."""
+    ctrl = _tg_controller
+    if ctrl is not None and getattr(ctrl, "admin_id", 0):
+        try:
+            ctrl.bot.send_message(ctrl.admin_id, text)
+        except Exception:
+            pass
 
 
 def send_user_action_request(account_name: str, request_id: str, prompt: str) -> bool:
@@ -122,6 +165,7 @@ def kb_account_detail(idx: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🆔 Изменить AdsPower ID", callback_data=f"acc_userid_{idx}"),
         # T12: запуск большого прогрева (10 нейтральных сайтов + Yandex).
         InlineKeyboardButton("🔥 Большой прогрев", callback_data=f"acc_bigwarmup_{idx}"),
+        InlineKeyboardButton("🛑 Остановть", callback_data=f"acc_stop_{idx}"),
         InlineKeyboardButton("🗑 Удалить", callback_data=f"acc_del_{idx}"),
         InlineKeyboardButton("◀️ Назад", callback_data="accounts_menu"),
     )
@@ -227,6 +271,7 @@ class TelegramController:
         # T12: набор имён аккаунтов, для которых сейчас крутится фоновый
         # большой прогрев. Защита от двойного запуска.
         self._big_warmup_running: set[str] = set()
+        self._last_msg_time: dict[int, float] = {}
         self._setup()
 
     # ── Утилиты ──────────────────────────────────────────────────────────────
@@ -242,6 +287,11 @@ class TelegramController:
                 pass
 
     def _allowed(self, uid: int) -> bool:
+        import time as _time
+        now = _time.time()
+        if now - self._last_msg_time.get(uid, 0.0) < 0.5:
+            return False
+        self._last_msg_time[uid] = now
         return not self.admin_id or uid == self.admin_id
 
     def _cfg(self) -> dict:
@@ -1111,6 +1161,8 @@ class TelegramController:
             return
         stop_event.clear()
         active_threads.clear()
+        for ev in account_stop_events.values():
+            ev.clear()
         self._send(cid, "Запускаю потоки...")
         threading.Thread(target=self._run_callback, daemon=True, name="tg-runner").start()
         self._show_main(cid, call.message)
@@ -1166,6 +1218,47 @@ class TelegramController:
             pass
 
     def _cb_status(self, call):
+        """Status callback"""
+        cid = call.message.chat.id
+        self._show_accounts(cid, call.message)
+
+        if not active_threads:
+            text = "Потоков нет."
+        else:
+            lines = [
+                f"{'🟢' if t.is_alive() else '🔴'} {t.name}: "
+                f"{'работает' if t.is_alive() else 'завершён'}"
+                for t in active_threads
+            ]
+            text = "\n".join(lines)
+        try:
+            self._send(cid, text, kb_back())
+        except Exception:
+            pass
+
+    def _cb_acc_stop(self, call):
+        """Stop a specific account"""
+        cid = call.message.chat.id
+        idx = int(call.data.replace("acc_stop_", ""))
+
+        # Load cfg here correctly.
+        try:
+            with open(Path(__file__).parent / "config.json", encoding="utf-8") as f:
+                import json
+
+                cfg = json.load(f)
+        except Exception:
+            cfg = {}
+
+        accounts = cfg.get("accounts", [])
+        if 0 <= idx < len(accounts):
+            acc_name = accounts[idx]["name"]
+            get_account_stop_event(acc_name).set()
+            add_log(f"🛑 Stop signal sent for account {acc_name}.", acc_name)
+            self.bot.answer_callback_query(call.id, f"🛑 Останавливаю {acc_name}...")
+            self._send(cid, f"Сигнал остановки отправлен аккаунту {acc_name}.")
+        self._show_accounts(cid, call.message)
+
         if not active_threads:
             text = "Потоков нет."
         else:
@@ -1628,11 +1721,12 @@ class TelegramController:
         prefix_handlers = (
             ("acc_del_ok_", self._cb_acc_del_ok),
             ("acc_del_", self._cb_acc_del_confirm),
+            ("acc_detail_", self._cb_acc_detail),
             # T12: bigwarmup_ok_ должен идти ПЕРЕД bigwarmup_, иначе
             # acc_bigwarmup_ok_5 заматчится как acc_bigwarmup_ с idx="ok".
             ("acc_bigwarmup_ok_", self._cb_acc_bigwarmup_ok),
             ("acc_bigwarmup_", self._cb_acc_bigwarmup_confirm),
-            ("acc_detail_", self._cb_acc_detail),
+            ("acc_stop_", self._cb_acc_stop),
             ("acc_cookies_", self._cb_acc_cookies),
             ("acc_userid_", self._cb_acc_userid),
             ("proxy_del_ok_", self._cb_proxy_del_ok),

@@ -1,0 +1,17 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    container_name: avito_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./:/app
+      # Keep local db and session data mapped
+      - ./bot_data.db:/app/bot_data.db
+      - ./accounts.json:/app/accounts.json
+      - ./cookies.json:/app/cookies.json
+    network_mode: host

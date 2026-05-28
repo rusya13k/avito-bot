@@ -102,8 +102,8 @@ def test_exactly_max_len_passes():
 )
 def test_phone_blocks(phone_variant):
     clean, reason = sanitize_llm_reply(phone_variant)
-    assert clean is None
-    assert reason == "phone"
+    assert "[контакт скрыт]" in clean
+    assert reason == "phone_redacted"
 
 
 def test_address_with_house_number_does_not_trigger_phone():
@@ -121,24 +121,24 @@ def test_address_with_house_number_does_not_trigger_phone():
 @pytest.mark.parametrize(
     "url_variant,expected_reasons",
     [
-        ("Пишите в t.me/seller_realty", ("messenger_url",)),
-        ("Telegram: https://t.me/seller_realty", ("messenger_url",)),
+        ("Пишите в t.me/seller_realty", ("messenger_redacted",)),
+        ("Telegram: https://t.me/seller_realty", ("messenger_redacted",)),
         # wa.me/<digits> может сработать сначала на phone-фильтре — это
         # тоже корректная блокировка.
-        ("https://wa.me/79991234567", ("messenger_url", "phone")),
-        ("Whatsapp: api.whatsapp.com/send?phone=...", ("messenger_url",)),
-        ("Звоните в Viber viber://chat?number=...", ("messenger_url",)),
-        ("Я в ВК: vk.com/id12345", ("messenger_url",)),
-        ("Instagram: instagram.com/seller", ("messenger_url",)),
-        ("tg://resolve?domain=seller", ("messenger_url",)),
+        ("https://wa.me/79991234567", ("messenger_redacted", "phone_redacted")),
+        ("Whatsapp: api.whatsapp.com/send?phone=...", ("messenger_redacted",)),
+        ("Звоните в Viber viber://chat?number=...", ("messenger_redacted",)),
+        ("Я в ВК: vk.com/id12345", ("messenger_redacted",)),
+        ("Instagram: instagram.com/seller", ("messenger_redacted",)),
+        ("tg://resolve?domain=seller", ("messenger_redacted",)),
     ],
 )
 def test_messenger_urls_blocked(url_variant, expected_reasons):
     clean, reason = sanitize_llm_reply(url_variant)
-    assert clean is None
+    assert "[контакт скрыт]" in clean
     # Главное — заблокировано. Какой именно фильтр сработал первым —
     # деталь реализации (порядок проверок в sanitize_llm_reply).
-    assert reason in expected_reasons
+    assert any(exp in reason for exp in expected_reasons)
 
 
 # ── Telegram-style handles ──────────────────────────────────────────
@@ -146,8 +146,8 @@ def test_messenger_urls_blocked(url_variant, expected_reasons):
 
 def test_tg_handle_blocked():
     clean, reason = sanitize_llm_reply("Пишите мне @seller_realty в телеге.")
-    assert clean is None
-    assert reason == "tg_handle"
+    assert "[контакт скрыт]" in clean
+    assert "tg_handle_redacted" in reason
 
 
 def test_short_handle_not_blocked():
@@ -159,14 +159,14 @@ def test_short_handle_not_blocked():
     # Не должен сработать tg_handle, может пройти как safe.
     # Если в будущем добавим detection email и тут что-то ещё — этот тест
     # станет регрессией для tg_handle конкретно.
-    assert reason != "tg_handle"
+    assert reason is None or "tg_handle_redacted" not in reason
 
 
 def test_email_in_text_does_not_match_tg_handle():
     """email содержит @, но домен длиннее 3 символов после точки — это email."""
     clean, reason = sanitize_llm_reply("Пишите на user@example.com")
-    assert clean is None
-    assert reason in ("email", "tg_handle")  # порядок проверок может меняться
+    assert "[контакт скрыт]" in clean
+    assert "email_redacted" in reason  # порядок проверок может меняться
 
 
 # ── Email ───────────────────────────────────────────────────────────
@@ -174,11 +174,11 @@ def test_email_in_text_does_not_match_tg_handle():
 
 def test_email_blocked():
     clean, reason = sanitize_llm_reply("Свяжитесь по почте: realty.seller@gmail.com")
-    assert clean is None
-    assert reason == "email"
+    assert "[контакт скрыт]" in clean
+    assert "email_redacted" in reason
 
 
 def test_email_with_plus_alias_blocked():
     clean, reason = sanitize_llm_reply("Email: agent+spam@yandex.ru")
-    assert clean is None
-    assert reason == "email"
+    assert "[контакт скрыт]" in clean
+    assert "email_redacted" in reason

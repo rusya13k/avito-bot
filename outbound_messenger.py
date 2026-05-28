@@ -48,8 +48,8 @@ from llm_sanitizer import sanitize_llm_reply
 logger = logging.getLogger(__name__)
 
 
-def _stopping() -> bool:
-    return _tg.stop_event.is_set()
+def _stopping(account_name: str) -> bool:
+    return _tg.is_stop_requested(account_name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,67 +61,10 @@ def _stopping() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 PERSONAS: dict[str, str] = {
-    "small_business_office": (
-        "представитель небольшой компании (5-10 человек), ищу офис для команды. "
-        "Бухгалтерия, переговорная, кухня. Бюджет ограничен."
-    ),
-    "retail_starter": (
-        "открываю первый магазин, ищу торговое помещение в проходимом месте. "
-        "Опыта мало, поэтому интересуют детали по трафику и соседям."
-    ),
-    "ecommerce_warehouse": (
-        "веду интернет-магазин, нужен склад под товары. "
-        "Важны удобный въезд для фургонов, сухость, отопление."
-    ),
-    "cafe_owner": (
-        "ищу площадь под кафе/кофейню. Важны вытяжка, мокрые точки, размер помещения, район."
-    ),
-    "clinic_medical": (
-        "ищу помещение под медицинский центр / стоматологию. "
-        "Важны санузлы, водоотведение, лицензируемость."
-    ),
-    "beauty_salon": (
-        "ищу под салон красоты / барбершоп. Важны окна, вытяжка, мокрые точки, проходимость."
-    ),
-    "fitness_studio": (
-        "открываю небольшую студию (йога/растяжка/пилатес). "
-        "Нужен ровный пол, высокие потолки, душевая зона."
-    ),
-    "service_workshop": (
-        "ищу под сервис (мастерская, шиномонтаж, авторемонт). "
-        "Важен заезд для авто, высота ворот, электричество."
-    ),
-    "educational": (
-        "открываю детский центр / курсы. Нужны несколько кабинетов, санузел, безопасный двор."
-    ),
-    "coworking": (
-        "развиваю небольшой коворкинг. Нужен open space, переговорная, скоростной интернет."
-    ),
-    "logistics": (
-        "логистическая компания, ищу склад. Важны площадь, рампа, въезд для длинномера, охрана."
-    ),
-    "it_office": (
-        "IT-команда, ищу офис на 10-15 рабочих мест. Важен интернет, отдельный санузел, тихий этаж."
-    ),
-    "legal_office": (
-        "юридическая практика, ищу офис в центре. Желательно деловой район, парковка для клиентов."
-    ),
-    "retail_chain": (
-        "представитель торговой сети, рассматриваем расширение. "
-        "Важны метраж, трафик, условия расторжения договора."
-    ),
-    "investor": (
-        "инвестор, рассматриваю объект под аренду или перепродажу. "
-        "Нужен потенциал, документы, окупаемость."
-    ),
     "tatarstan_developer": (
         "девелопер из Татарстана, занимаюсь строительством и сдачей небольших торговых центров. "
         "Уже есть 15 готовых арендных бизнесов. Ищу финансовых партнеров для строительства новых объектов. "
         "Средняя окупаемость 6-8 лет. Интересует партнерство, не аренда конкретного объекта."
-    ),
-    "family_business": (
-        "семейный бизнес, ищу небольшое помещение. "
-        "Важны цена, договор на длительный срок, лояльный собственник."
     ),
 }
 
@@ -305,7 +248,7 @@ class OutboundMessenger:
         account: dict | None = None,
         db_manager=None,
         llm_classifier=None,
-        max_per_cycle: int = 2,
+        max_per_cycle: int = 3,
         listing_min_age_hours: float = 1.0,
         between_messages_min_sec: float = 90.0,
         between_messages_max_sec: float = 240.0,
@@ -329,7 +272,7 @@ class OutboundMessenger:
         Возвращает сколько сообщений реально отправлено (0 если budget
         исчерпан, нет кандидатов, или произошли ошибки).
         """
-        if _stopping() or self.db is None:
+        if _stopping(self.account_name) or self.db is None:
             return 0
 
         # Проверяем cooldown (B4) — если аккаунт «остывает» после капч,
@@ -377,7 +320,7 @@ class OutboundMessenger:
 
         sent_count = 0
         for listing in candidates:
-            if sent_count >= n_to_send or _stopping():
+            if sent_count >= n_to_send or _stopping(self.account_name):
                 break
 
             # Между двумя outbound в одном цикле — длинная human-пауза.
@@ -386,7 +329,7 @@ class OutboundMessenger:
                 _human_delay(
                     self.between_messages_min_sec,
                     self.between_messages_max_sec,
-                    stop_event=_tg.stop_event,
+                    stop_event=_tg.get_account_stop_event(self.account_name),
                     distribution="lognormal",
                 )
 
@@ -441,9 +384,11 @@ class OutboundMessenger:
             log_func(self.account_name, f"H1: driver.get({listing_url}) fail: {exc}")
             return False
 
-        _human_delay(3, 7, stop_event=_tg.stop_event, distribution="normal")
+        _human_delay(
+            3, 7, stop_event=_tg.get_account_stop_event(self.account_name), distribution="normal"
+        )
 
-        if _stopping():
+        if _stopping(self.account_name):
             return False
 
         # 3. Pre-click captcha check.
@@ -512,12 +457,14 @@ class OutboundMessenger:
                 btn = WebDriverWait(self.driver, 3).until(
                     EC.element_to_be_clickable((By.XPATH, xpath))
                 )
-                _human_delay(0.5, 1.5, stop_event=_tg.stop_event)
+                _human_delay(0.5, 1.5, stop_event=_tg.get_account_stop_event(self.account_name))
                 # T6: human_click сам делает scrollIntoView + Bezier-движение
                 # курсора + fallback'и (native click → JS click). Это закрывает
                 # старый кейс с ElementClickInterceptedException / sticky-header.
-                _human_click(self.driver, btn, stop_event=_tg.stop_event)
-                _human_delay(2, 4, stop_event=_tg.stop_event)
+                _human_click(
+                    self.driver, btn, stop_event=_tg.get_account_stop_event(self.account_name)
+                )
+                _human_delay(2, 4, stop_event=_tg.get_account_stop_event(self.account_name))
                 return True
             except TimeoutException:
                 continue
@@ -555,8 +502,10 @@ class OutboundMessenger:
             return False
 
         # T6: human-like focus вместо одиночного click без mousemove.
-        _human_click(self.driver, input_el, stop_event=_tg.stop_event)
-        _human_delay(0.4, 1.2, stop_event=_tg.stop_event)
+        _human_click(
+            self.driver, input_el, stop_event=_tg.get_account_stop_event(self.account_name)
+        )
+        _human_delay(0.4, 1.2, stop_event=_tg.get_account_stop_event(self.account_name))
 
         # T5: реалистичный typing — бёрсты + опечатки + persona-driven темп.
         # Раньше: уравномерно 30-90ms/char (антифрод детектил по гистограмме).
@@ -572,7 +521,7 @@ class OutboundMessenger:
                 speed_range=(0.05, 0.20),
                 speed_multiplier=speed_mul,
                 enable_typos=True,
-                stop_event=_tg.stop_event,
+                stop_event=_tg.get_account_stop_event(self.account_name),
             ):
                 return False
         except StaleElementReferenceException:
@@ -582,7 +531,7 @@ class OutboundMessenger:
             log_func(self.account_name, f"H1: ошибка ввода текста: {exc}")
             return False
 
-        _human_delay(1.5, 3.5, stop_event=_tg.stop_event)
+        _human_delay(1.5, 3.5, stop_event=_tg.get_account_stop_event(self.account_name))
 
         # Кнопка Send: data-marker='send-message-button' или icon-кнопка.
         send_xpaths = [
@@ -608,11 +557,13 @@ class OutboundMessenger:
         # T6: human_click сам делает scrollIntoView + Bezier-движение +
         # fallback'и (native click → JS click) — старая обвязка с
         # ElementClickInterceptedException больше не нужна.
-        if not _human_click(self.driver, send_el, stop_event=_tg.stop_event):
+        if not _human_click(
+            self.driver, send_el, stop_event=_tg.get_account_stop_event(self.account_name)
+        ):
             log_func(self.account_name, "H1: не удалось кликнуть Send (все 3 пути упали).")
             return False
 
-        _human_delay(2, 5, stop_event=_tg.stop_event)
+        _human_delay(2, 5, stop_event=_tg.get_account_stop_event(self.account_name))
 
         # Post-send capture-check: иногда Avito подсовывает капчу сразу
         # после первого outbound — это самый детектируемый момент.

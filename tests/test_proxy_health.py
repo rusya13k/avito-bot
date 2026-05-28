@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
@@ -17,13 +17,24 @@ if str(ROOT) not in sys.path:
 
 from proxy_health import (  # noqa: E402
     DEFAULT_PROBE_URL,
+    DEFAULT_PROBE_URLS,
     ProbeResult,
+    _tcp_connect_proxy,
     build_proxy_url,
     parse_proxy,
     pick_healthy_proxy,
     probe_proxy,
     redact_proxy,
 )
+
+
+@pytest.fixture(autouse=True)
+def mock_tcp_for_probe(request, monkeypatch):
+    """TCP pre-check блокирует probe_proxy тесты (фиктивный хост 'h:1080').
+    Мокаем на True для всех тестов, кроме явных тестов TCP pre-check."""
+    if "tcp_pre_check" not in request.node.name and "tcp_connect" not in request.node.name:
+        monkeypatch.setattr("proxy_health._tcp_connect_proxy", lambda *a, **kw: True)
+
 
 # ── parse_proxy ──────────────────────────────────────────────────────────
 
@@ -370,10 +381,12 @@ def test_pick_healthy_proxy_skips_dead_ones():
         _mock_response(200, {"ip": "2.2.2.2"}),
     ]
 
-    proxy, result = pick_healthy_proxy(
-        ["dead:1080", "live:1080"],
-        session=sess,
-    )
+    # dead:1080 падает TCP pre-check, live:1080 проходит
+    with patch("proxy_health._tcp_connect_proxy", side_effect=lambda s, **kw: "live" in s):
+        proxy, result = pick_healthy_proxy(
+            ["dead:1080", "live:1080"],
+            session=sess,
+        )
 
     assert proxy == "live:1080"
     assert result.ok is True
@@ -382,35 +395,35 @@ def test_pick_healthy_proxy_skips_dead_ones():
 
 def test_pick_healthy_proxy_all_fail_returns_none():
     sess = MagicMock()
-    sess.get.side_effect = [
-        requests.Timeout("dead1"),
-        requests.ConnectionError("dead2"),
-    ]
+    sess.get.side_effect = requests.Timeout("dead")
 
-    proxy, result = pick_healthy_proxy(
-        ["d1:1080", "d2:1080"],
-        session=sess,
-    )
+    with patch("proxy_health._tcp_connect_proxy", return_value=True):
+        proxy, result = pick_healthy_proxy(
+            ["d1:1080", "d2:1080"],
+            session=sess,
+        )
 
     assert proxy is None
     assert result is not None
     assert result.ok is False
     # last result — от последней попытки
-    assert result.error and result.error.startswith("connection_error")
+    assert result.error == "timeout"
 
 
 def test_pick_healthy_proxy_respects_max_attempts():
     sess = MagicMock()
     sess.get.side_effect = requests.Timeout("dead")
 
-    proxy, result = pick_healthy_proxy(
-        ["a:1", "b:1", "c:1", "d:1", "e:1"],
-        session=sess,
-        max_attempts=2,
-    )
+    with patch("proxy_health._tcp_connect_proxy", return_value=True):
+        proxy, result = pick_healthy_proxy(
+            ["a:1", "b:1", "c:1", "d:1", "e:1"],
+            session=sess,
+            max_attempts=2,
+        )
 
     assert proxy is None
-    assert sess.get.call_count == 2  # только 2, не 5
+    # 2 прокси × 3 fallback URL = 6 вызовов sess.get
+    assert sess.get.call_count == 6
 
 
 def test_pick_healthy_proxy_empty_candidates():
@@ -433,6 +446,105 @@ def test_pick_healthy_proxy_logs_redacted(caplog):
     assert "supersecret" not in full_log
     assert "alice" not in full_log
     assert "h:1080" in full_log
+
+
+# ── TCP pre-check ────────────────────────────────────────────────────────
+
+
+def test_tcp_connect_proxy_invalid_string():
+    """Невалидная строка — False."""
+    assert _tcp_connect_proxy("not_a_proxy", timeout=1.0) is False
+
+
+def test_tcp_connect_proxy_unreachable_host():
+    """Недостижимый хост — быстрый False (timeout ~1s, не 10s)."""
+    # Мокаем и socks, и socket чтобы покрыть оба пути
+    fake_sock_cls = MagicMock()
+    fake_sock_cls.return_value.connect.side_effect = OSError("refused")
+    with patch.dict("sys.modules", {"socks": MagicMock(socksocket=fake_sock_cls)}):
+        assert _tcp_connect_proxy("192.0.2.0:12345", timeout=1.0) is False
+
+
+def test_tcp_connect_proxy_fallback_socket():
+    """Если pysocks не доступен — fallback на socket.create_connection."""
+    with (
+        patch.dict("sys.modules", {"socks": None}),
+        patch("proxy_health.socket.create_connection", side_effect=OSError("refused")),
+    ):
+        assert _tcp_connect_proxy("192.0.2.0:12345", timeout=1.0) is False
+
+
+# ── probe_proxy: fallback URLs ───────────────────────────────────────────
+
+
+def test_probe_proxy_fallback_urls_first_succeeds():
+    """Первый URL из fallback'ов отвечает — успех."""
+    sess = MagicMock()
+    sess.get.return_value = _mock_response(200, {"ip": "1.1.1.1"})
+
+    result = probe_proxy("h:1080", session=sess)
+
+    assert result.ok is True
+    assert result.ip == "1.1.1.1"
+
+
+def test_probe_proxy_fallback_urls_second_succeeds():
+    """Первый URL timeout'ит, второй отвечает — успех."""
+    sess = MagicMock()
+    sess.get.side_effect = [
+        requests.Timeout("first url dead"),
+        _mock_response(200, {"origin": "2.2.2.2"}),
+    ]
+
+    result = probe_proxy(
+        "h:1080",
+        session=sess,
+        probe_urls=DEFAULT_PROBE_URLS,
+    )
+
+    assert result.ok is True
+    assert result.ip == "2.2.2.2"
+    assert sess.get.call_count == 2
+
+
+def test_probe_proxy_fallback_urls_all_fail():
+    """Все fallback URL не отвечают — ok=False с последней ошибкой."""
+    sess = MagicMock()
+    sess.get.side_effect = requests.Timeout("all dead")
+
+    result = probe_proxy(
+        "h:1080",
+        session=sess,
+        probe_urls=DEFAULT_PROBE_URLS,
+    )
+
+    assert result.ok is False
+    assert result.error == "timeout"
+
+
+def test_probe_proxy_tcp_pre_check_blocks_fast():
+    """TCP pre-check проваливается — возвращаем быструю ошибку, не ждём HTTP."""
+    sess = MagicMock()
+
+    with patch("proxy_health._tcp_connect_proxy", return_value=False):
+        result = probe_proxy("h:1080", session=sess)
+
+    assert result.ok is False
+    assert result.error == "tcp_connect_failed"
+    sess.get.assert_not_called()
+
+
+def test_probe_proxy_tcp_pre_check_passes_then_probes():
+    """TCP pre-check проходит → HTTP-probe выполняется."""
+    sess = MagicMock()
+    sess.get.return_value = _mock_response(200, {"ip": "3.3.3.3"})
+
+    with patch("proxy_health._tcp_connect_proxy", return_value=True):
+        result = probe_proxy("h:1080", session=sess)
+
+    assert result.ok is True
+    assert result.ip == "3.3.3.3"
+    sess.get.assert_called_once()
 
 
 # ── ProbeResult dataclass ────────────────────────────────────────────────

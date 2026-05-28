@@ -88,6 +88,7 @@ class AvitoClient:
         max_categories_per_browse: int = 4,
         max_listings_per_browse: int = 4,
         messenger_config: dict | None = None,
+        outbound_config: dict | None = None,
     ):
         """
         Args:
@@ -119,6 +120,9 @@ class AvitoClient:
                 ignore_new_dialog_chance, persona). Прокидывается через **dict
                 в process_messages → AvitoMessenger.__init__. None / {} —
                 использовать дефолты AvitoMessenger.
+            outbound_config: H1 — kwargs для OutboundMessenger (max_per_cycle,
+                listing_min_age_hours, between_messages_min_sec,
+                between_messages_max_sec). Прокидывается через **dict.
         """
         self.driver = driver
         self.wait = wait
@@ -133,6 +137,7 @@ class AvitoClient:
         self.max_categories_per_browse: int = max_categories_per_browse
         self.max_listings_per_browse: int = max_listings_per_browse
         self.messenger_config: dict = messenger_config or {}
+        self.outbound_config: dict = outbound_config or {}
 
     # ──────────────────────────────────────────────────────────────────────
     # Navigation
@@ -587,10 +592,13 @@ class AvitoClient:
         from outbound_messenger import OutboundMessenger
 
         acc = account or {"name": self.account_name}
-        max_per_cycle = int(acc.get("outbound_max_per_cycle", 2))
-        listing_min_age_hours = float(acc.get("outbound_listing_min_age_hours", 1.0))
-        between_min = float(acc.get("outbound_between_messages_min_sec", 90.0))
-        between_max = float(acc.get("outbound_between_messages_max_sec", 240.0))
+        kwargs = {}
+        if self.outbound_config:
+            for k, v in self.outbound_config.items():
+                if k.startswith("outbound_"):
+                    kwargs[k[9:]] = v
+                else:
+                    kwargs[k] = v
 
         m = OutboundMessenger(
             self.driver,
@@ -599,9 +607,6 @@ class AvitoClient:
             account=acc,
             db_manager=self.db,
             llm_classifier=self.llm,
-            max_per_cycle=max_per_cycle,
-            listing_min_age_hours=listing_min_age_hours,
-            between_messages_min_sec=between_min,
-            between_messages_max_sec=between_max,
+            **kwargs,
         )
         return m.run_one_cycle(self.log)

@@ -88,6 +88,11 @@ class LLMClassifier:
         # db_manager (или достаём через scorer, чтобы не плодить соединения).
         self._db: DatabaseManager | None = db_manager or getattr(self._scorer, "db_manager", None)
 
+        # J1: in-memory LRU-кэш для LLM-ответов (только reactive).
+        from llm_cache import LLMResponseCache
+
+        self._response_cache = LLMResponseCache()
+
     def _incr_llm_error(self, kind: str) -> None:
         """
         E2: best-effort бамп счётчика llm_errors. account_name="" —
@@ -185,9 +190,21 @@ class LLMClassifier:
 
         D5: шаблоны system / user — в prompts/. input/output логируются
         на DEBUG-уровне (для последующего тюнинга промптов).
+
+        J1: результат кэшируется по (dialog_id, last_in_msg, persona) на 10 мин.
         """
         if self.client is None:
             return "Здравствуйте! Уточните, пожалуйста, ваш вопрос."
+
+        # J1: cache lookup
+        last_in_msg = (chat_history or [])[-1].get("text", "") if chat_history else ""
+        cached = self._response_cache.get(
+            context.get("dialog_id"),
+            last_in_msg,
+            context.get("persona"),
+        )
+        if cached is not None:
+            return cached
 
         try:
             history_lines = []
@@ -223,6 +240,13 @@ class LLMClassifier:
             out = (response.choices[0].message.content or "").strip()
             logger.debug(
                 "generate_response output: %s", (out[:300] + "...") if len(out) > 300 else out
+            )
+            # J1: cache the result
+            self._response_cache.set(
+                context.get("dialog_id"),
+                last_in_msg,
+                context.get("persona"),
+                out,
             )
             return out
         except OpenAIError as exc:

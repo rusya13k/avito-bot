@@ -316,6 +316,27 @@ class AccountState:
     def __init__(self):
         self._lock = threading.RLock()
         self._entries: dict[str, _Entry] = {}
+        # J3: shared probe cache (proxy_str -> ProbeResult, TTL 5 min)
+        self._probe_cache: dict[str, tuple[Any, float]] = {}
+        self._probe_cache_ttl_sec = 300.0
+        self._probe_cache_lock = threading.Lock()
+
+    def get_cached_probe(self, proxy_str: str) -> Any | None:
+        """J3: достать кэшированный ProbeResult если он ещё свежий."""
+        with self._probe_cache_lock:
+            entry = self._probe_cache.get(proxy_str)
+            if entry is None:
+                return None
+            result, ts = entry
+            if time.time() - ts > self._probe_cache_ttl_sec:
+                self._probe_cache.pop(proxy_str, None)
+                return None
+            return result
+
+    def set_cached_probe(self, proxy_str: str, result: Any) -> None:
+        """J3: положить ProbeResult в кэш (TTL 5 мин)."""
+        with self._probe_cache_lock:
+            self._probe_cache[proxy_str] = (result, time.time())
 
     def _get(self, account_name: str) -> _Entry:
         # Должен вызываться под lock.

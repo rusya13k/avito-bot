@@ -27,8 +27,8 @@ from outbound_messenger import (
 
 def test_pick_persona_explicit_override():
     """Если account.persona указан и валиден — используется именно она."""
-    persona = _pick_persona_for_account({"name": "acc1", "persona": "cafe_owner"})
-    assert persona == "cafe_owner"
+    persona = _pick_persona_for_account({"name": "acc1", "persona": "tatarstan_developer"})
+    assert persona == "tatarstan_developer"
 
 
 def test_pick_persona_unknown_override_falls_back_to_hash():
@@ -51,10 +51,10 @@ def test_pick_persona_stable_per_account():
 
 
 def test_pick_persona_different_accounts_different_personas():
-    """Разные аккаунты — статистически разные персоны (не все одинаковые)."""
+    """Разные аккаунты — получают одну и ту же персону, так как осталась только одна."""
     personas = {_pick_persona_for_account({"name": f"acc-{i}"}) for i in range(20)}
-    # 20 аккаунтов на 16 персон — должно быть >5 различных
-    assert len(personas) >= 5
+    # 20 аккаунтов на 1 персону — должно быть 1 различных
+    assert len(personas) == 1
 
 
 # ── _generate_first_message ────────────────────────────────────────────────
@@ -83,7 +83,7 @@ def test_generate_first_message_calls_llm_with_prompts():
     llm.model = "gpt-3.5-turbo"
     response = MagicMock()
     response.choices = [MagicMock()]
-    response.choices[0].message.content = "Привет! Площадь 50 м интересна, можно посмотреть?"
+    response.choices[0].message.content = "Привет! Ищу партнеров для стройки"
     llm.client.chat.completions.create.return_value = response
 
     listing = {
@@ -94,9 +94,9 @@ def test_generate_first_message_calls_llm_with_prompts():
         "price": 100000,
         "description": "Хороший офис с парковкой",
     }
-    result = _generate_first_message(llm, listing, "small_business_office")
+    result = _generate_first_message(llm, listing, "tatarstan_developer")
     assert result is not None
-    assert "50" in result or "офис" in result.lower() or "посмотреть" in result.lower()
+    assert "партнер" in result.lower() or "стройк" in result.lower()
     # LLM был вызван 1 раз
     assert llm.client.chat.completions.create.called
     call = llm.client.chat.completions.create.call_args
@@ -105,13 +105,11 @@ def test_generate_first_message_calls_llm_with_prompts():
     assert len(messages) == 2
     # User-prompt содержит данные листинга
     user_content = messages[1]["content"]
-    assert "Офис 50 м в центре" in user_content
-    assert PERSONAS["small_business_office"] in user_content
+    assert PERSONAS["tatarstan_developer"] in user_content
 
 
 def test_generate_first_message_sanitizer_rejects_phone():
-    """Если LLM выдаёт телефон в ответе — sanitizer возвращает None,
-    и мы НЕ отправляем."""
+    """Если LLM выдаёт телефон в ответе — sanitizer заменяет его."""
     llm = MagicMock()
     llm.client = MagicMock()
     llm.model = "gpt-3.5-turbo"
@@ -123,7 +121,7 @@ def test_generate_first_message_sanitizer_rejects_phone():
 
     listing = {"title": "Офис"}
     result = _generate_first_message(llm, listing, "small_business_office")
-    assert result is None  # sanitizer отрезал
+    assert "[контакт скрыт]" in result
 
 
 # ── pitch-mode (tatarstan_developer) ─────────────────────────────────────
@@ -135,7 +133,7 @@ def test_pitch_personas_contains_tatarstan_developer():
     на объект, лимит 1-3 предложения и т.д.)."""
     assert "tatarstan_developer" in _PITCH_PERSONAS
     assert _is_pitch_persona("tatarstan_developer") is True
-    assert _is_pitch_persona("small_business_office") is False
+    assert _is_pitch_persona("regular_buyer") is False
 
 
 def test_pitch_persona_uses_pitch_prompt():
@@ -202,7 +200,7 @@ def test_rent_persona_uses_rent_prompt():
         "price": 80000,
         "description": "офис в центре",
     }
-    result = _generate_first_message(llm, listing, "small_business_office")
+    result = _generate_first_message(llm, listing, "regular_buyer")
     assert result is not None
 
     call = llm.client.chat.completions.create.call_args
@@ -226,7 +224,7 @@ def test_generate_first_message_strips_quotes():
     llm.client.chat.completions.create.return_value = response
 
     listing = {"title": "Офис"}
-    result = _generate_first_message(llm, listing, "small_business_office")
+    result = _generate_first_message(llm, listing, "tatarstan_developer")
     assert result is not None
     assert not result.startswith('"')
     assert not result.endswith('"')

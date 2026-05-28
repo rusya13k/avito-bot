@@ -38,6 +38,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
 logger = logging.getLogger(__name__)
 
 ACCOUNTS_JSON_FILENAME = "accounts.json"
@@ -47,6 +49,27 @@ ACCOUNTS_JSON_FILENAME = "accounts.json"
 # могут одновременно дёрнуть add_account/remove_account. Без локa один из них
 # затрёт изменения другого (классический lost-update).
 _WRITE_LOCK = threading.Lock()
+
+
+class AccountConfig(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    name: str = Field(..., description="Уникальное имя аккаунта")
+    enabled: bool = True
+    adspower_id: str | None = None
+    user_id: str | None = None
+    phone: str | None = None
+    password: str | None = None
+    cookies_path: str | None = None
+    persona: str | None = None
+    captcha_cooldown_minutes: int | None = None
+
+    @field_validator("name")
+    def name_must_not_be_empty(cls, v):
+        v_stripped = v.strip()
+        if not v_stripped:
+            raise ValueError("name cannot be empty or just whitespace")
+        return v_stripped
 
 
 def load_accounts(
@@ -149,6 +172,7 @@ def _normalize_account(
 ) -> dict[str, Any] | None:
     """
     Возвращает нормализованный dict или None, если запись надо отбросить.
+    Теперь использует Pydantic для строгой валидации.
     """
     if not isinstance(item, dict):
         logger.warning(
@@ -159,34 +183,34 @@ def _normalize_account(
         )
         return None
 
-    name = item.get("name")
-    if not isinstance(name, str) or not name.strip():
+    try:
+        validated = AccountConfig(**item)
+    except ValidationError as exc:
         logger.warning(
-            "G2: %s: account #%d без 'name' — пропускаю",
+            "G2: %s: account #%d содержит ошибки валидации и будет пропущен:\n%s",
             source,
             index,
+            exc,
         )
         return None
 
-    # Делаем копию — не мутируем исходный конфиг (важно если cfg повторно читается).
-    out = dict(item)
+    # enabled: по умолчанию True. Если явно False — вернём None (отфильтровать).
+    if not validated.enabled:
+        logger.info(
+            "G2: %s: аккаунт %r отключён (enabled=false) — пропускаю",
+            source,
+            validated.name,
+        )
+        return None
 
-    # Alias: новый формат — adspower_id, старый — user_id. Поддерживаем оба.
+    out = validated.model_dump()
+
+    # Alias: новый формат — adspower_id, старый — user_id. Поддерживаем оба
+    # и гарантируем наличие обоих для совместимости.
     if out.get("adspower_id") and not out.get("user_id"):
         out["user_id"] = out["adspower_id"]
     elif out.get("user_id") and not out.get("adspower_id"):
         out["adspower_id"] = out["user_id"]
-
-    # enabled: по умолчанию True. Если явно False — вернём None (отфильтровать).
-    enabled = out.get("enabled", True)
-    if enabled is False:
-        logger.info(
-            "G2: %s: аккаунт %r отключён (enabled=false) — пропускаю",
-            source,
-            name,
-        )
-        return None
-    out["enabled"] = True
 
     return out
 
@@ -236,6 +260,7 @@ def _normalize_only(raw: list[Any], source: str) -> list[dict[str, Any]]:
     """
     Как _normalize_and_filter, но НЕ выбрасывает disabled.
     Сохраняет фактическое значение `enabled` (True/False), не насильно True.
+    Теперь использует Pydantic.
     """
     out: list[dict[str, Any]] = []
     seen_names: set[str] = set()
@@ -245,22 +270,29 @@ def _normalize_only(raw: list[Any], source: str) -> list[dict[str, Any]]:
                 "K1: %s: account #%d не dict (%s) — пропускаю", source, i, type(item).__name__
             )
             continue
-        name = item.get("name")
-        if not isinstance(name, str) or not name.strip():
-            logger.warning("K1: %s: account #%d без 'name' — пропускаю", source, i)
+
+        try:
+            validated = AccountConfig(**item)
+        except ValidationError as exc:
+            logger.warning(
+                "K1: %s: account #%d содержит ошибки валидации и будет пропущен:\n%s",
+                source,
+                i,
+                exc,
+            )
             continue
+
+        name = validated.name
         if name in seen_names:
             logger.warning("K1: %s: дубль имени %r — оставляю первое вхождение", source, name)
             continue
         seen_names.add(name)
 
-        normalized = dict(item)
+        normalized = validated.model_dump()
         if normalized.get("adspower_id") and not normalized.get("user_id"):
             normalized["user_id"] = normalized["adspower_id"]
         elif normalized.get("user_id") and not normalized.get("adspower_id"):
             normalized["adspower_id"] = normalized["user_id"]
-        # enabled: по умолчанию True, если явно False — оставляем False.
-        normalized["enabled"] = normalized.get("enabled", True) is not False
         out.append(normalized)
     return out
 

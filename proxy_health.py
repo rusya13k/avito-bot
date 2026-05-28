@@ -34,6 +34,7 @@ AdsPower выставляет в `proxy_type=socks5`.
 from __future__ import annotations
 
 import logging
+import socket
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -47,6 +48,13 @@ _logger = logging.getLogger(__name__)
 # api.ipify.org — простой сервис: GET → JSON {"ip": "1.2.3.4"}.
 # Альтернативы: https://api.myip.com, https://ifconfig.co/json.
 DEFAULT_PROBE_URL = "https://api.ipify.org?format=json"
+
+# Fallback probe URLs — используются если DEFAULT_PROBE_URL не отвечает.
+DEFAULT_PROBE_URLS = [
+    "https://api.ipify.org?format=json",
+    "https://httpbin.org/ip",
+    "https://checkip.amazonaws.com",
+]
 
 # ip-api.com — бесплатный geo-lookup без ключа (45 req/min с одного IP).
 # Возвращает поле `countryCode` (ISO 3166-1 alpha-2, e.g. "RU").
@@ -164,6 +172,42 @@ def redact_proxy(proxy_str: str) -> str:
         return proxy_str.split(":", 1)[0] + ":***"
 
 
+# ── TCP pre-check ────────────────────────────────────────────────────────
+
+
+def _tcp_connect_proxy(proxy_str: str, timeout: float = 2.0) -> bool:
+    """Быстрая TCP-проверка доступности прокси (~200ms вместо 10s timeout).
+
+    Для socks5 пробуем pysocks если доступен (создаёт socks-соединение).
+    Иначе — обычный socket.create_connection с хостом/портом.
+    """
+    try:
+        host, port, _user, _password = parse_proxy(proxy_str)
+    except ValueError:
+        return False
+
+    # Пробуем pysocks для socks5
+    try:
+        import socks
+
+        sock = socks.socksocket()
+        sock.settimeout(timeout)
+        sock.connect((host, port))
+        sock.close()
+        return True
+    except ImportError:
+        pass
+    except Exception:
+        return False
+
+    # Fallback: обычный TCP
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
 # ── Probe ────────────────────────────────────────────────────────────────
 
 
@@ -171,27 +215,45 @@ def probe_proxy(
     proxy_str: str,
     *,
     timeout: float = DEFAULT_TIMEOUT,
-    probe_url: str = DEFAULT_PROBE_URL,
+    probe_url: str | None = None,
+    probe_urls: list[str] | None = None,
     expected_country: str | None = None,
     geo_url_template: str | None = DEFAULT_GEO_URL_TEMPLATE,
     banned_ips: Iterable[str] | None = None,
     scheme: str = DEFAULT_PROXY_SCHEME,
     session: requests.Session | None = None,
+    cache_get=None,
+    cache_set=None,
 ) -> ProbeResult:
     """Делает HTTP-probe через прокси.
 
-    1. Парсит прокси, собирает proxy URL.
-    2. GET ``probe_url`` через прокси с timeout.
-    3. Non-200 / timeout / connection error → ok=False.
-    4. Парсит JSON, забирает 'ip'. Если IP не нашли — ok=False.
-    5. Если ip в `banned_ips` → ok=False.
-    6. Если задан `expected_country`: дополнительный GET geo-сервиса.
+    1. J3: проверяет кэш через cache_get (если передан).
+    2. TCP-connect pre-check — быстрая проверка перед HTTP (отбраковка
+       мёртвых прокси за ~200ms вместо 10s requests timeout).
+    3. Парсит прокси, собирает proxy URL.
+    4. GET ``probe_url`` через прокси с timeout.
+       Если ``probe_urls`` задан — пробуем fallback'и при timeout.
+    5. Non-200 / timeout / connection error → ok=False.
+    6. Парсит JSON, забирает 'ip'. Если IP не нашли — ok=False.
+    7. Если ip в `banned_ips` → ok=False.
+    8. Если задан `expected_country`: дополнительный GET geo-сервиса.
        Несовпадение ISO-кода → ok=False. Если geo не отдал страну
        (timeout/non-200) — НЕ валим probe, считаем soft-pass.
+    9. J3: записывает результат в кэш через cache_set (если передан).
 
     Returns:
         ProbeResult.
     """
+    # J3: check shared cache
+    if cache_get is not None:
+        cached = cache_get(proxy_str)
+        if cached is not None:
+            return cached
+
+    # TCP pre-check — быстро отбраковываем мёртвые прокси
+    if not _tcp_connect_proxy(proxy_str, timeout=2.0):
+        return ProbeResult(ok=False, error="tcp_connect_failed")
+
     try:
         proxy_url = build_proxy_url(proxy_str, scheme)
     except ValueError as e:
@@ -201,29 +263,41 @@ def probe_proxy(
     sess = session or requests
     banned_set: set[str] = set(banned_ips) if banned_ips else set()
 
-    started = time.monotonic()
-    try:
-        resp = sess.get(probe_url, proxies=proxies, timeout=timeout)
-    except requests.Timeout:
-        return ProbeResult(
-            ok=False,
-            error="timeout",
-            latency_ms=(time.monotonic() - started) * 1000.0,
-        )
-    except requests.ConnectionError as e:
-        return ProbeResult(
-            ok=False,
-            error=f"connection_error: {str(e)[:100]}",
-            latency_ms=(time.monotonic() - started) * 1000.0,
-        )
-    except requests.RequestException as e:
-        return ProbeResult(
-            ok=False,
-            error=f"request_error: {type(e).__name__}",
-            latency_ms=(time.monotonic() - started) * 1000.0,
-        )
+    # Определяем список probe URLs
+    urls = probe_urls
+    if urls is None:
+        if probe_url is not None:
+            urls = [probe_url]
+        else:
+            urls = DEFAULT_PROBE_URLS
 
-    latency_ms = (time.monotonic() - started) * 1000.0
+    last_error: str | None = None
+    latency_ms: float = 0.0
+    resp = None
+
+    for url in urls:
+        started = time.monotonic()
+        try:
+            resp = sess.get(url, proxies=proxies, timeout=timeout)
+            latency_ms = (time.monotonic() - started) * 1000.0
+            break  # успешный HTTP-ответ (проверим статус ниже)
+        except requests.Timeout:
+            latency_ms = (time.monotonic() - started) * 1000.0
+            last_error = "timeout"
+            continue  # пробуем fallback URL
+        except requests.ConnectionError as e:
+            latency_ms = (time.monotonic() - started) * 1000.0
+            last_error = f"connection_error: {str(e)[:100]}"
+            continue
+        except requests.RequestException as e:
+            latency_ms = (time.monotonic() - started) * 1000.0
+            last_error = f"request_error: {type(e).__name__}"
+            continue
+
+    if resp is None:
+        return ProbeResult(
+            ok=False, error=last_error or "all_probe_urls_failed", latency_ms=latency_ms
+        )
 
     status = getattr(resp, "status_code", None)
     if status != 200:
@@ -251,7 +325,10 @@ def probe_proxy(
                 latency_ms=latency_ms,
             )
 
-    return ProbeResult(ok=True, ip=ip, country=country, latency_ms=latency_ms)
+    result = ProbeResult(ok=True, ip=ip, country=country, latency_ms=latency_ms)
+    if cache_set is not None:
+        cache_set(proxy_str, result)
+    return result
 
 
 def _extract_ip(resp) -> str | None:
@@ -304,12 +381,15 @@ def pick_healthy_proxy(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     probe_url: str = DEFAULT_PROBE_URL,
+    probe_urls: list[str] | None = None,
     expected_country: str | None = None,
     banned_ips: Iterable[str] | None = None,
     max_attempts: int = DEFAULT_MAX_PROBE_ATTEMPTS,
     scheme: str = DEFAULT_PROXY_SCHEME,
     log_prefix: str = "",
     session: requests.Session | None = None,
+    cache_get=None,
+    cache_set=None,
 ) -> tuple[str | None, ProbeResult | None]:
     """Из списка `candidates` находит первый прокси, прошедший probe.
 
@@ -318,25 +398,41 @@ def pick_healthy_proxy(
     `max_attempts` общий — даже если кандидатов много, не делаем
     больше N HTTP-запросов.
 
+    J3: cache_get — shared кэш probe-результатов между аккаунтами.
+
     Returns:
         (proxy_str, ProbeResult) если нашли живой,
         (None, last_result) если ни один не прошёл (last_result —
         ProbeResult последней попытки, None если candidates пустой).
     """
+    # Если probe_urls не задан явно и probe_url — дефолтный,
+    # подхватываем fallback'и (api.ipify.org → httpbin → amazonaws).
+    effective_probe_urls = probe_urls
+    if effective_probe_urls is None and probe_url == DEFAULT_PROBE_URL:
+        effective_probe_urls = DEFAULT_PROBE_URLS
+
     last: ProbeResult | None = None
     tried = 0
     for proxy in candidates:
         if tried >= max_attempts:
             break
+        # J3: cache hit — не считаем за попытку
+        if cache_get is not None:
+            cached = cache_get(proxy)
+            if cached is not None and getattr(cached, "ok", False):
+                return proxy, cached
         tried += 1
         result = probe_proxy(
             proxy,
             timeout=timeout,
             probe_url=probe_url,
+            probe_urls=effective_probe_urls,
             expected_country=expected_country,
             banned_ips=banned_ips,
             scheme=scheme,
             session=session,
+            cache_get=cache_get,
+            cache_set=cache_set,
         )
         last = result
         if result.ok:

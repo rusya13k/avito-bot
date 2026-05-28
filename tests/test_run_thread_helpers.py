@@ -20,6 +20,7 @@ import pytest
 
 from account_state import account_state
 from bot import (
+    AdsPowerAPI,
     _apply_per_account_overrides,
     _apply_warmup_if_new,
     _check_health_and_log,
@@ -216,3 +217,48 @@ def test_check_health_swallows_exceptions():
     ):
         # Ошибка не должна пробрасываться
         _check_health_and_log("acc1", db)
+
+
+# ── AdsPowerAPI.is_profile_running ─────────────────────────────────────────
+
+
+def test_is_profile_running_true_when_active(monkeypatch):
+    """API вернул status=Active → True."""
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"code": 0, "data": {"status": "Active"}}
+    monkeypatch.setattr("requests.get", lambda *a, **kw: mock_resp)
+
+    api = AdsPowerAPI("http://localhost:50325")
+    assert api.is_profile_running("uid1") is True
+
+
+def test_is_profile_running_false_when_inactive(monkeypatch):
+    """API вернул status=Inactive → False."""
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"code": 0, "data": {"status": "Inactive"}}
+    monkeypatch.setattr("requests.get", lambda *a, **kw: mock_resp)
+
+    api = AdsPowerAPI("http://localhost:50325")
+    assert api.is_profile_running("uid1") is False
+
+
+def test_is_profile_running_false_on_error(monkeypatch):
+    """API недоступен → False (не падаем)."""
+    import requests
+
+    monkeypatch.setattr(
+        "requests.get", lambda *a, **kw: (_ for _ in ()).throw(requests.ConnectionError())
+    )
+
+    api = AdsPowerAPI("http://localhost:50325")
+    assert api.is_profile_running("uid1") is False
+
+
+def test_is_profile_running_false_on_nonzero_code(monkeypatch):
+    """API вернул code != 0 → False."""
+    mock_resp = MagicMock()
+    mock_resp.json.return_value = {"code": -1, "msg": "not found"}
+    monkeypatch.setattr("requests.get", lambda *a, **kw: mock_resp)
+
+    api = AdsPowerAPI("http://localhost:50325")
+    assert api.is_profile_running("uid1") is False

@@ -41,37 +41,36 @@ def _wf(driver, xpath, timeout=3):
 
 def normalize_phone(phone_text):
     """
-    D3: нормализация в E.164 (+7XXXXXXXXXX) с защитой от мусора.
-
-    Изменено относительно прежней версии:
-    - 10-значный номер с любого старта НЕ префиксуется автоматически '7'
-      (раньше '4155550123' → '+74155550123', что давало битый "российский"
-      номер для иностранных вводов). Теперь 10 цифр = только если
-      явно нет кода страны и это похоже на российский (мобильный 9XX,
-      городской 4XX/8XX). В неоднозначных случаях возвращаем None.
-    - Скрытые номера ('+7 (***) ***-**-**') корректно → None.
-    - Слишком короткие/длинные → None.
+    D3: нормализация в E.164 (+XXXXXXXXXXX) с защитой от мусора.
+    Поддерживает номера РФ, СНГ и международные форматы.
     """
     if not phone_text:
         return None
 
+    # Запоминаем, был ли явный плюс в начале
+    has_plus = phone_text.strip().startswith("+")
     digits = re.sub(r"\D", "", phone_text)
+
     if not digits:
         return None
 
-    # 11 digits начиная с 8 → российский, заменяем 8 на 7
-    if len(digits) == 11 and digits.startswith("8"):
+    length = len(digits)
+
+    if has_plus:
+        # Явный международный формат: просто проверяем длину (обычно 10-15 цифр)
+        if 10 <= length <= 15:
+            return f"+{digits}"
+        return None
+
+    # Без плюса: пытаемся нормализовать локальные форматы
+    if length == 11 and digits.startswith("8"):
+        # Локальный 8-800 или 8-9XX -> меняем на 7
         digits = "7" + digits[1:]
-    # 11 digits начиная с 7 → уже E.164 без '+'
-    elif len(digits) == 11 and digits.startswith("7"):
-        pass
-    # 10 digits → российский без кода страны. Принимаем ТОЛЬКО мобильные
-    # (9XX) — их написание без префикса однозначно. Городские (4XX/8XX)
-    # без префикса не отличить от иностранных (415, 800), поэтому
-    # требуем их с явным '+7' / '8'.
-    elif len(digits) == 10 and digits[0] == "9":
+    elif length == 10:
+        # Локальный 10-значный без 8/7 в начале -> предполагаем РФ (+7)
         digits = "7" + digits
-    else:
+    elif length < 10 or length > 15:
+        # Слишком короткий или длинный номер
         return None
 
     return f"+{digits}"
@@ -319,11 +318,13 @@ def _try_show_phone(driver, account_name: str, log_func, listing_data: dict) -> 
         )
         # T6: «Показать телефон» — самое палевное действие, кликаем
         # через Bezier-движение курсора + jitter, не «телепорт-click».
-        _human_click(driver, phone_btn, stop_event=_tg.stop_event)
+        _human_click(driver, phone_btn, stop_event=_tg.get_account_stop_event(account_name))
         # A3: cooldown 30-90 сек после клика (ранее было 0.8-1.6с).
         # Реальный пользователь не кликает "Показать телефон" каждые 2 секунды.
         # uniform (более равномерный), чтобы не быть предсказуемым.
-        human_delay(30, 90, stop_event=_tg.stop_event, distribution="uniform")
+        human_delay(
+            30, 90, stop_event=_tg.get_account_stop_event(account_name), distribution="uniform"
+        )
     except Exception as e:
         log_func(account_name, f"Ошибка клика 'Показать телефон': {e}")
         return

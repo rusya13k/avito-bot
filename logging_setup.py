@@ -92,14 +92,15 @@ class TGBufferHandler(logging.Handler):
     (раньше это делал bot.log() через _tg.add_log).
     """
 
-    def __init__(self, push_func: Callable[[str], None]):
+    def __init__(self, push_func: Callable[[str, str | None], None]):
         super().__init__(level=logging.INFO)
         self._push = push_func
         self.setFormatter(HumanFormatter())
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            self._push(self.format(record))
+            account_id = getattr(record, "account_id", None)
+            self._push(self.format(record), account_id)
         except Exception:
             self.handleError(record)
 
@@ -189,7 +190,7 @@ def get_account_logger(name: str, account_id: str | None) -> AccountAdapter:
     )
 
 
-def install_tg_buffer_handler(push_func: Callable[[str], None]) -> None:
+def install_tg_buffer_handler(push_func: Callable[[str, str | None], None]) -> None:
     """
     Подключить кольцевой TG-буфер логов (раньше это делал bot.log() напрямую).
     Идемпотентно: повторный вызов перенастраивает push-функцию.
