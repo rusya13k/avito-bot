@@ -5,6 +5,8 @@ Avito Commercial Real Estate Parser Bot
 import json
 import logging
 import random
+import signal
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1541,7 +1543,8 @@ def _apply_account_proxy(
     Порядок:
       1. Поле "proxy" из accounts.json (per-account, приоритет).
       2. Случайный прокси из proxies.txt (глобальный fallback).
-      3. Если ничего нет — логирует ERROR (E4 → TG) и возвращает None.
+      3. Если ничего нет — спрашивает админа в TG: продолжить без прокси?
+         Ответ "Продолжить" → возвращает "__no_proxy__", "Отмена" → None.
 
     T18 (если `cfg.proxy_probe_enabled=True`, default): перед применением
     через AdsPower делается HTTP-probe (api.ipify.org через прокси) с
@@ -1554,13 +1557,19 @@ def _apply_account_proxy(
             путь, используется в существующих тестах test_proxy.py).
 
     Returns:
-        Строку прокси, который удалось применить, или None.
+        Строку прокси, который удалось применить, "__no_proxy__" если админ
+        разрешил без прокси, или None.
     """
     # cfg=None — legacy-путь для back-compat (используется в тестах
     # test_proxy.py + в местах, которые ещё не передают cfg).
     # cfg=dict (даже пустой) → probe ON по дефолту.
     if cfg is not None and bool(cfg.get("proxy_probe_enabled", True)):
-        return _apply_account_proxy_with_probe(adspower, user_id, account, account_name, cfg)
+        result = _apply_account_proxy_with_probe(adspower, user_id, account, account_name, cfg)
+        if result is not None:
+            return result
+        # probe-путь вернул None — все кандидаты провалились.
+        # Падаем в TG-опрос ниже (no_proxy_result).
+        return _ask_admin_no_proxy(account_name)
 
     # Legacy path (probe disabled): прежнее поведение для back-compat.
     account_proxy = account.get("proxy")
@@ -1578,12 +1587,35 @@ def _apply_account_proxy(
             return fallback
         log(account_name, "A1: Fallback proxy из proxies.txt не удалось установить")
 
-    _bot_logger.error(
+    return _ask_admin_no_proxy(account_name)
+
+
+def _ask_admin_no_proxy(account_name: str) -> str | None:
+    """
+    Спрашивает админа в TG: продолжить без прокси или остановить аккаунт.
+
+    Returns "__no_proxy__" если админ нажал Продолжить, None если Отмена/таймаут.
+    """
+    _bot_logger.warning(
         "[%s] A1: Нет доступного прокси — ни per-account, ни в proxies.txt. "
-        "Аккаунт пропущен для защиты от блокировки. "
-        'Добавь поле "proxy" в accounts.json или заполни proxies.txt.',
+        "Запрос админу в TG: продолжить без прокси?",
         account_name,
     )
+    response = _wait_user_resume_for_login(
+        account_name,
+        "no_proxy_warning",
+        (
+            "У аккаунта нет прокси (ни в accounts.json, ни в proxies.txt).\n"
+            "Без прокси аккаунт будет работать с IP сервера — риск блокировки "
+            "выше обычного.\n\n"
+            "Продолжить без прокси?"
+        ),
+        timeout_seconds=600.0,
+    )
+    if response == "continue":
+        log(account_name, "A1: Админ разрешил продолжить БЕЗ прокси.")
+        return "__no_proxy__"
+    log(account_name, "A1: Аккаунт остановлен админом (нет прокси).")
     return None
 
 
@@ -1625,13 +1657,7 @@ def _apply_account_proxy_with_probe(
             seen.add(p)
 
     if not candidates:
-        _bot_logger.error(
-            "[%s] A1: Нет доступного прокси — ни per-account, ни в proxies.txt. "
-            "Аккаунт пропущен для защиты от блокировки. "
-            'Добавь поле "proxy" в accounts.json или заполни proxies.txt.',
-            account_name,
-        )
-        return None
+        return _ask_admin_no_proxy(account_name)
 
     chosen, result = pick_healthy_proxy(
         candidates,
@@ -1649,15 +1675,12 @@ def _apply_account_proxy_with_probe(
         last_err = result.error if result else "no_candidates"
         _bot_logger.error(
             "[%s] A1: Все %d попыток probe прокси провалились. "
-            "Последняя ошибка: %s. Аккаунт пропущен.",
+            "Последняя ошибка: %s.",
             account_name,
             min(max_attempts, len(candidates)),
             last_err,
         )
-        _tg._send_message(
-            f"⚠️ Для аккаунта {account_name} не найден рабочий прокси. Проверьте proxies.txt."
-        )
-        return None
+        return _ask_admin_no_proxy(account_name)
 
     if update_profile_proxy(adspower, user_id, chosen):
         log(
@@ -2280,13 +2303,24 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
     _apply_warmup_if_new(account, account_name)
     _check_health_and_log(account_name, db_manager)
 
+    # Восстанавливаем captcha_timestamps из БД (persist across restarts)
+    try:
+        captcha_ts = db_manager.get_captcha_timestamps_24h(account_name)
+        if captcha_ts:
+            account_state.load_captcha_history(account_name, captcha_ts)
+    except Exception as e:
+        _bot_logger.debug("Failed to load captcha history for %s: %s", account_name, e)
+
     # ── A1 + T18: Per-account proxy setup with health probe ─────────────
     # Приоритет: 1) поле "proxy" в accounts.json, 2) случайный из proxies.txt.
     # T18: перед apply делается HTTP-probe (api.ipify.org через прокси);
     # если timeout / non-200 / wrong country — пробуем следующий кандидат.
-    # Если ни один не прошёл — ERROR в TG (E4) и пропускаем аккаунт.
-    if _apply_account_proxy(adspower, user_id, account, account_name, cfg) is None:
+    # Если ни один не прошёл — спрашиваем админа в TG (продолжить без прокси?).
+    proxy_result = _apply_account_proxy(adspower, user_id, account, account_name, cfg)
+    if proxy_result is None:
         return
+    if proxy_result == "__no_proxy__":
+        log(account_name, "A1: Запуск БЕЗ прокси (админ разрешил).")
 
     try:
         # ── Connect (с retry + T18 probe-driven ротацией прокси) ────────
@@ -2553,7 +2587,6 @@ def _launch_commercial_bot_threads(cfg=None):
             target=run_thread,
             args=(acc, cfg, adspower, db_manager),
             name="acc-" + acc["name"],
-            daemon=True,
         )
         threads.append(t)
         _tg.active_threads.append(t)
@@ -2562,8 +2595,114 @@ def _launch_commercial_bot_threads(cfg=None):
         # Предотвращает регулярный паттерн «все аккаунты стартуют одновременно».
         _human_delay(30, 180, stop_event=_tg.stop_event)
 
-    for t in threads:
-        t.join()
+    # ── Thread Supervisor ─────────────────────────────────────────────────
+    # Мониторим потоки и перезапускаем упавшие (max 3 restart/час на аккаунт).
+    # Если stop_event выставлен — не перезапускаем, ждём завершения.
+    _MAX_RESTARTS_PER_HOUR = 3
+    restart_history: dict[str, list[float]] = {}  # acc_name -> [timestamps]
+    # Маппинг thread -> account для перезапуска
+    thread_account_map: dict[threading.Thread, dict] = {}
+    for t, acc in zip(threads, accounts):
+        thread_account_map[t] = acc
+
+    while not _tg.stop_event.is_set():
+        alive_threads = []
+        for t in list(thread_account_map.keys()):
+            if t.is_alive():
+                alive_threads.append(t)
+                continue
+
+            # Поток умер — решаем перезапускать ли
+            acc = thread_account_map.pop(t)
+            acc_name = acc["name"]
+
+            # Убираем из active_threads
+            if t in _tg.active_threads:
+                _tg.active_threads.remove(t)
+
+            # Проверяем лимит рестартов (скользящее окно 1 час)
+            now = time.time()
+            history = restart_history.setdefault(acc_name, [])
+            # Чистим записи старше часа
+            history[:] = [ts for ts in history if now - ts < 3600]
+
+            if len(history) >= _MAX_RESTARTS_PER_HOUR:
+                _bot_logger.error(
+                    "Account %s: %d restarts in last hour — NOT restarting "
+                    "(possible crash loop). Manual intervention required.",
+                    acc_name,
+                    len(history),
+                )
+                _tg._send_message(
+                    f"⚠️ Аккаунт {acc_name}: {len(history)} рестартов за час. "
+                    f"Остановлен. Проверьте логи."
+                )
+                continue
+
+            # Перезапускаем
+            history.append(now)
+            _bot_logger.warning(
+                "Account %s thread died — restarting (%d/%d this hour)",
+                acc_name,
+                len(history),
+                _MAX_RESTARTS_PER_HOUR,
+            )
+            # Сбрасываем per-account stop event (мог быть выставлен при ошибке)
+            _tg.clear_account_stop_event(acc_name)
+
+            new_t = threading.Thread(
+                target=run_thread,
+                args=(acc, cfg, adspower, db_manager),
+                name="acc-" + acc_name,
+            )
+            thread_account_map[new_t] = acc
+            _tg.active_threads.append(new_t)
+            new_t.start()
+            alive_threads.append(new_t)
+
+        if not alive_threads and not thread_account_map:
+            # Все потоки мертвы и ни один не перезапущен
+            break
+
+        # Проверяем каждые 10 секунд
+        _tg.stop_event.wait(timeout=10)
+
+    # Ждём завершения оставшихся потоков после stop_event
+    for t in thread_account_map:
+        t.join(timeout=30)
+
+
+def _graceful_shutdown(signum, frame):
+    """Signal handler: выставляет глобальный stop_event и ждёт завершения потоков.
+
+    Потоки проверяют is_stop_requested() на каждой итерации main loop и в
+    каждом human_delay — они увидят сигнал в течение 1-5 секунд и начнут
+    cleanup (driver.quit + adspower.stop_profile в finally-блоке run_thread).
+    """
+    sig_name = signal.Signals(signum).name if hasattr(signal, "Signals") else str(signum)
+    _bot_logger.info("Received %s — initiating graceful shutdown...", sig_name)
+    _tg.stop_event.set()
+
+    # Даём потокам SHUTDOWN_TIMEOUT секунд на cleanup (driver.quit + profile stop)
+    shutdown_timeout = 30
+    deadline = time.time() + shutdown_timeout
+    for t in _tg.active_threads:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        t.join(timeout=remaining)
+
+    still_alive = [t.name for t in _tg.active_threads if t.is_alive()]
+    if still_alive:
+        _bot_logger.warning(
+            "Threads still alive after %ds timeout: %s — forcing exit",
+            shutdown_timeout,
+            ", ".join(still_alive),
+        )
+    else:
+        _bot_logger.info("All threads stopped cleanly.")
+
+    sys.exit(0)
 
 
 def main():
@@ -2579,6 +2718,11 @@ def main():
     # Все логи дублируются в кольцевой TG-буфер (раньше это делал log()
     # вручную через _tg.add_log).
     install_tg_buffer_handler(_tg.add_log)
+
+    # Graceful shutdown: SIGINT (Ctrl+C) и SIGTERM (docker stop / systemd)
+    # выставляют stop_event и ждут join потоков с таймаутом.
+    signal.signal(signal.SIGINT, _graceful_shutdown)
+    signal.signal(signal.SIGTERM, _graceful_shutdown)
 
     cfg = _load_cfg()
     tg_token = cfg.get("telegram_bot_token", "")
@@ -2597,9 +2741,11 @@ def main():
         try:
             input()
         except (KeyboardInterrupt, EOFError):
-            # L2: bare except → конкретные. Ctrl-C / EOF — нормальные пути
-            # завершения main, проглатываем без лога. Любое другое
-            # исключение сюда теперь не попадёт и убьёт процесс с trace.
+            # Ctrl-C / EOF — нормальные пути завершения main.
+            # Signal handler уже обрабатывает SIGINT, но если input() поймал
+            # KeyboardInterrupt до handler'а — вызываем shutdown вручную.
+            if not _tg.stop_event.is_set():
+                _graceful_shutdown(signal.SIGINT, None)
             pass
         if not _tg.is_running():
             _launch_commercial_bot_threads(cfg)

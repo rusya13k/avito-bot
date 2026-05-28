@@ -110,12 +110,20 @@ class TGAlertHandler(logging.Handler):
     E4: ERROR/CRITICAL — мгновенно в TG. send_func принимает text.
     Внутри ловит свои собственные исключения, чтобы не уйти в рекурсию
     на собственный logger.
+
+    Rate-limit: max 5 сообщений в 60 секунд. При превышении — копим
+    suppressed count и отправляем сводку когда окно освобождается.
     """
+
+    _MAX_MESSAGES_PER_WINDOW = 5
+    _WINDOW_SECONDS = 60.0
 
     def __init__(self, send_func: Callable[[str], None]):
         super().__init__(level=logging.ERROR)
         self._send = send_func
         self._lock = threading.Lock()
+        self._timestamps: list[float] = []
+        self._suppressed = 0
 
     def emit(self, record: logging.LogRecord) -> None:
         if record.levelno < self.level:
@@ -131,7 +139,26 @@ class TGAlertHandler(logging.Handler):
             # лимит TG сообщения 4096; режем с запасом под HTML
             if len(text) > 3800:
                 text = text[:3800] + "\n…(truncated)"
+
             with self._lock:
+                now = time.time()
+                # Чистим timestamps старше окна
+                cutoff = now - self._WINDOW_SECONDS
+                self._timestamps = [t for t in self._timestamps if t > cutoff]
+
+                if len(self._timestamps) >= self._MAX_MESSAGES_PER_WINDOW:
+                    self._suppressed += 1
+                    return
+
+                # Если были suppressed — добавляем инфо в текущее сообщение
+                if self._suppressed > 0:
+                    text = (
+                        f"⚠️ [{self._suppressed} alerts suppressed "
+                        f"(rate-limit)]\n\n" + text
+                    )
+                    self._suppressed = 0
+
+                self._timestamps.append(now)
                 self._send(text)
         except Exception:
             # не уходим в рекурсию: handleError печатает в stderr

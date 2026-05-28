@@ -350,6 +350,29 @@ class AccountState:
     # Capture / query
     # ──────────────────────────────────────────────────────────────────────
 
+    def load_captcha_history(self, account_name: str, timestamps: list[float]) -> None:
+        """
+        Восстанавливает captcha_timestamps из БД при старте аккаунта.
+        Вызывается из bot.run_thread после инициализации db_manager.
+        Принимает список unix-timestamps капч за последние 24ч.
+        """
+        if not timestamps:
+            return
+        cutoff = time.time() - 86400
+        valid = [ts for ts in timestamps if ts > cutoff]
+        with self._lock:
+            entry = self._get(account_name)
+            entry.captcha_timestamps = valid
+            if valid:
+                entry.last_captcha_at = max(valid)
+                entry.captcha_hits = len(valid)
+                logger.info(
+                    "[%s] Restored %d captcha timestamps from DB (last: %s)",
+                    account_name,
+                    len(valid),
+                    time.strftime("%H:%M:%S", time.localtime(max(valid))),
+                )
+
     def set_account_cooldown_minutes(
         self,
         account_name: str,

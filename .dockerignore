@@ -1,0 +1,30 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+.mypy_cache
+*.egg-info
+
+# IDE
+.vscode
+.idea
+
+# Data (mounted as volumes, not baked into image)
+*.db
+accounts.json
+accounts/
+cookies.json
+.env
+
+# Tests (not needed in production image)
+tests/
+
+# Docs
+*.md
+zadachi.txt

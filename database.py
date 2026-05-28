@@ -992,6 +992,30 @@ class DatabaseManager:
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, row)) for row in cur.fetchall()]
 
+    def get_captcha_timestamps_24h(self, account_name: str) -> list[float]:
+        """
+        Загружает unix-timestamps капч за последние 24 часа для аккаунта.
+        Используется для восстановления in-memory captcha_timestamps при рестарте.
+        """
+        cutoff = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 86400)
+        )
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT ts FROM captcha_log "
+                "WHERE account_name = ? AND ts >= ? ORDER BY ts",
+                (account_name or "", cutoff),
+            )
+            results = []
+            for (ts_str,) in cur.fetchall():
+                try:
+                    results.append(
+                        time.mktime(time.strptime(ts_str, "%Y-%m-%d %H:%M:%S"))
+                    )
+                except (ValueError, OverflowError):
+                    pass
+            return results
+
     def get_new_listings_count(self, since_date):
         """
         Get the number of new listings since a specific date

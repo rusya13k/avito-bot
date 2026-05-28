@@ -16,5 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy project files
 COPY . .
 
+# Graceful shutdown: docker stop sends SIGTERM → signal handler joins threads
+STOPSIGNAL SIGTERM
+
 # Command to run the bot
-CMD ["python", "bot.py"]
+CMD ["python", "-u", "bot.py"]
