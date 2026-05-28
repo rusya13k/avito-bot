@@ -47,7 +47,7 @@ def _draw_seconds(lo: float, hi: float, distribution: str) -> float:
         mid = (lo + hi) / 2.0
         # Чтобы попадать в +/- разумный диапазон.
         sample = random.lognormvariate(0.0, 0.4) * mid * 0.7
-        return max(lo, min(hi * 2.0, sample))
+        return max(lo, min(hi, sample))
 
     # default: normal — пик в середине, ±3σ ≈ [lo, hi]
     mean = (lo + hi) / 2.0

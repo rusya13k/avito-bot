@@ -296,8 +296,12 @@ def load_cookies(driver: webdriver.Chrome, cookies_path: str, domain: str):
     except Exception:
         pass
 
-    with open(path, encoding="utf-8") as f:
-        cookies = json.load(f)
+    try:
+        with open(path, encoding="utf-8") as f:
+            cookies = json.load(f)
+    except (json.JSONDecodeError, ValueError) as e:
+        _bot_logger.warning("load_cookies: corrupt file %s: %s — skipping", path, e)
+        return
 
     for c in cookies:
         cookie_dict = {
@@ -446,14 +450,15 @@ def scroll_gallery(driver, wait, stop_event=None):
     except Exception:
         return
     hp(3, 7, stop_event=stop_event)
-    # F10: число пролистываний — случайное (1..12) вместо фикс 20. Реальный
-    # пользователь часто смотрит первые 1-3 фото и закрывает; иногда листает
-    # все. Фиксированные 20 — паттерн.
-    iters = random.randint(1, 12)
+    # F10: число пролистываний — weighted distribution вместо uniform.
+    # Реальный пользователь чаще смотрит 1-3 фото (60%), реже 4-7 (30%),
+    # редко листает все (10%). Uniform randint(1,12) — паттерн бота.
+    _GALLERY_WEIGHTS = [30, 20, 15, 10, 8, 5, 4, 3, 2, 1, 1, 1]  # 1..12
+    iters = random.choices(range(1, 13), weights=_GALLERY_WEIGHTS, k=1)[0]
     for _ in range(iters):
         btns = driver.find_elements(
             By.XPATH,
-            "//*[@data-marker='image-frame/next'] | "
+            "//*[@data-marker='image-frame/right-button'] | "
             "//button[contains(@class,'gallery-next')] | "
             "//button[contains(@aria-label,'следующ')] | "
             "//button[contains(@aria-label,'Next')]",
@@ -488,10 +493,14 @@ def check_block(driver, account_name):
         if "Ой!" in title or "Captcha" in title:
             log(account_name, f"!!! ALERT: BLOCK DETECTED BY TITLE ({title}) !!!")
             return True
-    except:
+    except Exception:
         pass
 
-    page_source = driver.page_source
+    try:
+        page_source = driver.page_source
+    except Exception:
+        log(account_name, "!!! ALERT: driver disconnected in check_block !!!")
+        return True
     for pattern in block_patterns:
         if pattern in page_source:
             log(account_name, f"!!! ALERT: IP BLOCK DETECTED BY PATTERN ({pattern}) !!!")
@@ -516,7 +525,7 @@ def _read_listing_meta(driver) -> tuple[str, int]:
     description = ""
     image_count = 0
     try:
-        desc_el = driver.find_element(By.XPATH, "//div[@data-marker='item-description']")
+        desc_el = driver.find_element(By.XPATH, "//div[@data-marker='item-view/item-description']")
         description = (desc_el.text or "").strip()
     except Exception:
         pass
@@ -623,7 +632,7 @@ def view_listing(
             hp(2, 6)
         elif action == "scroll_to_desc":
             try:
-                desc = driver.find_element(By.XPATH, "//div[@data-marker='item-description']")
+                desc = driver.find_element(By.XPATH, "//div[@data-marker='item-view/item-description']")
                 slow_scroll_to(driver, desc)
                 # T10: чтение описания пропорционально его длине + interest.
                 # Берём 50% от рассчитанного dwell — это «активное» чтение
@@ -631,7 +640,7 @@ def view_listing(
                 # фазы).
                 reading_share = max(3.0, dwell_time * 0.5)
                 hp(reading_share, reading_share)
-            except:
+            except Exception:
                 pass
         hp(1, 3)
 
@@ -648,7 +657,7 @@ def view_listing(
                 EC.element_to_be_clickable(
                     (
                         By.XPATH,
-                        "//button[@data-marker='item-view/add-to-favorites'] | "
+                        "//button[@data-marker='item-view/favorite-button'] | "
                         "//button[contains(@class,'favorites-button')] | "
                         "//button[contains(@aria-label,'избранн')] | "
                         "//button[contains(@aria-label,'Добавить в избранное')]",
@@ -676,9 +685,10 @@ def view_listing(
                     EC.element_to_be_clickable(
                         (
                             By.XPATH,
-                            "//button[@data-marker='item-contact-bar/call'] | "
-                            "//button[contains(@class,'phone-button')] | "
-                            "//button[.//span[contains(text(),'Позвонить')]]",
+                        "//button[@data-marker='item-phone-button/card'] | "
+                        "//button[@data-marker='item-phone-button/header'] | "
+                        "//button[contains(@class,'phone-button')] | "
+                        "//button[.//span[contains(text(),'Позвонить')]]",
                         )
                     )
                 )
@@ -881,6 +891,9 @@ def _pick_cycle_kind(
         weights = {k: (0.0 if k == "outbound_only" else float(v)) for k, v in weights.items()}
     kinds = list(weights.keys())
     probs = [float(weights[k]) for k in kinds]
+    # Guard: если все веса нулевые (кривой config) — fallback на "full".
+    if sum(probs) <= 0:
+        return "full"
     # random.choices гарантирует выбор хотя бы одного, если суммa > 0.
     # _CYCLE_KINDS_WARMUP содержит 0 для messenger_only — это нормально.
     return random.choices(kinds, weights=probs, k=1)[0]
@@ -892,8 +905,9 @@ def _do_profile_check(driver, account_name: str) -> None:
     Не парсим, не отвечаем — просто визит. Имитирует «зашёл проверить
     своё». В 30% случаев заглядываем ещё и в /profile/favorites.
     """
+    stop_ev = _tg.get_account_stop_event(account_name)
     safe_get(driver, "https://www.avito.ru/profile", account_name)
-    hp(30, 60)
+    hp(30, 60, stop_event=stop_ev)
     if random.random() < 0.3:
         safe_get(driver, "https://www.avito.ru/profile/favorites", account_name)
         hp(20, 40)
@@ -1120,9 +1134,9 @@ def browse_commercial_categories(
             continue
 
         hrefs = [
-            lnk.get_attribute("href")
+            h
             for lnk in random.sample(links, min(n_ads, len(links)))
-            if lnk.get_attribute("href")
+            if (h := lnk.get_attribute("href"))
         ]
 
         for i, href in enumerate(hrefs, 1):
@@ -1203,12 +1217,12 @@ def find_and_view_commercial_listings(
     # F2: случайное число листингов [1, max_listings_per_search] с весами.
     _n = _weighted_listing_count(max_n=max_listings_per_search)
     log(account_name, f"  F2: листингов в этом запросе={_n}")
-    # T11: сохраняем (href, element) пары — element нужен для Ctrl+Click,
-    # href — для fallback safe_get и для проверки is_new по БД.
+    # T11: сохраняем только href — element'ы станут stale после первой навигации.
+    # Ctrl+Click path (30%) будет re-find'ить элемент по href перед кликом.
     sampled = random.sample(links, min(_n, len(links)))
-    targets = [(lnk.get_attribute("href"), lnk) for lnk in sampled if lnk.get_attribute("href")]
+    targets = [lnk.get_attribute("href") for lnk in sampled if lnk.get_attribute("href")]
 
-    for i, (href, link_elem) in enumerate(targets, 1):
+    for i, href in enumerate(targets, 1):
         if _tg.is_stop_requested(account_name):
             break
         # A3: если внутри предыдущей итерации словили капчу — выходим.
@@ -1232,20 +1246,28 @@ def find_and_view_commercial_listings(
             use_new_tab = random.random() < 0.30
             opened_in_tab = False
             if use_new_tab:
-                with _new_tab_for_listing(
-                    driver, link_elem, stop_event=_tg.get_account_stop_event(account_name)
-                ) as ok:
-                    if ok:
-                        opened_in_tab = True
-                        log(account_name, "  T11: открыли в новой вкладке (Ctrl+Click)")
-                        listing_data = extract_listing_data(driver, wait, account_name, log)
-                        save_listing_to_db(listing_data, db_manager, log, account_name)
+                # Re-find element by href — previous references are stale after navigation.
+                link_elems = driver.find_elements(
+                    By.XPATH, f"//a[@data-marker='item-title'][@href='{href}']"
+                )
+                link_elem = link_elems[0] if link_elems else None
+                if link_elem is None:
+                    use_new_tab = False  # fallback to safe_get
+                else:
+                    with _new_tab_for_listing(
+                        driver, link_elem, stop_event=_tg.get_account_stop_event(account_name)
+                    ) as ok:
+                        if ok:
+                            opened_in_tab = True
+                            log(account_name, "  T11: открыли в новой вкладке (Ctrl+Click)")
+                            listing_data = extract_listing_data(driver, wait, account_name, log)
+                            save_listing_to_db(listing_data, db_manager, log, account_name)
 
-                        processed_count += 1
-                        if listing_data and is_new:
-                            new_listings_count += 1
-                # context exit: вкладка закрыта, мы снова на search-page.
-                hp(1.5, 3.5)
+                            processed_count += 1
+                            if listing_data and is_new:
+                                new_listings_count += 1
+                    # context exit: вкладка закрыта, мы снова на search-page.
+                    hp(1.5, 3.5)
 
             if not opened_in_tab:
                 # Fallback (или 70% базовый flow): safe_get + driver.back.
@@ -1987,6 +2009,7 @@ def _connect_with_retry(
                 return None
             time.sleep(1)
 
+        driver = None
         try:
             driver = connect_to_sphere(debug_port)
             wait = WebDriverWait(driver, 15)
@@ -1997,6 +2020,11 @@ def _connect_with_retry(
             raise Exception("Connection failed")
         except Exception as e:
             log(account_name, f"Connection fail: {e}. Rotating proxy...")
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
             new_proxy = _pick_rotation_proxy(cfg, exclude=tried_proxies)
             if new_proxy and update_profile_proxy(adspower, user_id, new_proxy):
                 tried_proxies.add(new_proxy)
@@ -2126,7 +2154,8 @@ def _sleep_until_tomorrow(account: dict, cfg: dict, account_name: str) -> None:
         f"F7: сегодня dead-day — спим {wait_secs / 3600:.1f} ч до завтра {start_hour:02d}:00.",
     )
     slept = 0.0
-    while slept < wait_secs and not _tg.get_account_stop_event(account_name).is_set():
+    stop_ev = _tg.get_account_stop_event(account_name)
+    while slept < wait_secs and not stop_ev.is_set():
         chunk = min(60.0, wait_secs - slept)
         time.sleep(chunk)
         slept += chunk
@@ -2200,7 +2229,15 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
         log(account_name, f"F8: cycle kind = {kind}")
 
         if kind == "full":
-            # J4: skip redundant browse — find_and_view already does category + city search
+            # Behavioral camouflage: перед парсингом — короткий browse по категориям,
+            # как реальный пользователь который сначала листает, потом открывает.
+            # Без этого бот сразу прыгает в find_and_view — паттерн автоматизации.
+            if random.random() < 0.6:
+                hp(3, 8, stop_event=_tg.get_account_stop_event(account_name))
+                client.browse_commercial_categories()
+                if _tg.is_stop_requested(account_name):
+                    break
+
             processed, new_listings, errors = client.find_and_view_commercial_listings()
             log(account_name, f"Processed {processed}, {new_listings} new, {errors} errors")
             if _tg.is_stop_requested(account_name):
@@ -2605,6 +2642,10 @@ def _launch_commercial_bot_threads(cfg=None):
     for t, acc in zip(threads, accounts):
         thread_account_map[t] = acc
 
+    # Watchdog: периодически чистим orphaned AdsPower profiles (zombie Chrome).
+    _WATCHDOG_INTERVAL = 300  # 5 минут
+    _last_watchdog = time.time()
+
     while not _tg.stop_event.is_set():
         alive_threads = []
         for t in list(thread_account_map.keys()):
@@ -2663,6 +2704,25 @@ def _launch_commercial_bot_threads(cfg=None):
         if not alive_threads and not thread_account_map:
             # Все потоки мертвы и ни один не перезапущен
             break
+
+        # Watchdog: каждые 5 мин проверяем orphaned AdsPower profiles.
+        # Если профиль запущен, но его нет среди живых потоков — останавливаем.
+        if time.time() - _last_watchdog > _WATCHDOG_INTERVAL:
+            _last_watchdog = time.time()
+            active_user_ids = set()
+            for _t, _acc in thread_account_map.items():
+                if _t.is_alive():
+                    uid = _acc.get("user_id") or _acc.get("adspower_id")
+                    if uid:
+                        active_user_ids.add(uid)
+            for acc in accounts:
+                uid = acc.get("user_id") or acc.get("adspower_id")
+                if uid and uid not in active_user_ids:
+                    if adspower.is_profile_running(uid):
+                        _bot_logger.warning(
+                            "Watchdog: orphaned profile %s (no alive thread) — stopping", uid
+                        )
+                        adspower.stop_profile(uid)
 
         # Проверяем каждые 10 секунд
         _tg.stop_event.wait(timeout=10)
@@ -2732,23 +2792,19 @@ def main():
         from tg_bot import TelegramController
 
         tg_ctrl = TelegramController(tg_token, tg_admin)
+        # Shared DB для TG-команд — один экземпляр на весь процесс.
+        tg_ctrl.set_db_manager(DatabaseManager())
         _tg._tg_controller = tg_ctrl
         tg_ctrl.set_run_callback(lambda: _launch_commercial_bot_threads(_load_cfg()))
         # E4: ERROR/CRITICAL → мгновенно в TG админу.
         install_tg_alert_handler(tg_ctrl.notify)
         threading.Thread(target=tg_ctrl.start_polling, daemon=True).start()
 
-        try:
-            input()
-        except (KeyboardInterrupt, EOFError):
-            # Ctrl-C / EOF — нормальные пути завершения main.
-            # Signal handler уже обрабатывает SIGINT, но если input() поймал
-            # KeyboardInterrupt до handler'а — вызываем shutdown вручную.
-            if not _tg.stop_event.is_set():
-                _graceful_shutdown(signal.SIGINT, None)
-            pass
-        if not _tg.is_running():
-            _launch_commercial_bot_threads(cfg)
+        _bot_logger.info("TG bot polling started. Waiting for /start command in Telegram...")
+
+        # Держим main thread живым — потоки запускаются через TG callback.
+        # stop_event.wait() блокирует до graceful shutdown (SIGINT/SIGTERM).
+        _tg.stop_event.wait()
     else:
         _launch_commercial_bot_threads(cfg)
 

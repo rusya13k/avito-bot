@@ -151,11 +151,11 @@ def _extract_title(wait) -> str:
 
 
 def _extract_price(driver) -> float:
-    """Цена из item-view/price. C5: до 3s ждём, страница может догружаться.
+    """Цена из item-view/item-price. C5: до 3s ждём, страница может догружаться.
     Возвращаем 0.0 sentinel — _nil_if маппит в None при сохранении в БД.
     """
     try:
-        price_elem = _wf(driver, "//span[@data-marker='item-view/price']")
+        price_elem = _wf(driver, "//span[@data-marker='item-view/item-price']")
         price_text = price_elem.text.replace("₽", "").replace(" ", "").replace("\n", "")
         return float(re.sub(r"[^\d,]", "", price_text).replace(",", "."))
     except Exception:
@@ -163,19 +163,43 @@ def _extract_price(driver) -> float:
 
 
 def _extract_description(driver) -> str:
-    """Текст описания из item-description. Пустая строка если нет."""
+    """Текст описания из item-view/item-description. Пустая строка если нет."""
     try:
-        desc_elem = _wf(driver, "//div[@data-marker='item-description']")
+        desc_elem = _wf(driver, "//div[@data-marker='item-view/item-description']")
         return desc_elem.text
     except Exception:
         return ""
 
 
 def _extract_location(driver) -> str:
-    """Локация из item-view/item-location//span. Sentinel "Неизвестно"."""
+    """Локация: пробуем несколько стратегий — geo-span рядом с картой,
+    breadcrumbs, или координаты из item-map-wrapper. Sentinel "Неизвестно".
+    """
     try:
-        location_elem = _wf(driver, "//div[@data-marker='item-view/item-location']//span")
-        return location_elem.text
+        # Стратегия 1: span с адресом рядом с картой (стабильный паттерн)
+        map_wrapper = driver.find_elements(By.XPATH, "//*[@data-marker='item-map-wrapper']")
+        if map_wrapper:
+            # Адрес обычно в предыдущем sibling-блоке карты
+            addr_spans = driver.find_elements(
+                By.XPATH,
+                "//*[@data-marker='item-map-wrapper']/preceding::span[contains(@class, 'geo')]"
+                " | //*[@data-marker='item-map-wrapper']/..//span[string-length(text()) > 5]",
+            )
+            for span in addr_spans:
+                text = span.text.strip()
+                if text and len(text) > 5 and ("," in text or "ул" in text.lower() or "пр" in text.lower()):
+                    return text
+        # Стратегия 2: itemprop address
+        addr_elem = driver.find_elements(By.XPATH, "//*[@itemprop='address']")
+        if addr_elem:
+            return addr_elem[0].text.strip() or "Неизвестно"
+        # Стратегия 3: breadcrumbs последний элемент (город/район)
+        crumbs = driver.find_elements(
+            By.XPATH, "//div[@data-marker='breadcrumbs']//span[@itemprop='name']"
+        )
+        if crumbs:
+            return crumbs[-1].text.strip() or "Неизвестно"
+        return "Неизвестно"
     except Exception:
         return "Неизвестно"
 
@@ -220,29 +244,52 @@ def _extract_category(driver, title: str) -> str:
 def _extract_seller_info(driver) -> dict:
     """Информация о продавце: seller_name + profile_url + profile_id +
     active_listings_count. Возвращает dict, готовый для merge в listing_data.
+
+    Новая вёрстка Avito (2025+): нет data-marker для seller-info.
+    Имя продавца — в span с title внутри блока item-view/item-view-contacts.
+    Ссылка на профиль — ближайший <a> с href содержащим /user/ или /brands/.
     """
     try:
-        seller_name_elem = _wf(driver, "//div[@data-marker='seller-info/username']//a")
-        seller_name = seller_name_elem.text
-        profile_url = seller_name_elem.get_attribute("href")
-
-        profile_id_match = re.search(r"/user/([^/]+)", profile_url or "")
-        profile_id = profile_id_match.group(1) if profile_id_match else "unknown"
-
-        try:
-            active_elem = _wf(
-                driver, "//div[@data-marker='seller-info/active-ads-count']", timeout=1
+        # Стратегия 1: meta-тег vk:seller_name (самый стабильный)
+        seller_name = "Неизвестно"
+        meta_seller = driver.find_elements(
+            By.XPATH, "//meta[@property='vk:seller_name']"
+        )
+        if meta_seller:
+            seller_name = meta_seller[0].get_attribute("content") or "Неизвестно"
+        else:
+            # Стратегия 2: span с title внутри contacts-блока
+            contacts_block = driver.find_elements(
+                By.XPATH, "//*[@data-marker='item-view/item-view-contacts']"
             )
-            count_match = re.search(r"\d+", active_elem.text)
-            active_count = int(count_match.group()) if count_match else 0
-        except Exception:
-            active_count = 0
+            if contacts_block:
+                name_spans = contacts_block[0].find_elements(
+                    By.XPATH, ".//span[@title]"
+                )
+                for span in name_spans:
+                    title = span.get_attribute("title") or ""
+                    if title and len(title) > 1:
+                        seller_name = title
+                        break
+
+        # Ссылка на профиль
+        profile_url = ""
+        profile_id = "unknown"
+        profile_links = driver.find_elements(
+            By.XPATH,
+            "//*[@data-marker='item-view/item-view-contacts']"
+            "//a[contains(@href,'/user/') or contains(@href,'/brands/')]",
+        )
+        if profile_links:
+            profile_url = profile_links[0].get_attribute("href") or ""
+            profile_id_match = re.search(r"/user/([^/?]+)", profile_url)
+            profile_id = profile_id_match.group(1) if profile_id_match else "unknown"
 
         return {
             "seller_name": seller_name,
             "profile_url": profile_url,
             "profile_id": profile_id,
-            "active_listings_count": active_count,
+            "active_listings_count": 0,
         }
     except Exception:
         return {
@@ -254,21 +301,226 @@ def _extract_seller_info(driver) -> dict:
 
 
 def _extract_publication_date(driver) -> str:
-    """Дата публикации из item-view/date. Пустая строка если нет."""
+    """Дата публикации из item-view/item-date. Пустая строка если нет."""
     try:
-        date_elem = _wf(driver, "//div[@data-marker='item-view/date']", timeout=1)
+        date_elem = _wf(driver, "//*[@data-marker='item-view/item-date']", timeout=1)
         return date_elem.text
     except Exception:
         return ""
 
 
 def _extract_photos(driver, max_n: int = 3) -> list[str]:
-    """Первые `max_n` URL фото из image-frame/image. [] если нет."""
+    """Первые `max_n` URL фото из image-preview/item или image-frame/image-wrapper. [] если нет."""
     try:
-        photo_elements = driver.find_elements(By.XPATH, "//img[@data-marker='image-frame/image']")
-        return [p.get_attribute("src") for p in photo_elements[:max_n]]
+        # Новая вёрстка: превью-лента
+        photo_elements = driver.find_elements(
+            By.XPATH,
+            "//ul[@data-marker='image-preview/preview-wrapper']"
+            "//li[@data-marker='image-preview/item']//img",
+        )
+        if not photo_elements:
+            # Fallback: основная галерея
+            photo_elements = driver.find_elements(
+                By.XPATH, "//*[@data-marker='image-frame/image-wrapper']//img"
+            )
+        urls = []
+        for p in photo_elements[:max_n]:
+            src = p.get_attribute("src") or p.get_attribute("data-src") or ""
+            if src and "avito" in src:
+                urls.append(src)
+        return urls
     except Exception:
         return []
+
+
+def _visit_seller_profile(driver, listing_data: dict, log_func, account_name: str) -> None:
+    """Открывает профиль продавца в новой вкладке, считает активные объявления
+    и количество похожих (в той же категории). Мутирует listing_data:
+      - active_listings_count: общее число активных объявлений продавца
+      - similar_listings_count: число объявлений в той же категории (недвижимость)
+
+    Работает через новую вкладку — текущая страница объявления не теряется.
+    При любой ошибке — молча возвращает, не ломая основной парсинг.
+    """
+    profile_url = listing_data.get("profile_url", "")
+    if not profile_url:
+        return
+
+    original_window = driver.current_window_handle
+    try:
+        # Снимаем snapshot handles ДО открытия — чтобы точно найти новую вкладку.
+        handles_before = set(driver.window_handles)
+        # Открываем профиль в новой вкладке
+        driver.execute_script("window.open(arguments[0], '_blank');", profile_url)
+        # Ждём появления новой вкладки (до 3 сек)
+        new_handle = None
+        for _ in range(6):
+            diff = set(driver.window_handles) - handles_before
+            if diff:
+                new_handle = diff.pop()
+                break
+            time.sleep(0.5)
+        if not new_handle:
+            return
+        driver.switch_to.window(new_handle)
+
+        # Ждём загрузки страницы профиля (до 8 сек)
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//div[@data-marker='profile-item']"
+                     " | //*[contains(@data-marker,'item')]//a[@data-marker='item-title']"
+                     " | //*[@data-marker='profile/summary']")
+                )
+            )
+        except TimeoutException:
+            # Страница не загрузилась — закрываем и уходим
+            driver.close()
+            driver.switch_to.window(original_window)
+            return
+
+        # Парсим количество объявлений
+        _parse_seller_profile_listings(driver, listing_data, log_func, account_name)
+
+    except Exception as e:
+        log_func(account_name, f"Ошибка визита в профиль продавца: {e}")
+    finally:
+        # Гарантированно закрываем вкладку и возвращаемся
+        try:
+            if driver.current_window_handle != original_window:
+                driver.close()
+                driver.switch_to.window(original_window)
+        except Exception:
+            # Если что-то пошло совсем не так — пробуем вернуться
+            try:
+                driver.switch_to.window(original_window)
+            except Exception:
+                pass
+
+
+def _parse_seller_profile_listings(
+    driver, listing_data: dict, log_func, account_name: str
+) -> None:
+    """Парсит страницу профиля продавца. Считает общее количество объявлений
+    и количество в категории недвижимости.
+
+    Авито профиль продавца показывает:
+    - Список объявлений (item-title ссылки)
+    - Счётчик "N объявлений" в шапке
+    - Категории/табы с числами
+    """
+    # Стратегия 1: ищем счётчик объявлений в шапке профиля
+    total_count = 0
+    try:
+        # Текст вида "42 объявления" или "Объявления (42)"
+        counter_elems = driver.find_elements(
+            By.XPATH,
+            "//*[contains(text(),'объявлен')]"
+            " | //*[contains(text(),'Объявлен')]",
+        )
+        for elem in counter_elems:
+            text = elem.text.strip()
+            match = re.search(r"(\d+)", text)
+            if match:
+                total_count = max(total_count, int(match.group(1)))
+                break
+    except Exception:
+        pass
+
+    # Стратегия 2: если счётчик не нашли — считаем карточки на странице
+    if total_count == 0:
+        try:
+            items = driver.find_elements(
+                By.XPATH,
+                "//a[@data-marker='item-title']"
+                " | //*[@data-marker='profile-item']",
+            )
+            total_count = len(items)
+        except Exception:
+            pass
+
+    listing_data["active_listings_count"] = total_count
+
+    # Считаем похожие (в категории недвижимость)
+    similar_count = 0
+    try:
+        items = driver.find_elements(By.XPATH, "//a[@data-marker='item-title']")
+        realty_keywords = [
+            "аренд", "помещен", "офис", "склад", "торгов", "коммерч",
+            "недвижим", "м²", "кв.м", "этаж",
+        ]
+        for item in items:
+            title_text = (item.text or "").lower()
+            href = (item.get_attribute("href") or "").lower()
+            combined = title_text + " " + href
+            if any(kw in combined for kw in realty_keywords):
+                similar_count += 1
+    except Exception:
+        pass
+
+    listing_data["similar_listings_count"] = similar_count
+
+    log_func(
+        account_name,
+        f"Профиль продавца: {total_count} объявлений, {similar_count} похожих (недвижимость)",
+    )
+
+
+def _extract_item_id(driver) -> str:
+    """ID объявления из item-view/item-id. Пустая строка если нет."""
+    try:
+        id_elem = _wf(driver, "//*[@data-marker='item-view/item-id']", timeout=1)
+        text = id_elem.text.replace("№", "").strip()
+        return re.sub(r"[^\d]", "", text)
+    except Exception:
+        return ""
+
+
+def _extract_views(driver) -> int:
+    """Общее количество просмотров из item-view/total-views. 0 если нет."""
+    try:
+        views_elem = _wf(driver, "//*[@data-marker='item-view/total-views']", timeout=1)
+        match = re.search(r"\d+", views_elem.text.replace(" ", ""))
+        return int(match.group()) if match else 0
+    except Exception:
+        return 0
+
+
+def _extract_params(driver) -> dict:
+    """Параметры помещения из item-view/item-params. {} если нет.
+    Возвращает dict вида {"Площадь": "18 м²", "Этаж": "1 из 5", ...}.
+    """
+    try:
+        params_block = driver.find_elements(
+            By.XPATH, "//*[@data-marker='item-view/item-params']//li"
+        )
+        result = {}
+        for li in params_block:
+            spans = li.find_elements(By.XPATH, ".//span")
+            if spans:
+                key = spans[0].text.strip().rstrip(":")
+                # Значение — текст li минус текст первого span
+                full_text = li.text.strip()
+                value = full_text.replace(spans[0].text, "").strip().lstrip(":")
+                if key:
+                    result[key] = value
+        return result
+    except Exception:
+        return {}
+
+
+def _extract_coordinates(driver) -> dict:
+    """Координаты из item-map-wrapper data-map-lat/lon. {} если нет."""
+    try:
+        map_el = driver.find_elements(By.XPATH, "//*[@data-marker='item-map-wrapper']")
+        if map_el:
+            lat = map_el[0].get_attribute("data-map-lat")
+            lon = map_el[0].get_attribute("data-map-lon")
+            if lat and lon:
+                return {"lat": float(lat), "lon": float(lon)}
+        return {}
+    except Exception:
+        return {}
 
 
 def _try_show_phone(driver, account_name: str, log_func, listing_data: dict) -> None:
@@ -314,7 +566,9 @@ def _try_show_phone(driver, account_name: str, log_func, listing_data: dict) -> 
 
     try:
         phone_btn = driver.find_element(
-            By.XPATH, "//button[@data-marker='item-contact-bar/call-button']"
+            By.XPATH,
+            "//button[@data-marker='item-phone-button/card']"
+            " | //button[@data-marker='item-phone-button/header']",
         )
         # T6: «Показать телефон» — самое палевное действие, кликаем
         # через Bezier-движение курсора + jitter, не «телепорт-click».
@@ -342,12 +596,26 @@ def _try_show_phone(driver, account_name: str, log_func, listing_data: dict) -> 
         return
 
     try:
+        # После клика номер появляется внутри кнопки или в соседнем элементе.
+        # Новая вёрстка: телефон рендерится как текст внутри item-phone-button
+        # или в отдельном span/a рядом. Пробуем несколько стратегий.
         phone_elem = WebDriverWait(driver, 5).until(
             EC.visibility_of_element_located(
-                (By.XPATH, "//span[@data-marker='item-contact-bar/phone']")
+                (
+                    By.XPATH,
+                    "//a[contains(@href,'tel:')]"
+                    " | //button[@data-marker='item-phone-button/card']//span[contains(text(),'+')]"
+                    " | //button[@data-marker='item-phone-button/card']//a"
+                    " | //*[contains(@class,'phone-number')]"
+                    " | //span[@data-marker='item-contact-bar/phone']",
+                )
             )
         )
-        listing_data["phone"] = normalize_phone(phone_elem.text)
+        phone_text = phone_elem.text or phone_elem.get_attribute("href") or ""
+        # href может быть tel:+79001234567
+        if phone_text.startswith("tel:"):
+            phone_text = phone_text[4:]
+        listing_data["phone"] = normalize_phone(phone_text)
         # A3: успешный клик — обновляем in-memory счётчики.
         # Метрика phone_clicks в БД инкрементируется в save_listing_to_db
         # через флаг _PHONE_CLICKED_FLAG.
@@ -399,6 +667,14 @@ def extract_listing_data(driver, wait, account_name, log_func):
         listing_data.update(_extract_seller_info(driver))
         listing_data["date_published"] = _extract_publication_date(driver)
         listing_data["photo_urls"] = _extract_photos(driver)
+        listing_data["item_id"] = _extract_item_id(driver)
+        listing_data["views"] = _extract_views(driver)
+        listing_data["params"] = _extract_params(driver)
+        listing_data["coordinates"] = _extract_coordinates(driver)
+
+        # Визит в профиль продавца для подсчёта активных объявлений.
+        # Открываем в новой вкладке, парсим, закрываем — не теряем текущую страницу.
+        _visit_seller_profile(driver, listing_data, log_func, account_name)
 
         # A3: попытка клика «Показать телефон» (мутирует listing_data).
         _try_show_phone(driver, account_name, log_func, listing_data)

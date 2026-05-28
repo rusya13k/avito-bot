@@ -280,10 +280,11 @@ class _Entry:
     budget_alert_sent: dict = field(default_factory=dict)
 
     # ── F5b: dialog_id'ы, которые бот решил никогда не отвечать ──────────
-    # Bросок 5% при первом просмотре нового диалога (см. AvitoMessenger).
+    # Бросок 5% при первом просмотре нового диалога (см. AvitoMessenger).
     # State in-memory, сбрасывается при рестарте — это допустимо: после
     # рестарта максимум один раз ответим «сразу», что не страшно.
-    ignored_dialogs: set = field(default_factory=set)
+    # TTL-eviction: храним (dialog_id, timestamp), чистим старше 7 дней.
+    ignored_dialogs: dict = field(default_factory=dict)  # {dialog_id: unix_ts}
 
     # ── F7: random «dead days» ────────────────────────────────────────────
     # Per-account override базовой вероятности dead-day. None ⇒ глобальный
@@ -712,7 +713,10 @@ class AccountState:
         AvitoMessenger при первом просмотре нового диалога (5% chance).
         """
         with self._lock:
-            self._get(account_name).ignored_dialogs.add(int(dialog_id))
+            entry = self._get(account_name)
+            entry.ignored_dialogs[int(dialog_id)] = time.time()
+            # TTL eviction: чистим записи старше 7 дней при каждом add
+            self._evict_ignored_dialogs(entry)
 
     def is_dialog_ignored(self, account_name: str, dialog_id: int) -> bool:
         """F5b: True если данный диалог в этом процессе уже помечен как ignored."""
@@ -721,6 +725,13 @@ class AccountState:
             if entry is None:
                 return False
             return int(dialog_id) in entry.ignored_dialogs
+
+    def _evict_ignored_dialogs(self, entry: _Entry) -> None:
+        """Удаляет записи старше 7 дней из ignored_dialogs. Вызывать под lock."""
+        cutoff = time.time() - 7 * 86400
+        stale = [did for did, ts in entry.ignored_dialogs.items() if ts < cutoff]
+        for did in stale:
+            del entry.ignored_dialogs[did]
 
     # ──────────────────────────────────────────────────────────────────────
     # User-resume (SMS / login captcha)

@@ -261,6 +261,9 @@ class TelegramController:
         self.admin_id = int(admin_id) if admin_id else 0
         self.bot = telebot.TeleBot(token, parse_mode=None)
         self._run_callback = None
+        # Shared DatabaseManager — передаётся через set_db_manager() из bot.main().
+        # До вызова set_db_manager() команды создадут свой экземпляр (fallback).
+        self._db = None
         # Состояние диалога: {chat_id: {"state": str, "data": dict}}
         self._state: dict = {}
         # L5: cfg-кэш с mtime-инвалидацией. _cfg() раньше читал config.json
@@ -278,6 +281,18 @@ class TelegramController:
 
     def set_run_callback(self, fn):
         self._run_callback = fn
+
+    def set_db_manager(self, db_manager) -> None:
+        """Передать shared DatabaseManager из bot.main() — один на весь процесс."""
+        self._db = db_manager
+
+    def _get_db(self):
+        """Возвращает shared DatabaseManager или создаёт fallback."""
+        if self._db is not None:
+            return self._db
+        from database import DatabaseManager
+        self._db = DatabaseManager()
+        return self._db
 
     def notify(self, text: str):
         if self.admin_id:
@@ -502,9 +517,8 @@ class TelegramController:
             else:
                 since = time.strftime("%Y-%m-%d 00:00:00", time.localtime())
                 title = f"за сегодня ({since[:10]})"
-            from database import DatabaseManager
 
-            db = DatabaseManager()
+            db = self._get_db()
             s = db.get_daily_summary(since)
             lines = [
                 f"📊 Сводка {title}",
@@ -541,11 +555,10 @@ class TelegramController:
         try:
             from account_state import account_state as _astate
             from accounts import load_accounts
-            from database import DatabaseManager
 
             cfg = self._cfg()
             accounts_list = load_accounts(self.BASE, cfg)
-            db = DatabaseManager()
+            db = self._get_db()
             today = time.strftime("%Y-%m-%d 00:00:00")
             lines = ["💰 Бюджет аккаунтов на сегодня", ""]
             if not accounts_list:
@@ -595,9 +608,8 @@ class TelegramController:
                 return
             name = parts[1]
             limit = int(parts[2]) if len(parts) > 2 else 5
-            from database import DatabaseManager
 
-            db = DatabaseManager()
+            db = self._get_db()
             rows = db.get_captcha_log(name, limit=limit)
             if not rows:
                 self.bot.reply_to(message, f"Нет капча-инцидентов для '{name}'.")
@@ -665,11 +677,10 @@ class TelegramController:
             from account_state import account_state as _astate
             from account_state import compute_account_health
             from accounts import load_accounts
-            from database import DatabaseManager
 
             parts = (message.text or "").split()
             cfg = self._cfg()
-            db = DatabaseManager()
+            db = self._get_db()
 
             if len(parts) > 1:
                 target_accounts = [{"name": parts[1]}]
@@ -1241,16 +1252,8 @@ class TelegramController:
         cid = call.message.chat.id
         idx = int(call.data.replace("acc_stop_", ""))
 
-        # Load cfg here correctly.
-        try:
-            with open(Path(__file__).parent / "config.json", encoding="utf-8") as f:
-                import json
-
-                cfg = json.load(f)
-        except Exception:
-            cfg = {}
-
-        accounts = cfg.get("accounts", [])
+        # G2: читаем аккаунты из единого источника (accounts.json → legacy cfg).
+        accounts = self._accounts()
         if 0 <= idx < len(accounts):
             acc_name = accounts[idx]["name"]
             get_account_stop_event(acc_name).set()
@@ -1642,10 +1645,9 @@ class TelegramController:
     def _cb_reclassify_all(self, call):
         cid = call.message.chat.id
         try:
-            from database import DatabaseManager
             from listing_classifier import ListingClassifier
 
-            db_manager = DatabaseManager()
+            db_manager = self._get_db()
             # L4: один _cfg() вместо двух — не дёргаем диск дважды.
             cfg = self._cfg()
             llm_config = {
@@ -1672,9 +1674,8 @@ class TelegramController:
         # без write_lock, без надёжного close при exception.
         cid = call.message.chat.id
         try:
-            from database import DatabaseManager
 
-            stats = DatabaseManager().get_classification_stats()
+            stats = self._get_db().get_classification_stats()
             if not stats["total"]:
                 self._send(cid, "📊 Нет классифицированных объявлений.", kb_classification())
             else:

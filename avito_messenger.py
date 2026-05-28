@@ -13,7 +13,7 @@ import tg_bot as _tg
 from account_state import account_state as _astate
 from human_delay import human_delay as _human_delay
 from human_mouse import human_click as _human_click
-from human_typing import persona_speed_multiplier
+from human_typing import length_speed_multiplier, persona_speed_multiplier
 from human_typing import type_human as _type_human
 from llm_sanitizer import sanitize_llm_reply
 
@@ -190,6 +190,9 @@ class AvitoMessenger:
         # T5: persona-driven typing speed multiplier.
         self.persona = persona
         self.typing_speed_multiplier = persona_speed_multiplier(persona)
+        # Fix: per-(dialog_id, text) cached lognormal target — не перебрасываем
+        # кости каждый цикл, гарантируя сходимость ответа.
+        self._reply_targets: dict[tuple[int, str], float] = {}
 
     def process_messages(self, log_func):
         """Main entry point for processing new messages"""
@@ -262,7 +265,7 @@ class AvitoMessenger:
                     )
                     if unread_indicator:
                         is_unread = True
-                except:
+                except Exception:
                     pass
 
                 if not is_unread:
@@ -281,7 +284,7 @@ class AvitoMessenger:
                     _ = dialog.find_element(
                         By.XPATH, ".//*[@data-marker='messenger/chat-item/last-message']"
                     ).text
-                except:
+                except Exception:
                     visitor_name = "Unknown"
 
                 # B3: пытаемся вытащить устойчивый ID визитёра из самой карточки
@@ -340,7 +343,7 @@ class AvitoMessenger:
                     listing_id = listing["id"]
                     listing_description = listing.get("description", "")
                     listing_price = listing.get("price", "Не указана")
-            except:
+            except Exception:
                 pass
 
             # B3: устойчивый visitor_id (channel_id из URL > dom_uid > composite > имя).
@@ -384,7 +387,7 @@ class AvitoMessenger:
 
                     # Save message to DB
                     self.db.add_message(dialog_id, direction, text, timestamp)
-                except:
+                except Exception:
                     continue
 
             if not chat_history:
@@ -564,13 +567,18 @@ class AvitoMessenger:
             return True
         age_min = age_seconds / 60.0
 
-        target_min = max(
-            self.min_reply_age_min,
-            min(
-                self.max_reply_age_min,
-                random.lognormvariate(self.reply_delay_mu, self.reply_delay_sigma),
-            ),
-        )
+        # Fix: кешируем target для (dialog_id, text) — не перебрасываем кости
+        # каждый цикл, гарантируя что ответ рано или поздно будет отправлен.
+        cache_key = (int(dialog_id), last_in_text)
+        if cache_key not in self._reply_targets:
+            self._reply_targets[cache_key] = max(
+                self.min_reply_age_min,
+                min(
+                    self.max_reply_age_min,
+                    random.lognormvariate(self.reply_delay_mu, self.reply_delay_sigma),
+                ),
+            )
+        target_min = self._reply_targets[cache_key]
 
         if age_min < target_min:
             log_func(
@@ -584,7 +592,7 @@ class AvitoMessenger:
     def _send_message(self, text, log_func=None):
         """Types and sends a message in the current chat. Returns True on success."""
         try:
-            if _stopping():
+            if _stopping(self.account_name):
                 return False
             input_box = self.wait.until(
                 EC.presence_of_element_located(
@@ -597,12 +605,14 @@ class AvitoMessenger:
             )
             hp(0.5, 1)
             # T5: persona-driven typing speed (молодой быстрее, инвестор медленнее).
-            if not human_type(input_box, text, speed_multiplier=self.typing_speed_multiplier):
+            # + адаптивный множитель по длине сообщения (короткие — быстрее).
+            effective_multiplier = self.typing_speed_multiplier * length_speed_multiplier(text)
+            if not human_type(input_box, text, speed_multiplier=effective_multiplier):
                 # Stop signaled mid-typing — do NOT send a half-typed message.
                 return False
             hp(0.5, 1)
 
-            if _stopping():
+            if _stopping(self.account_name):
                 return False
 
             # C5: кнопка send иногда отрендерена не сразу после ввода текста.
