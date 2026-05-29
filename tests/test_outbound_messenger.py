@@ -68,9 +68,9 @@ def test_generate_first_message_no_llm_returns_none():
 
 
 def test_generate_first_message_no_client_returns_none():
-    """LLM есть, но client=None (нет API-ключа) → None."""
+    """LLM есть, но api_key пустой → None."""
     llm = MagicMock()
-    llm.client = None
+    llm.api_key = ""
     listing = {"title": "Офис 50 м"}
     assert _generate_first_message(llm, listing, "small_business_office") is None
 
@@ -79,12 +79,9 @@ def test_generate_first_message_calls_llm_with_prompts():
     """LLM получает system+user message, оба не пустые, в user есть
     persona_description."""
     llm = MagicMock()
-    llm.client = MagicMock()
+    llm.api_key = "test-key"
     llm.model = "gpt-3.5-turbo"
-    response = MagicMock()
-    response.choices = [MagicMock()]
-    response.choices[0].message.content = "Привет! Ищу партнеров для стройки"
-    llm.client.chat.completions.create.return_value = response
+    llm._call_llm = MagicMock(return_value="Привет! Ищу партнеров для стройки")
 
     listing = {
         "title": "Офис 50 м в центре",
@@ -98,26 +95,22 @@ def test_generate_first_message_calls_llm_with_prompts():
     assert result is not None
     assert "партнер" in result.lower() or "стройк" in result.lower()
     # LLM был вызван 1 раз
-    assert llm.client.chat.completions.create.called
-    call = llm.client.chat.completions.create.call_args
-    messages = call.kwargs.get("messages") or call.args[0] if call.args else call.kwargs["messages"]
-    # Должно быть 2 сообщения: system + user
-    assert len(messages) == 2
+    assert llm._call_llm.called
+    call = llm._call_llm.call_args
+    # Проверяем что system_message и user_message переданы
+    kwargs = call.kwargs
+    assert "system_message" in kwargs
+    assert "user_message" in kwargs
     # User-prompt содержит данные листинга
-    user_content = messages[1]["content"]
-    assert PERSONAS["tatarstan_developer"] in user_content
+    assert PERSONAS["tatarstan_developer"] in kwargs["user_message"]
 
 
 def test_generate_first_message_sanitizer_rejects_phone():
     """Если LLM выдаёт телефон в ответе — sanitizer заменяет его."""
     llm = MagicMock()
-    llm.client = MagicMock()
+    llm.api_key = "test-key"
     llm.model = "gpt-3.5-turbo"
-    response = MagicMock()
-    response.choices = [MagicMock()]
-    # LLM нарушил инструкции и впихнул телефон
-    response.choices[0].message.content = "Здравствуйте, звоните 89991234567!"
-    llm.client.chat.completions.create.return_value = response
+    llm._call_llm = MagicMock(return_value="Здравствуйте, звоните 89991234567!")
 
     listing = {"title": "Офис"}
     result = _generate_first_message(llm, listing, "small_business_office")
@@ -141,16 +134,21 @@ def test_pitch_persona_uses_pitch_prompt():
     pitch-prompt, в котором есть инструкции про «15 готовых арендных
     бизнесов» и партнёрство — а не обычный rent-prompt."""
     llm = MagicMock()
-    llm.client = MagicMock()
+    llm.api_key = "test-key"
     llm.model = "gpt-3.5-turbo"
-    response = MagicMock()
-    response.choices = [MagicMock()]
-    response.choices[0].message.content = (
-        "Здравствуйте. Занимаюсь строительством небольших ТЦ, есть 15 готовых "
-        "арендных бизнесов в Татарстане, ищу финансовых партнёров. "
-        "Окупаемость 6-8 лет. Интересно обсудить?"
-    )
-    llm.client.chat.completions.create.return_value = response
+
+    # Capture the call args to inspect prompts
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        return (
+            "Здравствуйте. Занимаюсь строительством небольших ТЦ, есть 15 готовых "
+            "арендных бизнесов в Татарстане, ищу финансовых партнёров. "
+            "Окупаемость 6-8 лет. Интересно обсудить?"
+        )
+
+    llm._call_llm = MagicMock(side_effect=fake_call_llm)
 
     listing = {
         "title": "Помещение свободного назначения",
@@ -164,10 +162,8 @@ def test_pitch_persona_uses_pitch_prompt():
     assert result is not None
 
     # Проверяем что в system prompt передан pitch-вариант
-    call = llm.client.chat.completions.create.call_args
-    messages = call.kwargs.get("messages") or call.args[0] if call.args else call.kwargs["messages"]
-    system_content = messages[0]["content"]
-    user_content = messages[1]["content"]
+    system_content = captured["system_message"]
+    user_content = captured["user_message"]
 
     # System prompt — pitch-версия (содержит ключевые маркеры)
     assert "15 готовых арендных бизнесов" in system_content
@@ -185,12 +181,16 @@ def test_rent_persona_uses_rent_prompt():
     """Для обычной (rent) персоны грузится исходный rent-prompt
     с обязательной ссылкой на объект."""
     llm = MagicMock()
-    llm.client = MagicMock()
+    llm.api_key = "test-key"
     llm.model = "gpt-3.5-turbo"
-    response = MagicMock()
-    response.choices = [MagicMock()]
-    response.choices[0].message.content = "Привет! Площадь 50 м интересна, можно посмотреть?"
-    llm.client.chat.completions.create.return_value = response
+
+    captured = {}
+
+    def fake_call_llm(**kwargs):
+        captured.update(kwargs)
+        return "Привет! Площадь 50 м интересна, можно посмотреть?"
+
+    llm._call_llm = MagicMock(side_effect=fake_call_llm)
 
     listing = {
         "title": "Офис 50 м",
@@ -203,9 +203,7 @@ def test_rent_persona_uses_rent_prompt():
     result = _generate_first_message(llm, listing, "regular_buyer")
     assert result is not None
 
-    call = llm.client.chat.completions.create.call_args
-    messages = call.kwargs.get("messages") or call.args[0] if call.args else call.kwargs["messages"]
-    system_content = messages[0]["content"]
+    system_content = captured["system_message"]
 
     # rent-prompt — содержит требование сослаться на объект
     assert "Сослаться на объект" in system_content or "объекта" in system_content
@@ -216,12 +214,9 @@ def test_rent_persona_uses_rent_prompt():
 def test_generate_first_message_strips_quotes():
     """LLM иногда оборачивает ответ в кавычки — мы их снимаем."""
     llm = MagicMock()
-    llm.client = MagicMock()
+    llm.api_key = "test-key"
     llm.model = "gpt-3.5-turbo"
-    response = MagicMock()
-    response.choices = [MagicMock()]
-    response.choices[0].message.content = '"Привет, актуально объявление?"'
-    llm.client.chat.completions.create.return_value = response
+    llm._call_llm = MagicMock(return_value='"Привет, актуально объявление?"')
 
     listing = {"title": "Офис"}
     result = _generate_first_message(llm, listing, "tatarstan_developer")
@@ -245,8 +240,9 @@ def fake_db():
 @pytest.fixture
 def fake_llm():
     llm = MagicMock()
-    llm.client = MagicMock()
+    llm.api_key = "test-key"
     llm.model = "gpt-3.5-turbo"
+    llm._call_llm = MagicMock(return_value=None)
     return llm
 
 

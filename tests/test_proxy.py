@@ -4,8 +4,9 @@ A1: тесты per-account proxy (_apply_account_proxy).
 Проверяем:
 - account.get("proxy") используется как первый источник прокси.
 - При неудаче per-account прокси — fallback на proxies.txt.
-- Если ни один прокси не доступен — логируем ERROR и возвращаем None.
+- Если ни один прокси не доступен — спрашиваем админа в TG.
 - Успешный per-account proxy возвращается без обращения к proxies.txt.
+- __no_proxy__ если админ разрешил без прокси.
 
 L11: тесты для AdsPowerAPI.update_proxy (метод-инкапсуляция URL-сборки).
 
@@ -61,18 +62,33 @@ def test_per_account_proxy_fallback_on_failure(adspower):
     assert mock_upd.call_count == 2
 
 
-def test_no_proxy_at_all_returns_none_and_logs_error(adspower, caplog):
-    """Нет per-account прокси и proxies.txt пуст — возвращаем None, ERROR в лог."""
+def test_no_proxy_at_all_cancel_by_admin_returns_none(adspower, caplog):
+    """Нет per-account прокси и proxies.txt пуст — TG-опрос, cancel → None."""
     acc = _make_account(proxy=None)
     with (
         patch("bot.update_profile_proxy") as mock_upd,
         patch("bot.get_random_proxy", return_value=None),
-        caplog.at_level(logging.ERROR, logger="bot"),
+        patch("bot._wait_user_resume_for_login", return_value="cancel"),
+        caplog.at_level(logging.WARNING, logger="bot"),
     ):
         result = _apply_account_proxy(adspower, "u1", acc, "acc1")
     assert result is None
     mock_upd.assert_not_called()
     assert any("Нет доступного прокси" in r.message for r in caplog.records)
+
+
+def test_no_proxy_at_all_admin_allows_returns_sentinel(adspower, caplog):
+    """Нет per-account прокси и proxies.txt пуст — TG-опрос, continue → __no_proxy__."""
+    acc = _make_account(proxy=None)
+    with (
+        patch("bot.update_profile_proxy") as mock_upd,
+        patch("bot.get_random_proxy", return_value=None),
+        patch("bot._wait_user_resume_for_login", return_value="continue"),
+        caplog.at_level(logging.WARNING, logger="bot"),
+    ):
+        result = _apply_account_proxy(adspower, "u1", acc, "acc1")
+    assert result == "__no_proxy__"
+    mock_upd.assert_not_called()
 
 
 def test_no_per_account_proxy_uses_proxies_txt(adspower):
@@ -88,12 +104,13 @@ def test_no_per_account_proxy_uses_proxies_txt(adspower):
 
 
 def test_both_proxies_fail_returns_none(adspower, caplog):
-    """Per-account и proxies.txt оба не ставятся → None + ERROR."""
+    """Per-account и proxies.txt оба не ставятся — TG-опрос, cancel → None."""
     acc = _make_account(proxy="p:1")
     with (
         patch("bot.update_profile_proxy", return_value=False),
         patch("bot.get_random_proxy", return_value="p:2"),
-        caplog.at_level(logging.ERROR, logger="bot"),
+        patch("bot._wait_user_resume_for_login", return_value="cancel"),
+        caplog.at_level(logging.WARNING, logger="bot"),
     ):
         result = _apply_account_proxy(adspower, "u1", acc, "acc1")
     assert result is None
@@ -113,7 +130,6 @@ def test_update_proxy_success_with_credentials():
         ok = api.update_proxy("u1", "1.2.3.4:1080:alice:pwd")
 
     assert ok is True
-    # base должен быть нормализован (без trailing slash) и URL — собран из _url
     mock_post.assert_called_once()
     call_args = mock_post.call_args
     assert call_args.args[0] == "http://127.0.0.1:50325/api/v1/user/update"
@@ -124,7 +140,6 @@ def test_update_proxy_success_with_credentials():
     assert cfg["proxy_port"] == "1080"
     assert cfg["proxy_user"] == "alice"
     assert cfg["proxy_password"] == "pwd"
-    # При наличии api_key — Authorization header.
     assert call_args.kwargs["headers"]["Authorization"] == "Bearer secret"
 
 
@@ -154,8 +169,7 @@ def test_update_proxy_invalid_format_skips_http():
 
 
 def test_update_profile_proxy_wrapper_delegates_to_method():
-    """L11: top-level update_profile_proxy — тонкая обёртка над методом
-    (back-compat для tests/test_proxy.py, которые мокают этот символ)."""
+    """L11: top-level update_profile_proxy — тонкая обёртка над методом."""
     from bot import update_profile_proxy
 
     api = MagicMock(spec=AdsPowerAPI)
@@ -204,7 +218,6 @@ def test_probe_enabled_picks_healthy_per_account(adspower, tmp_path, monkeypatch
         result = _apply_account_proxy(adspower, "u1", acc, "acc1", cfg)
 
     assert result == "acc:1080"
-    # Кандидаты: per-account первый, потом fb из proxies.txt.
     args, kwargs = mock_probe.call_args
     candidates = list(args[0])
     assert candidates[0] == "acc:1080"
@@ -232,9 +245,8 @@ def test_probe_picks_healthy_from_pool_when_per_account_dead(adspower, tmp_path,
     mock_upd.assert_called_once_with(adspower, "u1", "p2:1080")
 
 
-def test_probe_all_fail_returns_none_with_error_log(adspower, tmp_path, monkeypatch, caplog):
-    """pick_healthy_proxy → (None, ProbeResult fail) → ERROR + None.
-    AdsPower update_proxy НЕ дёргается."""
+def test_probe_all_fail_asks_admin_tg(adspower, tmp_path, monkeypatch, caplog):
+    """pick_healthy_proxy → (None, ProbeResult fail) — TG-опрос, cancel → None."""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "proxies.txt").write_text("p1:1080\np2:1080\n", encoding="utf-8")
     acc = _make_account(proxy="dead:1080")
@@ -246,6 +258,7 @@ def test_probe_all_fail_returns_none_with_error_log(adspower, tmp_path, monkeypa
             return_value=(None, _fail("timeout")),
         ),
         patch("bot.update_profile_proxy") as mock_upd,
+        patch("bot._wait_user_resume_for_login", return_value="cancel"),
         caplog.at_level(logging.ERROR, logger="bot"),
     ):
         result = _apply_account_proxy(adspower, "u1", acc, "acc1", cfg)
@@ -255,8 +268,8 @@ def test_probe_all_fail_returns_none_with_error_log(adspower, tmp_path, monkeypa
     assert any("probe прокси провалились" in r.message for r in caplog.records)
 
 
-def test_probe_no_candidates_at_all_returns_none(adspower, tmp_path, monkeypatch, caplog):
-    """Нет ни per-account, ни proxies.txt → ERROR (как в legacy)."""
+def test_probe_no_candidates_asks_admin_tg(adspower, tmp_path, monkeypatch, caplog):
+    """Нет ни per-account, ни proxies.txt — TG-опрос, cancel → None."""
     monkeypatch.chdir(tmp_path)  # без proxies.txt
     acc = _make_account(proxy=None)
     cfg = {"proxy_probe_enabled": True}
@@ -264,7 +277,8 @@ def test_probe_no_candidates_at_all_returns_none(adspower, tmp_path, monkeypatch
     with (
         patch("proxy_health.pick_healthy_proxy") as mock_probe,
         patch("bot.update_profile_proxy") as mock_upd,
-        caplog.at_level(logging.ERROR, logger="bot"),
+        patch("bot._wait_user_resume_for_login", return_value="cancel"),
+        caplog.at_level(logging.WARNING, logger="bot"),
     ):
         result = _apply_account_proxy(adspower, "u1", acc, "acc1", cfg)
 
@@ -351,8 +365,7 @@ def test_probe_default_enabled_when_cfg_omits_flag(adspower, tmp_path, monkeypat
 
 
 def test_probe_legacy_when_cfg_is_none(adspower):
-    """cfg=None (default) → legacy-путь без probe — для back-compat существующих
-    тестов / вызовов которые не передают cfg."""
+    """cfg=None (default) → legacy-путь без probe — для back-compat."""
     acc = _make_account(proxy="acc:1080")
     with (
         patch("proxy_health.pick_healthy_proxy") as mock_probe,
@@ -360,8 +373,6 @@ def test_probe_legacy_when_cfg_is_none(adspower):
     ):
         result = _apply_account_proxy(adspower, "u1", acc, "acc1", None)
 
-    # Эта проверка важна: если кто-то меняет default, тест поймает.
-    # При cfg=None исходные тесты выше остаются актуальными.
     assert result == "acc:1080"
     mock_probe.assert_not_called()
     mock_upd.assert_called_once_with(adspower, "u1", "acc:1080")

@@ -26,6 +26,7 @@ Anti-fingerprinting:
 
 import logging
 import random
+import time
 
 from selenium.common.exceptions import (
     StaleElementReferenceException,
@@ -155,10 +156,10 @@ def _generate_first_message(llm_classifier, listing: dict, persona_id: str) -> s
     LLM получает context листинга + персону + случайные стилевые подсказки
     (formality, length, approach). Это даёт высокую вариативность даже
     при одной и той же персоне.
+
+    Retry: до 2 попыток при transient-ошибках (timeout, 5xx).
     """
-    if llm_classifier is None or getattr(llm_classifier, "client", None) is None:
-        # Без LLM не пишем первым: нет хорошего fallback'а — стандартный
-        # шаблон выдаст всех ботов с потрохами.
+    if llm_classifier is None or not getattr(llm_classifier, "api_key", ""):
         return None
 
     persona_description = PERSONAS.get(persona_id, "")
@@ -177,47 +178,53 @@ def _generate_first_message(llm_classifier, listing: dict, persona_id: str) -> s
         system_prompt_name = "outbound_first_message.system.txt"
         user_prompt_name = "outbound_first_message.user.txt"
 
-    try:
-        # Lazy import чтобы не плодить циклические зависимости.
-        from llm_classifier import _load_prompt
+    max_attempts = 2
+    for attempt in range(max_attempts):
+        try:
+            from llm_classifier import _load_prompt
 
-        system_message = _load_prompt(system_prompt_name)
-        # Pitch-prompt не использует area/price/description (B2B-питч не
-        # завязан на детали объявления), но передаём их форматтеру всегда —
-        # шаблон сам решит, какие плейсхолдеры взять.
-        user_prompt = _load_prompt(user_prompt_name).format(
-            title=listing.get("title", "—"),
-            category=listing.get("category", "коммерческая недвижимость"),
-            location=listing.get("location", "—"),
-            area=listing.get("area", "—"),
-            price=listing.get("price", "не указана"),
-            description=(listing.get("description") or "")[:600],
-            persona_description=persona_description,
-            formality=formality,
-            length=length,
-            approach=approach,
-        )
+            system_message = _load_prompt(system_prompt_name)
+            user_prompt = _load_prompt(user_prompt_name).format(
+                title=listing.get("title", "—"),
+                category=listing.get("category", "коммерческая недвижимость"),
+                location=listing.get("location", "—"),
+                area=listing.get("area", "—"),
+                price=listing.get("price", "не указана"),
+                description=(listing.get("description") or "")[:600],
+                persona_description=persona_description,
+                formality=formality,
+                length=length,
+                approach=approach,
+            )
 
-        response = llm_classifier.client.chat.completions.create(
-            model=llm_classifier.model,
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.95,  # выше дефолта (0.7) — нам нужна вариативность
-        )
-        raw = (response.choices[0].message.content or "").strip()
-        # Снимаем кавычки, если LLM их зачем-то добавил
-        raw = raw.strip('"').strip("'").strip()
+            raw = llm_classifier._call_llm(
+                system_message=system_message,
+                user_message=user_prompt,
+                temperature=0.95,
+            )
+            if raw is None:
+                if attempt < max_attempts - 1:
+                    time.sleep(2)
+                    continue
+                llm_classifier._incr_llm_error("outbound:empty")
+                return None
+            raw = raw.strip('"').strip("'").strip()
 
-        clean, reason = sanitize_llm_reply(raw)
-        if clean is None:
-            logger.info("outbound: LLM sanitizer отбросил (%s): %r", reason, raw[:100])
-            return None
-        return clean
-    except Exception as exc:
-        logger.warning("outbound: generate_first_message failed: %s", exc)
-        return None
+            clean, reason = sanitize_llm_reply(raw)
+            if clean is None:
+                logger.info("outbound: LLM sanitizer отбросил (%s): %r", reason, raw[:100])
+                return None
+            return clean
+        except Exception as exc:
+            logger.warning(
+                "outbound: generate_first_message attempt %d/%d failed: %s",
+                attempt + 1, max_attempts, exc,
+            )
+            if attempt < max_attempts - 1:
+                time.sleep(3)
+            else:
+                llm_classifier._incr_llm_error("outbound:api")
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,7 +256,7 @@ class OutboundMessenger:
         db_manager=None,
         llm_classifier=None,
         max_per_cycle: int = 3,
-        listing_min_age_hours: float = 1.0,
+        listing_min_age_hours: float = 4.0,
         between_messages_min_sec: float = 90.0,
         between_messages_max_sec: float = 240.0,
     ):
@@ -377,11 +384,26 @@ class OutboundMessenger:
             )
             return False
 
-        # 2. Открываем страницу листинга.
+        # 2. Открываем страницу листинга с referrer-симуляцией.
+        # Прямой driver.get() оставляет пустой referrer — паттерн бота.
+        # Реальный пользователь приходит из поиска или из списка объявлений.
         try:
-            self.driver.get(listing_url)
+            # Сначала переходим на страницу поиска (если ещё не там),
+            # чтобы referrer был avito.ru/...
+            current = self.driver.current_url or ""
+            if "avito.ru" not in current:
+                self.driver.get("https://www.avito.ru/")
+                _human_delay(
+                    2, 4,
+                    stop_event=_tg.get_account_stop_event(self.account_name),
+                    distribution="normal",
+                )
+            # Переход на листинг через JS — сохраняет referrer текущей страницы
+            self.driver.execute_script(
+                "window.location.href = arguments[0];", listing_url
+            )
         except WebDriverException as exc:
-            log_func(self.account_name, f"H1: driver.get({listing_url}) fail: {exc}")
+            log_func(self.account_name, f"H1: navigate to {listing_url} fail: {exc}")
             return False
 
         _human_delay(
@@ -443,13 +465,17 @@ class OutboundMessenger:
         """Клик «Написать сообщение» на странице листинга. Avito имеет
         несколько селекторов в зависимости от верстки. Пробуем по очереди.
         """
-        # Попытка 1: главная кнопка «Написать сообщение» в item-contact-bar.
+        # Актуальные селекторы Avito (2025-2026):
         candidates = [
+            "//a[@data-marker='messenger-button/link']",
+            "//*[@data-marker='messenger-button/link']",
+            "//a[@id='bx_contact_button_messenger']",
             "//button[@data-marker='item-contact-bar/message-button']",
             "//a[@data-marker='item-contact-bar/message-button']",
             "//*[@data-marker='item-contact-bar/message-button']",
-            "//button[contains(., 'Написать сообщение')]",
             "//a[contains(., 'Написать сообщение')]",
+            "//button[contains(., 'Написать сообщение')]",
+            "//a[contains(., 'Написать')]",
             "//button[contains(., 'Написать')]",
         ]
         for xpath in candidates:
@@ -514,7 +540,9 @@ class OutboundMessenger:
         # (см. self.persona_id) и через persona_speed_multiplier превращается
         # в множитель задержек (молодой → 0.95, инвестор → 1.20).
         try:
-            speed_mul = persona_speed_multiplier(self.persona_id)
+            from human_typing import length_speed_multiplier
+
+            speed_mul = persona_speed_multiplier(self.persona_id) * length_speed_multiplier(text)
             if not _type_human(
                 input_el,
                 text,

@@ -373,3 +373,24 @@ def persona_speed_multiplier(persona_id: str | None) -> float:
     if not persona_id:
         return 1.0
     return _PERSONA_SPEED_MULTIPLIERS.get(persona_id, 1.0)
+
+
+def length_speed_multiplier(text: str) -> float:
+    """Адаптивный множитель скорости в зависимости от длины сообщения.
+
+    Реальный человек:
+    - Короткие сообщения (<30 символов): печатает быстрее (×0.8) — "привет", "ок", "да"
+    - Средние (30-100): нормальная скорость (×1.0)
+    - Длинные (100-200): чуть медленнее (×1.1) — больше "задумчивых" пауз
+    - Очень длинные (>200): ещё медленнее (×1.2) — перечитывает, думает
+
+    Возвращает множитель для speed_multiplier.
+    """
+    n = len(text)
+    if n < 30:
+        return 0.8
+    if n <= 100:
+        return 1.0
+    if n <= 200:
+        return 1.1
+    return 1.2

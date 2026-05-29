@@ -53,7 +53,7 @@ DEFAULT_PROBE_URL = "https://api.ipify.org?format=json"
 DEFAULT_PROBE_URLS = [
     "https://api.ipify.org?format=json",
     "https://httpbin.org/ip",
-    "https://checkip.amazonaws.com",
+    "https://ifconfig.co/json",
 ]
 
 # ip-api.com — бесплатный geo-lookup без ключа (45 req/min с одного IP).

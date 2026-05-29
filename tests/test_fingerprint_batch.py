@@ -33,12 +33,11 @@ def test_scroll_gallery_uses_random_iters():
         patch("bot.hp"),
         patch("bot.random") as mock_rng,
     ):
-        mock_rng.randint.return_value = 3  # из 1..12 выбрали 3
+        mock_rng.choices.return_value = [3]  # weighted choice returns 3
         scroll_gallery(driver, wait)
 
-    # Проверяем что random.randint вызывался с границами 1..12.
-    randint_calls = [c for c in mock_rng.randint.call_args_list if c.args == (1, 12)]
-    assert len(randint_calls) >= 1, "scroll_gallery должен делать random.randint(1, 12)"
+    # Проверяем что random.choices вызывался (weighted distribution).
+    assert mock_rng.choices.call_count >= 1, "scroll_gallery должен делать random.choices (weighted)"
 
 
 def test_view_listing_calls_scroll_only_with_60pct_probability():

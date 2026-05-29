@@ -79,42 +79,51 @@ class ListingClassifier:
 
     def classify_all_listings(self):
         """
-        Classify all unclassified listings in the database
+        Classify all unclassified listings in the database.
+        Per-listing error handling — one bad listing doesn't stop the batch.
         """
         unclassified_listings = self.db_manager.get_unclassified_listings()
-        results = {"total_processed": 0, "owners": 0, "agents": 0, "uncertain": 0}
+        results = {"total_processed": 0, "owners": 0, "agents": 0, "uncertain": 0, "errors": 0}
 
         for listing in unclassified_listings:
-            # Classify the listing
-            result = self.classify_listing(listing)
+            try:
+                # Classify the listing
+                result = self.classify_listing(listing)
 
-            # Update listing in database
-            self.db_manager.update_listing_classification(
-                listing["id"],
-                result["classification"],
-                result["confidence"],
-                result["source"],
-                result["classified_at"],
-            )
-
-            # Update account classification if profile_id exists
-            if listing.get("profile_id") and listing["profile_id"] != "unknown":
-                self.db_manager.update_account_classification(
-                    listing["profile_id"],
+                # Update listing in database
+                self.db_manager.update_listing_classification(
+                    listing["id"],
                     result["classification"],
                     result["confidence"],
                     result["source"],
                     result["classified_at"],
                 )
 
-            # Update statistics
-            results["total_processed"] += 1
-            if result["classification"] == "owner":
-                results["owners"] += 1
-            elif result["classification"] == "agent":
-                results["agents"] += 1
-            else:
-                results["uncertain"] += 1
+                # Update account classification if profile_id exists
+                if listing.get("profile_id") and listing["profile_id"] != "unknown":
+                    self.db_manager.update_account_classification(
+                        listing["profile_id"],
+                        result["classification"],
+                        result["confidence"],
+                        result["source"],
+                        result["classified_at"],
+                    )
+
+                # Update statistics
+                results["total_processed"] += 1
+                if result["classification"] == "owner":
+                    results["owners"] += 1
+                elif result["classification"] == "agent":
+                    results["agents"] += 1
+                else:
+                    results["uncertain"] += 1
+            except Exception as exc:
+                logger.warning(
+                    "classify_all_listings: listing id=%s failed: %s",
+                    listing.get("id"),
+                    exc,
+                )
+                results["errors"] += 1
 
         return results
 

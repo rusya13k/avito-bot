@@ -34,6 +34,9 @@ def tg_ctrl(tmp_path, monkeypatch):
 
     monkeypatch.setattr(TelegramController, "BASE", tmp_path)
     ctrl = TelegramController(token="test", admin_id=42)
+    # Отключаем rate-limit 0.5s между сообщениями от одного uid:
+    # мешает тестам, которые шлют несколько callback-ов подряд.
+    ctrl._allowed = lambda uid: not ctrl.admin_id or uid == ctrl.admin_id
     return ctrl
 
 

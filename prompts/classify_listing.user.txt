@@ -3,4 +3,8 @@ Listing data:
 - Seller name: {seller_name}
 - Phone: {phone}
 - Profile id: {profile_id}
+- Active listings (from seller profile): {active_listings_count}
+- Similar listings in real estate category: {similar_listings_count}
+- Params: {params}
+- Views: {views}
 - Description: {description}

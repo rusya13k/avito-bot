@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from openai import OpenAI, OpenAIError
+import requests
 
 from database import DatabaseManager
 from heuristic_scorer import HeuristicScorer
@@ -35,12 +35,11 @@ _PROMPT_CACHE: dict[str, str] = {}
 
 class LLMClassifier:
     """
-    Тонкая обёртка над OpenAI-клиентом (>=1.0).
+    Обёртка над LLM API с поддержкой двух форматов:
+    - OpenAI-совместимый (/v1/chat/completions) — для GPT, Mistral, DeepSeek и т.д.
+    - Anthropic Messages (/v1/messages) — для Claude через vibecode и аналоги.
 
-    - Создаёт клиент один раз в __init__.
-    - При отсутствии api_key или сетевой ошибке делает fallback на heuristic-скорер,
-      который тоже инстанцируется один раз (не пересоздаём DatabaseManager на каждый запрос).
-    - Все ошибки LLM логируются (раньше тихо проваливались в except).
+    Авто-детект: если model содержит "claude" → Anthropic формат, иначе OpenAI.
     """
 
     DEFAULT_MODEL = "gpt-3.5-turbo"
@@ -62,30 +61,18 @@ class LLMClassifier:
         self.config = config
         self.api_key = (config.get("api_key") or "").strip()
         self.model = config.get("model") or self.DEFAULT_MODEL
-        self.api_base = (config.get("api_base") or self.DEFAULT_API_BASE).strip()
+        self.api_base = (config.get("api_base") or self.DEFAULT_API_BASE).strip().rstrip("/")
 
-        # Шаринг heuristic_scorer / db_manager на всё время жизни классификатора —
-        # вместо создания нового DatabaseManager() в каждом except.
+        # Авто-детект: Claude модели → Anthropic Messages API
+        self._is_anthropic = "claude" in self.model.lower()
+
+        # Шаринг heuristic_scorer / db_manager на всё время жизни классификатора
         if heuristic_scorer is not None:
             self._scorer = heuristic_scorer
         else:
             self._scorer = HeuristicScorer(db_manager or DatabaseManager())
 
-        # OpenAI client создаём только если есть ключ.
-        self.client: OpenAI | None = None
-        if self.api_key:
-            try:
-                self.client = OpenAI(
-                    api_key=self.api_key,
-                    base_url=self.api_base,
-                    timeout=self.REQUEST_TIMEOUT,
-                )
-            except Exception as exc:  # pragma: no cover — конструктор почти не падает
-                logger.warning("Не удалось создать OpenAI-клиент: %s", exc)
-                self.client = None
-
-        # E2: db для записи llm_errors-метрики. Используем уже имеющийся
-        # db_manager (или достаём через scorer, чтобы не плодить соединения).
+        # E2: db для записи llm_errors-метрики.
         self._db: DatabaseManager | None = db_manager or getattr(self._scorer, "db_manager", None)
 
         # J1: in-memory LRU-кэш для LLM-ответов (только reactive).
@@ -106,6 +93,71 @@ class LLMClassifier:
         except Exception as exc:  # pragma: no cover — не должно влиять на бизнес-флоу
             logger.debug("incr_metric llm_errors (%s) failed: %s", kind, exc)
 
+    def _call_llm(
+        self,
+        system_message: str,
+        user_message: str,
+        temperature: float = 0.0,
+        json_mode: bool = False,
+    ) -> str | None:
+        """Универсальный вызов LLM — авто-детект OpenAI vs Anthropic формата."""
+        if not self.api_key:
+            return None
+
+        if self._is_anthropic:
+            return self._call_anthropic(system_message, user_message, temperature)
+        return self._call_openai(system_message, user_message, temperature, json_mode)
+
+    def _call_anthropic(
+        self, system_message: str, user_message: str, temperature: float
+    ) -> str | None:
+        """Вызов через Anthropic Messages API (/v1/messages)."""
+        url = f"{self.api_base}/messages"
+        headers = {
+            "x-api-key": self.api_key,
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+        payload = {
+            "model": self.model,
+            "system": system_message,
+            "messages": [{"role": "user", "content": user_message}],
+            "max_tokens": 1024,
+            "temperature": temperature,
+        }
+        resp = requests.post(url, headers=headers, json=payload, timeout=self.REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
+        content_blocks = data.get("content", [])
+        if content_blocks:
+            return content_blocks[0].get("text", "").strip()
+        return None
+
+    def _call_openai(
+        self, system_message: str, user_message: str, temperature: float, json_mode: bool
+    ) -> str | None:
+        """Вызов через OpenAI Chat Completions API (/v1/chat/completions)."""
+        url = f"{self.api_base}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_message},
+            ],
+            "temperature": temperature,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        resp = requests.post(url, headers=headers, json=payload, timeout=self.REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        return (data["choices"][0]["message"]["content"] or "").strip()
+
     # ---------- classification ----------
 
     def classify_listing(self, listing_data: dict[str, Any]) -> tuple[str, float, str]:
@@ -114,38 +166,25 @@ class LLMClassifier:
 
         Если ключа нет / клиент недоступен / LLM ошибка / невалидный JSON —
         делаем fallback на эвристику.
-
-        D1: HeuristicScorer.calculate_score теперь возвращает 4-tuple
-        (label, confidence, reason, breakdown). Здесь нам breakdown не
-        нужен — мы держим узкую сигнатуру 3-tuple для совместимости
-        с прежним протоколом. ListingClassifier работает напрямую со
-        scorer'ом и breakdown получает там.
         """
-        if self.client is None:
+        if not self.api_key:
             return self._scorer.calculate_score(listing_data)[:3]
 
         try:
             user_prompt = self._create_classification_prompt(listing_data)
-            # D5: input/output логируются на DEBUG для тюнинга промптов
             logger.debug("classify_listing prompt: %s", user_prompt[:300])
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self._create_system_message()},
-                    {"role": "user", "content": user_prompt},
-                ],
+            content = self._call_llm(
+                system_message=self._create_system_message(),
+                user_message=user_prompt,
                 temperature=0.0,
-                response_format={"type": "json_object"},
+                json_mode=True,
             )
-            content = (response.choices[0].message.content or "").strip()
+            if content is None:
+                return self._scorer.calculate_score(listing_data)[:3]
             logger.debug("classify_listing output: %s", content[:300])
-        except OpenAIError as exc:
-            logger.warning("OpenAI classify_listing failed: %s — fallback на эвристику", exc)
-            self._incr_llm_error("classify:openai")
-            return self._scorer.calculate_score(listing_data)[:3]
-        except Exception as exc:  # сеть / таймаут / proxy
-            logger.warning("classify_listing unexpected error: %s — fallback на эвристику", exc)
-            self._incr_llm_error("classify:unexpected")
+        except Exception as exc:
+            logger.warning("classify_listing failed: %s — fallback на эвристику", exc)
+            self._incr_llm_error("classify:api")
             return self._scorer.calculate_score(listing_data)[:3]
 
         try:
@@ -173,12 +212,21 @@ class LLMClassifier:
     def _create_classification_prompt(self, listing_data: dict[str, Any]) -> str:
         # D5: шаблон + параметры. .format вместо f-string, потому что
         # шаблон лежит в файле как обычный текст.
+        params = listing_data.get("params") or {}
+        params_str = ", ".join(f"{k}: {v}" for k, v in params.items()) if params else "не указаны"
+        views = listing_data.get("views") or 0
+        active_count = listing_data.get("active_listings_count") or 0
+        similar_count = listing_data.get("similar_listings_count") or 0
         return _load_prompt("classify_listing.user.txt").format(
             title=listing_data.get("title", "") or "",
             description=(listing_data.get("description", "") or "")[:1500],
             seller_name=listing_data.get("seller_name", "") or "",
             phone=listing_data.get("phone", "") or "",
             profile_id=listing_data.get("profile_id", "") or "",
+            params=params_str,
+            views=views,
+            active_listings_count=active_count,
+            similar_listings_count=similar_count,
         )
 
     # ---------- response generation ----------
@@ -188,12 +236,9 @@ class LLMClassifier:
         Генерация ответа клиенту в Avito-чате.
         chat_history — список {'direction': 'in'|'out', 'text': '...'}
 
-        D5: шаблоны system / user — в prompts/. input/output логируются
-        на DEBUG-уровне (для последующего тюнинга промптов).
-
         J1: результат кэшируется по (dialog_id, last_in_msg, persona) на 10 мин.
         """
-        if self.client is None:
+        if not self.api_key:
             return "Здравствуйте! Уточните, пожалуйста, ваш вопрос."
 
         # J1: cache lookup
@@ -223,24 +268,16 @@ class LLMClassifier:
                 history_str=history_str,
             )
 
-            # D5: лог input для аналитики промптов (DEBUG, чтобы не шуметь)
-            logger.debug(
-                "generate_response prompt: %s",
-                (prompt[:500] + "...") if len(prompt) > 500 else prompt,
-            )
-
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": prompt},
-                ],
+            logger.debug("generate_response prompt: %s", prompt[:500])
+            out = self._call_llm(
+                system_message=system_message,
+                user_message=prompt,
                 temperature=0.7,
             )
-            out = (response.choices[0].message.content or "").strip()
-            logger.debug(
-                "generate_response output: %s", (out[:300] + "...") if len(out) > 300 else out
-            )
+            if out is None:
+                return "Здравствуйте! Подскажите, пожалуйста, какой объект вас интересует?"
+
+            logger.debug("generate_response output: %s", out[:300])
             # J1: cache the result
             self._response_cache.set(
                 context.get("dialog_id"),
@@ -249,12 +286,9 @@ class LLMClassifier:
                 out,
             )
             return out
-        except OpenAIError as exc:
-            logger.warning("OpenAI generate_response failed: %s", exc)
-            self._incr_llm_error("respond:openai")
         except Exception as exc:
-            logger.warning("generate_response unexpected error: %s", exc)
-            self._incr_llm_error("respond:unexpected")
+            logger.warning("generate_response failed: %s", exc)
+            self._incr_llm_error("respond:api")
         return "Здравствуйте! Подскажите, пожалуйста, какой объект вас интересует?"
 
 

@@ -41,6 +41,8 @@ HEURISTIC_WEIGHTS = {
     # Сигнал 1: много активных объявлений у продавца
     "active_listings_threshold": 5,
     "active_listings_weight": -2.0,
+    # Сигнал 1b: много похожих объявлений в категории недвижимости
+    "similar_listings_weight": -1.5,
     # Сигнал 2: телефон встречается в N+ листингах
     "phone_frequency_threshold": 3,
     "phone_frequency_weight": -2.0,
