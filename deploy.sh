@@ -17,10 +17,7 @@ REPO_URL="https://github.com/rusya13k/avito-bot.git"
 BRANCH="main"
 BOT_DIR="/opt/avito-bot"
 BOT_USER="avito"
-ADS_VERSION="latest"
-PYTHON_VERSION="3.11"
-GIT_EMAIL="ruslan88.kash@gmail.com"
-GIT_NAME="Ruslan"
+PYTHON_VERSION="3"  # 3 = latest (3.12 на 24.04, 3.11 на 22.04)
 
 # ── Проверка root ────────────────────────────
 [[ $EUID -eq 0 ]] || err "Запусти от root: sudo bash deploy.sh"
@@ -28,27 +25,24 @@ GIT_NAME="Ruslan"
 step "1/8 — Системные пакеты"
 apt-get update -qq
 apt-get install -y -qq \
-    python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python3-pip \
+    python3 python3-venv python3-pip \
     git curl wget unzip \
     software-properties-common \
-    xvfb x11vnc fluxbox \
+    xvfb fluxbox \
     libnss3 libatk-bridge2.0-0 libdrm2 libxkbcommon0 libgbm1 \
     libasound2 libxshmfence1 libglib2.0-0 libgtk-3-0 \
     libxdamage1 libxrandr2 libxfixes3 libxi6 libxtst6 libcups2 \
     ufw
 
-# Ставим python3.11 если нет
-if ! command -v python3.11 &>/dev/null; then
-    add-apt-repository -y ppa:deadsnakes/ppa &>/dev/null
-    apt-get install -y -qq python3.11 python3.11-venv
-fi
-
-step "2/8 — Пользователь avito"
+step "2/8 — Пользователь avito + python3"
 if ! id -u "$BOT_USER" &>/dev/null; then
     useradd -m -s /bin/bash "$BOT_USER"
     usermod -aG sudo "$BOT_USER"
     info "Пользователь $BOT_USER создан"
 fi
+PYTHON_BIN=$(command -v python3)
+[[ -n "$PYTHON_BIN" ]] || err "python3 не установлен"
+info "Python: $($PYTHON_BIN --version)"
 
 step "3/8 — Клонирование репозитория"
 rm -rf "$BOT_DIR"
@@ -59,7 +53,7 @@ cd "$BOT_DIR"
 info "Репозиторий склонирован в $BOT_DIR"
 
 step "4/8 — Python venv + зависимости"
-sudo -u "$BOT_USER" python3.11 -m venv "$BOT_DIR/venv"
+sudo -u "$BOT_USER" python3 -m venv "$BOT_DIR/venv"
 source "$BOT_DIR/venv/bin/activate"
 pip install --upgrade pip setuptools wheel -q
 pip install -r "$BOT_DIR/requirements.txt" -q
