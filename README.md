@@ -272,3 +272,150 @@ tests/                — pytest unit-тесты
 ## Лицензия
 
 Используйте на свой страх и риск, соблюдая правила Avito.
+
+---
+
+## Деплой на Timeweb Cloud VDS
+
+Сервер: Ubuntu 22.04, 2 vCPU / 4GB RAM, 3 аккаунта Avito.
+
+### Порядок действий (пошагово)
+
+#### Шаг 1 — Создать VDS в панели Timeweb
+
+- **Тариф:** VDS 2 vCPU / 4 GB / 40 GB SSD
+- **ОС:** Ubuntu 22.04
+- **SSH-ключ:** добавь свой публичный ключ при создании
+
+После создания — скопируй IP и войди:
+```bash
+ssh root@<IP-сервера>
+```
+
+#### Шаг 2 — Запустить deploy.sh
+
+```bash
+apt-get update -qq && apt-get install -y -qq git curl
+git clone https://github.com/rusya13k/avito-bot.git /opt/avito-bot
+cd /opt/avito-bot
+chmod +x deploy.sh
+bash deploy.sh
+```
+
+Скрипт сделает всё сам: установит пакеты, Python 3.11, AdsPower, создаст пользователя, systemd-сервисы, venv с зависимостями.
+
+#### Шаг 3 — Заполнить секреты
+
+```bash
+sudo -u avito nano /opt/avito-bot/.env
+```
+
+Обязательно заполнить:
+- `DEEPSEEK_API_KEY` — ключ DeepSeek (или OpenAI-совместимый)
+- `TELEGRAM_BOT_TOKEN` — уже есть, если нужен другой — заменить
+- `ADSPOWER_API_KEY` — уже есть
+
+#### Шаг 4 — Настроить аккаунты Avito
+
+Создать вручную 3 профиля в AdsPower. После создания — записать их ID:
+
+```bash
+sudo -u avito nano /opt/avito-bot/accounts.json
+```
+
+Формат (пример):
+```json
+[
+  {
+    "name": "account1",
+    "adspower_id": "xxxxxxxx",
+    "phone": "+79991234567",
+    "password": "password123",
+    "enabled": true
+  },
+  {
+    "name": "account2",
+    "adspower_id": "yyyyyyyy",
+    "phone": "+79997654321",
+    "password": "password456",
+    "enabled": true
+  },
+  {
+    "name": "account3",
+    "adspower_id": "zzzzzzzz",
+    "phone": "+79991112233",
+    "password": "password789",
+    "enabled": true
+  }
+]
+```
+
+#### Шаг 5 — Запустить
+
+```bash
+systemctl start xvfb.service           # виртуальный дисплей
+sleep 3
+systemctl start adsower.service         # AdsPower
+sleep 30                                # ждём пока AdsPower загрузит профили
+systemctl start avito-bot.service       # бот
+```
+
+Проверить логи:
+```bash
+journalctl -u avito-bot -f
+```
+
+#### Шаг 6 — Управление через Telegram
+
+Бот откроет ТГ-меню для двух админов (1951766747 и 411399016).
+Команды: `/start` → меню, `/report` — сводка, `/stop` — стоп.
+
+### Команды для обслуживания
+
+```bash
+# Статус
+systemctl status avito-bot
+
+# Логи в реальном времени
+journalctl -u avito-bot -f -n 100
+
+# Перезапуск бота (без перезапуска AdsPower)
+systemctl restart avito-bot
+
+# Полный перезапуск
+systemctl restart xvfb adsower avito-bot
+
+# Остановка всего
+systemctl stop avito-bot adsower xvfb
+```
+
+### Подготовка AdsPower на сервере
+
+AdsPower запускается через Xvfb (виртуальный дисплей). Профили создаются стандартным способом:
+
+```bash
+# Проверить что AdsPower запущен
+curl http://localhost:50325/api/v1/version
+
+# Создать профили через API (нужно сделать 1 раз)
+curl -X POST http://localhost:50325/api/v1/user/create \
+  -H "Content-Type: application/json" \
+  -d '{"name":"account1","group_id":"...","user_proxy_config":{...}}'
+```
+
+Либо создать вручную: настроить VNC-доступ для отладки (необязательно):
+```bash
+# На локальной машине (не на сервере):
+ssh -L 5900:localhost:5900 root@<IP>
+# На сервере:
+apt-get install -y x11vnc
+x11vnc -display :99 -forever -nopw
+# Подключиться VNC-клиентом к localhost:5900
+```
+
+### Важно
+
+- **AdsPower** должен быть запущен **до** бота (systemd зависимость настроена).
+- Первый запуск AdsPower может быть долгим (скачивает Chromium).
+- Если Avito банит — проверь прокси в профилях AdsPower (российский IP).
+- Бюджет листингов по умолчанию: 80/день. Меняется через ТГ → Настройки.
