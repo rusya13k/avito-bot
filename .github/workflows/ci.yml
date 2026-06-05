@@ -1,0 +1,55 @@
+# H4: CI smoke
+#
+# Запускается на push/PR. Три быстрые проверки:
+#   1. ruff check  — статический анализ.
+#   2. import smoke — все модули импортируются (ловит синтаксис/имена).
+#   3. pytest tests/ — unit-тесты на critical paths (database, scorer,
+#      classifier, phone, url).
+#
+# Selenium / OpenAI / Telegram сюда специально НЕ подтягиваются —
+# они моки в тестах. CI не должен ходить в внешние сервисы.
+
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install dev tools
+        run: |
+          pip install ruff pytest
+
+      - name: Lint (ruff)
+        run: |
+          ruff check .
+
+      - name: Import smoke
+        run: |
+          python -c "import bot, tg_bot, database, commercial_parser, avito_messenger, llm_classifier, listing_classifier, heuristic_scorer, account_state, captcha_detect, human_delay, logging_setup, env_config, classification_config; print('imports ok')"
+
+      - name: Run tests
+        run: |
+          pytest tests/ -v
