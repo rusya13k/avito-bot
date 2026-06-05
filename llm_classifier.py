@@ -42,8 +42,8 @@ class LLMClassifier:
     Авто-детект: если model содержит "claude" → Anthropic формат, иначе OpenAI.
     """
 
-    DEFAULT_MODEL = "gpt-3.5-turbo"
-    DEFAULT_API_BASE = "https://api.openai.com/v1"
+    DEFAULT_MODEL = "deepseek-v4-flash"
+    DEFAULT_API_BASE = "https://api.deepseek.com/v1"
     REQUEST_TIMEOUT = 30.0
 
     def __init__(
@@ -64,7 +64,18 @@ class LLMClassifier:
         self.api_base = (config.get("api_base") or self.DEFAULT_API_BASE).strip().rstrip("/")
 
         # Авто-детект: Claude модели → Anthropic Messages API
-        self._is_anthropic = "claude" in self.model.lower()
+        # Также поддерживает Ollama/vLLM с "claude" в имени модели.
+        self._is_anthropic = "claude" in self.model.lower() or self.api_base.rstrip("/").endswith(
+            "/v1/messages"
+        )
+
+        # Security: warn if API key sent over unencrypted HTTP
+        if self.api_key and self.api_base.startswith("http://"):
+            api_base_host = self.api_base.split("//", 1)[1].split("/")[0].split(":")[0]
+            if api_base_host not in ("localhost", "127.0.0.1"):
+                logger.warning(
+                    "API key передаётся по нешифрованному HTTP (%s) — MITM риск!", self.api_base
+                )
 
         # Шаринг heuristic_scorer / db_manager на всё время жизни классификатора
         if heuristic_scorer is not None:
@@ -105,11 +116,15 @@ class LLMClassifier:
             return None
 
         if self._is_anthropic:
-            return self._call_anthropic(system_message, user_message, temperature)
+            return self._call_anthropic(system_message, user_message, temperature, json_mode)
         return self._call_openai(system_message, user_message, temperature, json_mode)
 
     def _call_anthropic(
-        self, system_message: str, user_message: str, temperature: float
+        self,
+        system_message: str,
+        user_message: str,
+        temperature: float,
+        json_mode: bool = False,
     ) -> str | None:
         """Вызов через Anthropic Messages API (/v1/messages)."""
         url = f"{self.api_base}/messages"
@@ -125,13 +140,22 @@ class LLMClassifier:
             "max_tokens": 1024,
             "temperature": temperature,
         }
+        if json_mode:
+            # Anthropic не поддерживает response_format как OpenAI,
+            # но можно использовать prefill чтобы триггернуть JSON
+            payload["messages"].append({"role": "assistant", "content": "{"})
         resp = requests.post(url, headers=headers, json=payload, timeout=self.REQUEST_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
         content_blocks = data.get("content", [])
         if content_blocks:
-            return content_blocks[0].get("text", "").strip()
+            text = content_blocks[0].get("text", "").strip()
+            # Prefill добавляет "{" перед JSON — если ответ не начинается с "{",
+            # восстанавливаем (Anthropic продолжает с prefill).
+            if json_mode and text and not text.startswith("{"):
+                text = "{" + text
+            return text
         return None
 
     def _call_openai(

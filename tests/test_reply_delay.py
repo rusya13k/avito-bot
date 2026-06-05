@@ -2,10 +2,9 @@
 F5: тесты для AvitoMessenger._should_reply_now (реалистичная задержка ответа).
 
 Логика, которую тестируем:
-  1. Если диалог уже помечен ignored в account_state — False.
-  2. Новый диалог (без out-сообщений) с шансом `ignore_new_dialog_chance`
-     помечается ignored и возвращает False.
-  3. Иначе считаем возраст последнего in-сообщения через БД и сравниваем
+  1. Если диалог уже помечен ignored в account_state — снимаем пометку
+     и продолжаем (ignore отключён — отвечаем всем).
+  2. Считаем возраст последнего in-сообщения через БД и сравниваем
      с lognormal target (clamped к [min_reply_age_min, max_reply_age_min]).
 
 LLM не вызывается (вся логика — до `generate_response`). БД и random мокаем.
@@ -95,54 +94,46 @@ def test_db_returns_none_means_reply(messenger, log):
         assert messenger._should_reply_now(dialog_id=1, chat_history=chat, log_func=log) is True
 
 
-# ── F5b: 5% ignore для новых диалогов ─────────────────────────────────────
+# ── Legacy ignored dialogs — now unignored ──────────────────────────────
 
 
-def test_ignore_rolls_only_for_new_dialogs(log):
-    """Если в чате уже есть наш OUT — ignore-roll НЕ должен срабатывать
-    (даже при 100% chance), мы продолжаем переписку."""
+def test_ignored_dialog_gets_unignored(log):
+    """Если диалог был помечен ignored ранее — снимаем пометку и отвечаем
+    (ignore отключён — отвечаем всем)."""
     messenger = AvitoMessenger(
         driver=MagicMock(),
         wait=MagicMock(),
         db_manager=MagicMock(),
         llm_classifier=MagicMock(),
         account_name="acc_f5",
-        ignore_new_dialog_chance=1.0,  # должен бы игнорить ВСЁ — но only new
     )
     messenger.db.get_first_in_message_age_seconds.return_value = 60 * 60
-    chat = [
-        {"direction": "in", "text": "привет"},
-        {"direction": "out", "text": "здравствуйте"},
-        {"direction": "in", "text": "вопрос"},
-    ]
+    chat = [{"direction": "in", "text": "привет"}]
+    # Помечаем диалог как ignored вручную
+    account_state.mark_dialog_ignored("acc_f5", 42)
+    assert account_state.is_dialog_ignored("acc_f5", 42) is True
+    # Теперь _should_reply_now должен снять ignore и продолжить
     with patch("avito_messenger.random.lognormvariate", return_value=10.0):
-        # min_reply_age_min=15 → target=15, age=60 → ОК → True
         assert messenger._should_reply_now(dialog_id=42, chat_history=chat, log_func=log) is True
-    # Проверим что ignore флага НЕ выставился.
+    # Ignore снят
     assert account_state.is_dialog_ignored("acc_f5", 42) is False
 
 
-def test_ignore_marks_new_dialog_when_unlucky(log):
-    """random < ignore_chance + chat без out → mark + False, и в следующий
-    раз тот же диалог тоже False (даже если повезло)."""
+def test_new_dialog_always_answered(log):
+    """Новый диалог (без out-сообщений) — отвечаем, ignore отключён.
+    Раньше был 5% шанс игнора, теперь всегда True."""
     messenger = AvitoMessenger(
         driver=MagicMock(),
         wait=MagicMock(),
         db_manager=MagicMock(),
         llm_classifier=MagicMock(),
         account_name="acc_f5",
-        ignore_new_dialog_chance=0.5,
     )
+    messenger.db.get_first_in_message_age_seconds.return_value = 60 * 60
     chat = [{"direction": "in", "text": "первое сообщение"}]
-
-    # Первый вызов: random=0.1 < 0.5 → ignore.
-    with patch("avito_messenger.random.random", return_value=0.1):
-        assert messenger._should_reply_now(dialog_id=99, chat_history=chat, log_func=log) is False
-
-    # account_state теперь помнит ignore → даже если повезёт, всё равно False.
-    assert account_state.is_dialog_ignored("acc_f5", 99) is True
-    with patch("avito_messenger.random.random", return_value=0.99):
-        assert messenger._should_reply_now(dialog_id=99, chat_history=chat, log_func=log) is False
+    with patch("avito_messenger.random.lognormvariate", return_value=10.0):
+        assert messenger._should_reply_now(dialog_id=99, chat_history=chat, log_func=log) is True
+    assert account_state.is_dialog_ignored("acc_f5", 99) is False
 
 
 def test_ignore_does_not_mark_when_lucky(log):
@@ -165,16 +156,16 @@ def test_ignore_does_not_mark_when_lucky(log):
     assert account_state.is_dialog_ignored("acc_f5", 7) is False
 
 
-def test_existing_persistent_ignore_short_circuits(log, messenger):
-    """Если диалог уже помечен ignored ранее (в этом процессе) — мгновенно
-    возвращаем False, не трогая БД и не делая random-броски."""
+def test_existing_persistent_ignore_gets_unignored(log, messenger):
+    """Если диалог уже помечен ignored ранее — снимаем пометку и продолжаем
+    к задержке. БД и lognormal вызываются (ignore не short-circuits)."""
     account_state.mark_dialog_ignored("acc_f5", 555)
     chat = [{"direction": "in", "text": "x"}]
-    with patch("avito_messenger.random.lognormvariate") as mock_log:
-        assert messenger._should_reply_now(dialog_id=555, chat_history=chat, log_func=log) is False
-    # БД и lognormal даже не должны вызываться.
-    messenger.db.get_first_in_message_age_seconds.assert_not_called()
-    mock_log.assert_not_called()
+    messenger.db.get_first_in_message_age_seconds.return_value = 60 * 60
+    with patch("avito_messenger.random.lognormvariate", return_value=10.0):
+        assert messenger._should_reply_now(dialog_id=555, chat_history=chat, log_func=log) is True
+    # Ignore снят
+    assert account_state.is_dialog_ignored("acc_f5", 555) is False
 
 
 # ── Default — F5 выключаем, поведение совместимо со старым ───────────────

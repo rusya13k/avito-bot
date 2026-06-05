@@ -232,7 +232,11 @@ def test_get_daily_summary(db):
 
 
 def test_add_message_is_idempotent(db):
-    """add_message — защита от дубля по (dialog_id, direction, text, timestamp)."""
+    """add_message — C2-fix: dedup по (dialog_id, direction, text) без timestamp.
+
+    Одно и то же сообщение с разными timestamp НЕ создаёт дубль — сохраняется
+    только первое появление (MIN timestamp для F5).
+    """
     did = db.upsert_dialog(
         our_account="acc",
         visitor_id="v1",
@@ -243,9 +247,10 @@ def test_add_message_is_idempotent(db):
     )
     db.add_message(did, "in", "hello", "2024-01-01 12:00:00")
     db.add_message(did, "in", "hello", "2024-01-01 12:00:00")  # дубль
-    db.add_message(did, "in", "hello", "2024-01-01 12:00:01")  # ts другой
+    db.add_message(did, "in", "hello", "2024-01-01 12:00:01")  # ts другой — всё равно дубль
+    db.add_message(did, "in", "world", "2024-01-01 12:00:01")  # другой текст — новая запись
     msgs = db.get_messages(did)
-    assert len(msgs) == 2
+    assert len(msgs) == 2  # "hello" + "world"
 
 
 # ── F5: get_first_in_message_age_seconds ──────────────────────────────────
@@ -265,8 +270,8 @@ def test_get_first_in_message_age_returns_none_without_message(db):
 
 
 def test_get_first_in_message_age_uses_min_timestamp(db):
-    """F5: при дубликатах одного сообщения с разными timestamp возвращаем
-    возраст самого раннего (когда мы ВПЕРВЫЕ его увидели)."""
+    """F5: C2-fix — дубли с разными timestamp не записываются, но первый
+    timestamp сохраняется корректно (MIN семантика для F5)."""
     import datetime
 
     did = db.upsert_dialog(
@@ -281,10 +286,10 @@ def test_get_first_in_message_age_uses_min_timestamp(db):
     # детерминированные относительные timestamp'ы.
     now = datetime.datetime.now()
     long_ago = (now - datetime.timedelta(minutes=120)).strftime("%Y-%m-%d %H:%M:%S")
-    recent = (now - datetime.timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M:%S")
 
     db.add_message(did, "in", "hello", long_ago)
-    db.add_message(did, "in", "hello", recent)  # дубль с другим ts
+    # C2-fix: повторный add_message с тем же текстом — пропускается (dedup).
+    # Первый timestamp (long_ago) остаётся единственным.
 
     age_seconds = db.get_first_in_message_age_seconds(did, "hello")
     assert age_seconds is not None

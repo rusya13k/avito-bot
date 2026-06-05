@@ -83,7 +83,8 @@ class AvitoClient:
         llm_classifier=None,
         search_filters=None,
         favorite_rate: float = 0.08,
-        call_rate: float = 0.05,
+        call_rate: float | None = None,
+        message_rate: float = 0.05,
         max_listings_per_search: int = 7,
         max_categories_per_browse: int = 4,
         max_listings_per_browse: int = 4,
@@ -107,8 +108,11 @@ class AvitoClient:
             favorite_rate: F1 — вероятность «Добавить в избранное» при просмотре
                 листинга в browse. Конфигурируется через config.json /
                 accounts.json (ключ view_listing_favorite_rate). Default: 0.08.
-            call_rate: F1 — вероятность нажать «Позвонить» при просмотре.
-                Конфигурируется через view_listing_call_rate. Default: 0.05.
+            call_rate: F1 — УСТАРЕВШИЙ алиас для message_rate (back-compat).
+                Если задан — используется вместо message_rate.
+            message_rate: F1 — вероятность нажать «Написать» и отправить
+                сообщение при просмотре. Конфигурируется через
+                view_listing_message_rate. Default: 0.05.
             max_listings_per_search: F2 — верхняя граница весового распределения
                 числа листингов за find_and_view. Default: 7.
             max_categories_per_browse: F2 — верхняя граница числа категорий
@@ -132,12 +136,14 @@ class AvitoClient:
         self.llm = llm_classifier
         self.search_filters: dict = search_filters or {}
         self.favorite_rate: float = favorite_rate
-        self.call_rate: float = call_rate
+        self.call_rate: float | None = call_rate
+        self.message_rate: float = message_rate
         self.max_listings_per_search: int = max_listings_per_search
         self.max_categories_per_browse: int = max_categories_per_browse
         self.max_listings_per_browse: int = max_listings_per_browse
         self.messenger_config: dict = messenger_config or {}
         self.outbound_config: dict = outbound_config or {}
+        self._account: dict = {}  # Set externally by _build_avito_client
 
     # ──────────────────────────────────────────────────────────────────────
     # Navigation
@@ -347,7 +353,7 @@ class AvitoClient:
         Wrapper над bot.browse_commercial_categories.
         E2: search_filters (self.search_filters) прокидывается автоматически,
         если явно не передан через kwargs.
-        F1: favorite_rate / call_rate из self прокидываются автоматически.
+        F1: favorite_rate / message_rate из self прокидываются автоматически.
         F12: дневной бюджет на "listings" проверяется ДО входа в browse —
         раньше браузер открывал 3 категории × 3 листинга = 9 листингов
         мимо A2-счётчика, и реальное превышение лимита было ~10-15%.
@@ -371,11 +377,16 @@ class AvitoClient:
         kwargs.setdefault("search_filters", self.search_filters or None)
         kwargs.setdefault("favorite_rate", self.favorite_rate)
         kwargs.setdefault("call_rate", self.call_rate)
+        kwargs.setdefault("message_rate", self.message_rate)
         kwargs.setdefault("max_categories_per_browse", self.max_categories_per_browse)
         kwargs.setdefault("max_listings_per_browse", self.max_listings_per_browse)
         # T20: db_manager прокидывается, чтобы view_listing мог записывать
         # dwell_sec sample'ы.
         kwargs.setdefault("db_manager", self.db)
+        kwargs.setdefault("llm_classifier", self.llm)
+        # T20: account для persona в view_listing (LLM-генерация сообщений).
+        if "account" not in kwargs and hasattr(self, "_account"):
+            kwargs.setdefault("account", self._account)
         return browse_commercial_categories(
             self.driver,
             self.wait,
@@ -432,6 +443,8 @@ class AvitoClient:
             self.db,
             search_filters=self.search_filters or None,
             max_listings_per_search=self.max_listings_per_search,
+            llm_classifier=self.llm,
+            account=getattr(self, "_account", None),
         )
 
     def extract_listing_data(self) -> dict[str, Any]:

@@ -1,11 +1,14 @@
+import datetime
 import hashlib
 import logging
 import random
 import re
+import threading
 import time
 
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -18,6 +21,138 @@ from human_typing import type_human as _type_human
 from llm_sanitizer import sanitize_llm_reply
 
 logger = logging.getLogger(__name__)
+
+# C3-fix: per-(account, dialog) lock предотвращает двойную отправку
+_send_locks: dict[tuple[str, str], threading.Lock] = {}
+_send_locks_guard = threading.Lock()
+# Периодическая очистка _send_locks: храним максимум 1000 ключей,
+# старые (неактивные диалоги) удаляем при превышении.
+_SEND_LOCKS_MAX = 1000
+
+
+def _cleanup_send_locks() -> None:
+    """Удаляет лишние записи из _send_locks если их слишком много."""
+    global _send_locks
+    with _send_locks_guard:
+        if len(_send_locks) > _SEND_LOCKS_MAX:
+            # Оставляем последние добавленные (по логике dict сохраняет insertion order)
+            keys = list(_send_locks.keys())
+            for k in keys[: len(keys) - _SEND_LOCKS_MAX]:
+                del _send_locks[k]
+
+
+def _parse_message_timestamp(msg_el) -> str | None:
+    """Парсит реальный timestamp сообщения из DOM Avito.
+
+    Ищет элемент с data-marker='messenger/message/time' или time-элемент
+    рядом с сообщением. Возвращает строку 'YYYY-MM-DD HH:MM:SS' или None.
+    """
+    # Способ 1: data-marker для timestamp (Avito обычно рендерит время)
+    try:
+        time_el = msg_el.find_element(By.XPATH, ".//*[@data-marker='messenger/message/time']")
+        time_text = time_el.text.strip()
+        if time_text:
+            return _avito_time_to_iso(time_text)
+    except Exception:
+        pass
+
+    # Способ 2: <time> элемент с datetime атрибутом
+    try:
+        time_el = msg_el.find_element(By.XPATH, ".//time")
+        dt_attr = time_el.get_attribute("datetime")
+        if dt_attr:
+            # datetime может быть ISO 8601 или UNIX timestamp
+            try:
+                dt = datetime.datetime.fromisoformat(dt_attr.replace("Z", "+00:00"))
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError):
+                pass
+            # Может быть UNIX timestamp (millis)
+            try:
+                ts = int(dt_attr)
+                if ts > 1e12:
+                    ts = ts // 1000
+                return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+            except (ValueError, TypeError):
+                pass
+    except Exception:
+        pass
+
+    return None
+
+
+def _avito_time_to_iso(time_text: str) -> str | None:
+    """Конвертирует текстовое время Avito в 'YYYY-MM-DD HH:MM:SS'.
+
+    Поддерживаемые форматы:
+    - '12:34' → сегодня 12:34
+    - 'вчера в 12:34' → вчера 12:34
+    - '2 янв в 12:34' → этот год
+    - '2 янв 2024 в 12:34' → конкретный год
+    """
+    now = datetime.datetime.now()
+
+    # 'HH:MM' — сегодня
+    m = re.match(r"^(\d{1,2}):(\d{2})$", time_text)
+    if m:
+        return now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+    # 'вчера в HH:MM'
+    m = re.match(r"вчера\s+в?\s*(\d{1,2}):(\d{2})", time_text, re.IGNORECASE)
+    if m:
+        yesterday = now - datetime.timedelta(days=1)
+        yesterday = yesterday.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0)
+        return yesterday.strftime("%Y-%m-%d %H:%M:%S")
+
+    # '2 янв в 12:34' или '2 янв 2024 в 12:34'
+    months_ru = {
+        "янв": 1,
+        "фев": 2,
+        "мар": 3,
+        "апр": 4,
+        "мая": 5,
+        "июн": 6,
+        "июл": 7,
+        "авг": 8,
+        "сен": 9,
+        "окт": 10,
+        "ноя": 11,
+        "дек": 12,
+        "май": 5,
+    }
+    m = re.match(
+        r"(\d{1,2})\s+(\w{3})\s+(\d{4})?\s*в?\s*(\d{1,2}):(\d{2})", time_text, re.IGNORECASE
+    )
+    if m:
+        day = int(m.group(1))
+        month = months_ru.get(m.group(2).lower()[:3])
+        year = int(m.group(3)) if m.group(3) else now.year
+        hour, minute = int(m.group(4)), int(m.group(5))
+        if month:
+            try:
+                return datetime(year, month, day, hour, minute, 0).strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                pass
+
+    return None
+
+
+def _get_send_lock(account_name: str, dialog_id: str) -> threading.Lock:
+    """C3-fix: возвращает lock для конкретного (account, dialog) — предотвращает двойную отправку."""
+    key = (account_name, dialog_id)
+    with _send_locks_guard:
+        # Периодическая очистка: при >500 локов удаляем для остановленных аккаунтов
+        # и обрезаем до _SEND_LOCKS_MAX
+        if len(_send_locks) > 500:
+            for k in list(_send_locks.keys()):
+                if _tg.is_stop_requested(k[0]):
+                    del _send_locks[k]
+            _cleanup_send_locks()
+        if key not in _send_locks:
+            _send_locks[key] = threading.Lock()
+        return _send_locks[key]
 
 
 def _stopping(account_name: str) -> bool:
@@ -274,18 +409,22 @@ class AvitoMessenger:
                     pass
 
                 # Extract visitor name and last message
+                visitor_name = "Unknown"
                 try:
                     visitor_name = dialog.find_element(
                         By.XPATH, ".//*[@data-marker='messenger/chat-item/user-name']"
                     ).text
-                    # last-message-snippet не нужен в логике, но и не делаем
-                    # лишнего find_element без причины — оставляем no-op
-                    # на случай, если позже захотим логировать.
-                    _ = dialog.find_element(
+                except Exception:
+                    pass
+                # last-message-snippet — сохраняем в отдельную переменную,
+                # чтобы исключение не обнулило visitor_name
+                _last_msg_snippet = ""
+                try:
+                    _last_msg_snippet = dialog.find_element(
                         By.XPATH, ".//*[@data-marker='messenger/chat-item/last-message']"
                     ).text
                 except Exception:
-                    visitor_name = "Unknown"
+                    pass
 
                 # B3: пытаемся вытащить устойчивый ID визитёра из самой карточки
                 # ДО клика, на случай если после клика DOM перерендерится.
@@ -381,7 +520,11 @@ class AvitoMessenger:
                     text = msg_el.find_element(
                         By.XPATH, ".//*[@data-marker='messenger/message/text']"
                     ).text
-                    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")  # Real timestamp harder to get
+                    # Парсим реальный timestamp из DOM (Avito показывает время
+                    # рядом с сообщением). Fallback на server time если не найден.
+                    timestamp = _parse_message_timestamp(msg_el) or time.strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
 
                     chat_history.append({"direction": direction, "text": text})
 
@@ -467,8 +610,17 @@ class AvitoMessenger:
                     log_func(self.account_name, "Stop requested before send — skipping.")
                     return
 
-                # Send the response
-                sent_ok = self._send_message(response_text, log_func)
+                # C3-fix: lock на (account, dialog) — предотвращает двойную отправку
+                # при быстром перезапуске цикла.
+                send_lock = _get_send_lock(self.account_name, str(dialog_id))
+                if not send_lock.acquire(blocking=False):
+                    log_func(self.account_name, "C3: send already in progress — skipping.")
+                    return
+                try:
+                    # Send the response
+                    sent_ok = self._send_message(response_text, log_func)
+                finally:
+                    send_lock.release()
 
                 if sent_ok:
                     # C4: запись факта отправки и обновление last_message
@@ -525,40 +677,27 @@ class AvitoMessenger:
         F5: решает, отвечать ли в ТЕКУЩЕМ messenger-цикле или отложить.
 
         Логика:
-          1. Если диалог в `account_state.ignored_dialogs` (5% от новых) —
-             никогда не отвечаем.
-          2. Если это «новый диалог» (нет наших out-сообщений в chat_history)
-             и выпал ignore-rоlл (`ignore_new_dialog_chance`, default 5%) —
-             помечаем как ignored и не отвечаем (+будущие циклы тоже).
-          3. Иначе считаем возраст последнего in-сообщения. Бросаем lognormal
-             target_age (clamped к [min_reply_age_min, max_reply_age_min]).
-             Если возраст меньше target — пропускаем цикл (на следующем
-             бросок будет другой; статистически среднее задержки ≈ mean
-             lognormal'a).
+           1. Если диалог в `account_state.ignored_dialogs` (legacy — больше
+              не добавляем, но старые записи ещё могут быть) — снимаем ignore
+              и отвечаем.
+           2. Возраст последнего in-сообщения. Бросаем lognormal target_age
+              (clamped к [min_reply_age_min, max_reply_age_min]).
+              Если возраст меньше target — пропускаем цикл (на следующем
+              бросок будет другой; статистически среднее задержки ≈ mean
+              lognormal'a).
 
         Returns:
             True — отвечать сейчас. False — отложить (return из caller'а).
         """
-        # 1) Persistent ignore из предыдущих циклов.
+        # 1) Legacy ignored dialogs — снимаем пометку и продолжаем (ignore отключён).
         if _astate.is_dialog_ignored(self.account_name, dialog_id):
+            _astate.unignore_dialog(self.account_name, dialog_id)
             log_func(
                 self.account_name,
-                f"F5b: dialog#{dialog_id} помечен как ignored — пропускаю.",
+                f"F5b: dialog#{dialog_id} снят ignore — отвечаем.",
             )
-            return False
 
-        # 2) 5% chance проигнорить НОВЫЙ диалог (без наших out-сообщений).
-        out_count = sum(1 for m in chat_history if m["direction"] == "out")
-        if out_count == 0 and random.random() < self.ignore_new_dialog_chance:
-            _astate.mark_dialog_ignored(self.account_name, dialog_id)
-            log_func(
-                self.account_name,
-                f"F5b: dialog#{dialog_id} помечаю ignored "
-                f"({self.ignore_new_dialog_chance * 100:.0f}% chance — «увидел, не интересно»).",
-            )
-            return False
-
-        # 3) Реалистичная lognormal-задержка для всех остальных.
+        # 2) Реалистичная lognormal-задержка.
         last_in_text = chat_history[-1]["text"]
         age_seconds = self.db.get_first_in_message_age_seconds(dialog_id, last_in_text)
         if age_seconds is None:
@@ -599,6 +738,17 @@ class AvitoMessenger:
                     (By.XPATH, "//*[@data-marker='messenger/input-field']")
                 )
             )
+
+            # C4-fix: ВСЕГДА очищать input field перед вводом — Avito может
+            # предзаполнить его айсбрейкером, или остался текст от предыдущей
+            # неудачной отправки. Без очистки сообщение обрезается.
+            try:
+                input_box.send_keys(Keys.CONTROL + "a")
+                input_box.send_keys(Keys.DELETE)
+                hp(0.2, 0.4)
+            except Exception:
+                pass
+
             # T6: human-like focus вместо одиночного click без mousemove.
             _human_click(
                 self.driver, input_box, stop_event=_tg.get_account_stop_event(self.account_name)
@@ -609,10 +759,22 @@ class AvitoMessenger:
             effective_multiplier = self.typing_speed_multiplier * length_speed_multiplier(text)
             if not human_type(input_box, text, speed_multiplier=effective_multiplier):
                 # Stop signaled mid-typing — do NOT send a half-typed message.
+                # C4-fix: очистить поле чтобы не оставлять мусор.
+                try:
+                    input_box.send_keys(Keys.CONTROL + "a")
+                    input_box.send_keys(Keys.DELETE)
+                except Exception:
+                    pass
                 return False
             hp(0.5, 1)
 
             if _stopping(self.account_name):
+                # C4-fix: очистить поле при stop mid-send.
+                try:
+                    input_box.send_keys(Keys.CONTROL + "a")
+                    input_box.send_keys(Keys.DELETE)
+                except Exception:
+                    pass
                 return False
 
             # C5: кнопка send иногда отрендерена не сразу после ввода текста.

@@ -244,6 +244,38 @@ def _visit_site(
             "clicked": False,
         }
 
+    # T4-fix: обработка Yandex SmartCaptcha в warmup
+    try:
+        cur_url = (driver.current_url or "").lower()
+    except Exception:
+        cur_url = ""
+    if "/showcaptcha" in cur_url or "captcha=" in cur_url:
+        log_func(account_name, f"    {name}: Yandex captcha detected, solving...")
+        try:
+            from captcha_solver import solve_yandex_smartcaptcha
+
+            solved = solve_yandex_smartcaptcha(driver, account_name, log_func=log_func)
+            if solved:
+                log_func(account_name, f"    {name}: captcha solved!")
+            else:
+                log_func(account_name, f"    {name}: captcha solve failed, skipping.")
+                return {
+                    "name": name,
+                    "ok": False,
+                    "duration_s": time.time() - started,
+                    "scrolled": 0,
+                    "clicked": False,
+                }
+        except Exception as exc:
+            log_func(account_name, f"    {name}: captcha solver error: {type(exc).__name__}: {exc}")
+            return {
+                "name": name,
+                "ok": False,
+                "duration_s": time.time() - started,
+                "scrolled": 0,
+                "clicked": False,
+            }
+
     # Скроллим (имитация чтения).
     iters = random.randint(scrolls_lo, scrolls_hi)
     _scroll_page(driver, iters)

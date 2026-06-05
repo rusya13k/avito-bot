@@ -46,16 +46,19 @@ def state_mock():
 
 
 def test_uninteresting_listing_returns_early(state_mock):
-    """interest < 0.10 → early return True, без scroll/favorite/call."""
+    """interest < 0.10 → early return True, без scroll/favorite.
+    Но _try_write_to_owner вызывается ДО ранней остановки — сообщение
+    отправляется даже неинтересным собственникам."""
     from bot import view_listing
 
     with (
         patch("bot.hp", return_value=5.0),
         patch("bot.scroll_gallery") as mock_scroll,
-        patch("bot.move_click") as mock_click,
+        patch("bot.move_click"),
         patch("bot.WebDriverWait") as mock_wdw,
         patch("bot.account_state", state_mock),
         patch("bot.random") as mock_rng,
+        patch("bot._try_write_to_owner") as mock_write,
     ):
         # interest_roll < 0.20 → ветка «совсем не моё»
         # interest = uniform(0.0, 0.20). Через mock uniform=0.05 → interest=0.05 < 0.10.
@@ -66,8 +69,9 @@ def test_uninteresting_listing_returns_early(state_mock):
 
     assert result is True
     mock_scroll.assert_not_called()
-    mock_click.assert_not_called()
-    state_mock.should_skip_phone.assert_not_called()
+    # message_rate=0.05 по умолчанию → при random.random()=0.10 > 0.05
+    # «Написать» не нажимается. Пишем не всем — стелс-режим.
+    mock_write.assert_not_called()
 
 
 def test_interesting_listing_continues_full_flow(state_mock):

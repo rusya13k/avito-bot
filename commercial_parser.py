@@ -187,7 +187,11 @@ def _extract_location(driver) -> str:
             )
             for span in addr_spans:
                 text = span.text.strip()
-                if text and len(text) > 5 and ("," in text or "ул" in text.lower() or "пр" in text.lower()):
+                if (
+                    text
+                    and len(text) > 5
+                    and ("," in text or "ул" in text.lower() or "пр" in text.lower())
+                ):
                     return text
         # Стратегия 2: itemprop address
         addr_elem = driver.find_elements(By.XPATH, "//*[@itemprop='address']")
@@ -252,9 +256,7 @@ def _extract_seller_info(driver) -> dict:
     try:
         # Стратегия 1: meta-тег vk:seller_name (самый стабильный)
         seller_name = "Неизвестно"
-        meta_seller = driver.find_elements(
-            By.XPATH, "//meta[@property='vk:seller_name']"
-        )
+        meta_seller = driver.find_elements(By.XPATH, "//meta[@property='vk:seller_name']")
         if meta_seller:
             seller_name = meta_seller[0].get_attribute("content") or "Неизвестно"
         else:
@@ -263,9 +265,7 @@ def _extract_seller_info(driver) -> dict:
                 By.XPATH, "//*[@data-marker='item-view/item-view-contacts']"
             )
             if contacts_block:
-                name_spans = contacts_block[0].find_elements(
-                    By.XPATH, ".//span[@title]"
-                )
+                name_spans = contacts_block[0].find_elements(By.XPATH, ".//span[@title]")
                 for span in name_spans:
                     title = span.get_attribute("title") or ""
                     if title and len(title) > 1:
@@ -368,9 +368,12 @@ def _visit_seller_profile(driver, listing_data: dict, log_func, account_name: st
         try:
             WebDriverWait(driver, 8).until(
                 EC.presence_of_element_located(
-                    (By.XPATH, "//div[@data-marker='profile-item']"
-                     " | //*[contains(@data-marker,'item')]//a[@data-marker='item-title']"
-                     " | //*[@data-marker='profile/summary']")
+                    (
+                        By.XPATH,
+                        "//div[@data-marker='profile-item']"
+                        " | //*[contains(@data-marker,'item')]//a[@data-marker='item-title']"
+                        " | //*[@data-marker='profile/summary']",
+                    )
                 )
             )
         except TimeoutException:
@@ -387,20 +390,28 @@ def _visit_seller_profile(driver, listing_data: dict, log_func, account_name: st
     finally:
         # Гарантированно закрываем вкладку и возвращаемся
         try:
-            if driver.current_window_handle != original_window:
-                driver.close()
-                driver.switch_to.window(original_window)
+            current_handles = driver.window_handles
+            if original_window in current_handles:
+                if driver.current_window_handle != original_window:
+                    driver.close()
+                    driver.switch_to.window(original_window)
+            else:
+                # Оригинальное окно пропало — переключаемся на первое доступное
+                log_func(
+                    account_name,
+                    "Оригинальное окно пропало, переключаюсь на первое доступное",
+                )
+                if current_handles:
+                    driver.switch_to.window(current_handles[0])
         except Exception:
-            # Если что-то пошло совсем не так — пробуем вернуться
+            # Последний fallback — пробуем вернуться
             try:
                 driver.switch_to.window(original_window)
             except Exception:
                 pass
 
 
-def _parse_seller_profile_listings(
-    driver, listing_data: dict, log_func, account_name: str
-) -> None:
+def _parse_seller_profile_listings(driver, listing_data: dict, log_func, account_name: str) -> None:
     """Парсит страницу профиля продавца. Считает общее количество объявлений
     и количество в категории недвижимости.
 
@@ -415,8 +426,7 @@ def _parse_seller_profile_listings(
         # Текст вида "42 объявления" или "Объявления (42)"
         counter_elems = driver.find_elements(
             By.XPATH,
-            "//*[contains(text(),'объявлен')]"
-            " | //*[contains(text(),'Объявлен')]",
+            "//*[contains(text(),'объявлен')] | //*[contains(text(),'Объявлен')]",
         )
         for elem in counter_elems:
             text = elem.text.strip()
@@ -432,8 +442,7 @@ def _parse_seller_profile_listings(
         try:
             items = driver.find_elements(
                 By.XPATH,
-                "//a[@data-marker='item-title']"
-                " | //*[@data-marker='profile-item']",
+                "//a[@data-marker='item-title'] | //*[@data-marker='profile-item']",
             )
             total_count = len(items)
         except Exception:
@@ -446,8 +455,16 @@ def _parse_seller_profile_listings(
     try:
         items = driver.find_elements(By.XPATH, "//a[@data-marker='item-title']")
         realty_keywords = [
-            "аренд", "помещен", "офис", "склад", "торгов", "коммерч",
-            "недвижим", "м²", "кв.м", "этаж",
+            "аренд",
+            "помещен",
+            "офис",
+            "склад",
+            "торгов",
+            "коммерч",
+            "недвижим",
+            "м²",
+            "кв.м",
+            "этаж",
         ]
         for item in items:
             title_text = (item.text or "").lower()
@@ -676,8 +693,9 @@ def extract_listing_data(driver, wait, account_name, log_func):
         # Открываем в новой вкладке, парсим, закрываем — не теряем текущую страницу.
         _visit_seller_profile(driver, listing_data, log_func, account_name)
 
-        # A3: попытка клика «Показать телефон» (мутирует listing_data).
-        _try_show_phone(driver, account_name, log_func, listing_data)
+        # A3: попытка клика «Показать телефон» — TEMP DISABLED (Бакуган: убрать)
+        # _try_show_phone(driver, account_name, log_func, listing_data)
+        listing_data["phone"] = None
 
         # D4: нормализуем URL до канонического вида — иначе один и тот же
         # листинг с разными UTM создаст дубль в БД.
@@ -853,6 +871,41 @@ def save_listing_to_db(listing_data, db_manager, log_func, account_name):
                 )
 
             _save_phones_for_listing(db_manager, cur, listing_data)
+
+            # Inline heuristic classification — заполняет classification для новых
+            # листингов сразу при парсинге (без LLM — только эвристика).
+            # Без этого поле остаётся NULL и _try_write_to_owner не может
+            # отличить собственника от агента.
+            if listing_id is not None and norm["profile_id"]:
+                try:
+                    from heuristic_scorer import HeuristicScorer
+
+                    scorer = HeuristicScorer(db_manager)
+                    cls, conf, reason, _ = scorer.calculate_score(listing_data)
+                    from datetime import datetime
+
+                    db_manager.update_listing_classification(
+                        listing_id=listing_id,
+                        classification=cls,
+                        confidence=conf,
+                        source="heuristic-inline",
+                        classified_at=datetime.now().isoformat(),
+                        cursor=cur,
+                    )
+                    db_manager.update_account_classification(
+                        profile_id=norm["profile_id"],
+                        classification=cls,
+                        confidence=conf,
+                        source="heuristic-inline",
+                        classified_at=datetime.now().isoformat(),
+                        cursor=cur,
+                    )
+                    log_func(
+                        account_name,
+                        f"  Inline classification: {cls} (conf={conf:.2f}, {reason})",
+                    )
+                except Exception:
+                    pass  # не ломаем save если классификация упала
 
             # A3: parse_status — 'ok' или 'captcha' (если поймали капчу).
             if listing_id is not None:

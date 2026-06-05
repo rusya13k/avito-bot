@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # Маппинг env-переменная → (json-ключ верхнего уровня).
 # Только секреты + базовая инфра. Списки аккаунтов в env не льём.
 ENV_TO_CFG = {
+    "DEEPSEEK_API_KEY": "openai_api_key",
     "OPENAI_API_KEY": "openai_api_key",
     "OPENAI_API_BASE": "openai_api_base",
     "OPENAI_MODEL": "openai_model",

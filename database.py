@@ -1,6 +1,7 @@
 import datetime
 import json
 import logging
+import random
 import sqlite3
 import threading
 import time
@@ -313,6 +314,12 @@ class DatabaseManager:
         ]
         with self._cursor(write=True) as cursor:
             for table, column, col_type in new_columns:
+                # Whitelist: table/column/col_type из хардкодированного списка,
+                # но на всякий случай валидируем (нет внешнего ввода).
+                if not all(s.isidentifier() for s in (table, column)):
+                    raise ValueError(f"Invalid identifier in migration: {table}.{column}")
+                if col_type not in ("TEXT", "INTEGER", "REAL"):
+                    raise ValueError(f"Invalid col_type in migration: {col_type}")
                 try:
                     cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
                 except sqlite3.OperationalError as e:
@@ -779,6 +786,10 @@ class DatabaseManager:
                 "(account_name, event_type, value, ts) VALUES (?, ?, ?, ?)",
                 (account_name or "", event_type, float(value), ts_val),
             )
+            # T20-ttl: удаляем samples старше 7 дней (бесконечный рост = OOM)
+            if random.random() < 0.01:  # 1% chance — не каждый вызов
+                cutoff = time.time() - 7 * 86400
+                cur.execute("DELETE FROM behavioral_samples WHERE ts < ?", (cutoff,))
 
     def get_behavioral_samples(
         self,
@@ -819,7 +830,8 @@ class DatabaseManager:
             f"ORDER BY ts DESC"
         )
         if limit is not None:
-            sql += f" LIMIT {int(limit)}"
+            sql += " LIMIT ?"
+            params.append(int(limit))
         with self._cursor() as cur:
             cur.execute(sql, params)
             cols = [d[0] for d in cur.description]
@@ -997,21 +1009,16 @@ class DatabaseManager:
         Загружает unix-timestamps капч за последние 24 часа для аккаунта.
         Используется для восстановления in-memory captcha_timestamps при рестарте.
         """
-        cutoff = time.strftime(
-            "%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 86400)
-        )
+        cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 86400))
         with self._cursor() as cur:
             cur.execute(
-                "SELECT ts FROM captcha_log "
-                "WHERE account_name = ? AND ts >= ? ORDER BY ts",
+                "SELECT ts FROM captcha_log WHERE account_name = ? AND ts >= ? ORDER BY ts",
                 (account_name or "", cutoff),
             )
             results = []
             for (ts_str,) in cur.fetchall():
                 try:
-                    results.append(
-                        time.mktime(time.strptime(ts_str, "%Y-%m-%d %H:%M:%S"))
-                    )
+                    results.append(time.mktime(time.strptime(ts_str, "%Y-%m-%d %H:%M:%S")))
                 except (ValueError, OverflowError):
                     pass
             return results
@@ -1024,13 +1031,16 @@ class DatabaseManager:
             cursor.execute("SELECT COUNT(*) FROM listings WHERE date_parsed >= ?", (since_date,))
             return cursor.fetchone()[0]
 
-    def get_unclassified_listings(self):
+    def get_unclassified_listings(self, limit: int = 1000):
         """
-        Get listings that haven't been classified yet
+        Get listings that haven't been classified yet.
+        limit: максимальное количество строк (защита от OOM при 100k+ листингов).
         """
         with self._cursor() as cursor:
             cursor.execute(
-                'SELECT * FROM listings WHERE classification IS NULL OR classification = ""'
+                'SELECT * FROM listings WHERE classification IS NULL OR classification = "" '
+                "LIMIT ?",
+                (limit,),
             )
             rows = cursor.fetchall()
             columns = [d[0] for d in cursor.description]
@@ -1089,6 +1099,27 @@ class DatabaseManager:
             cursor.execute("SELECT 1 FROM listings WHERE url = ? LIMIT 1", (url,))
             return cursor.fetchone() is None
 
+    def get_seen_listing_urls(self) -> set[str]:
+        """Возвращает множество всех URL в таблице listings (нормализованных).
+        Используется для фильтрации уже просмотренных объявлений перед
+        навигацией — чтобы не тратить Selenium-транзит и бюджет листингов
+        на повторные просмотры.
+
+        Для больших БД (100k+ URL) может потреблять много памяти.
+        Рассмотрите использование is_listing_url_seen() для точечных проверок.
+        """
+        with self._cursor() as cursor:
+            cursor.execute("SELECT url FROM listings")
+            return {row[0] for row in cursor.fetchall()}
+
+    def is_listing_url_seen(self, url: str) -> bool:
+        """Проверяет конкретный URL — без загрузки всего набора в память.
+        Используется вместо get_seen_listing_urls() когда нужен только один check.
+        """
+        with self._cursor() as cursor:
+            cursor.execute("SELECT 1 FROM listings WHERE url = ? LIMIT 1", (url,))
+            return cursor.fetchone() is not None
+
     def mark_listing_parse_status(self, url, status, listing_id=None, cursor=None):
         """
         Помечает листинг статусом парсинга:
@@ -1139,13 +1170,13 @@ class DatabaseManager:
             return row[0] if row else None
 
     def update_listing_classification(
-        self, listing_id, classification, confidence, source, classified_at
+        self, listing_id, classification, confidence, source, classified_at, *, cursor=None
     ):
         """
         Update listing with classification results
         """
-        with self._cursor(write=True) as cursor:
-            cursor.execute(
+        with self._with_cursor(write=True, cursor=cursor) as cur:
+            cur.execute(
                 """
                 UPDATE listings
                 SET classification = ?,
@@ -1156,6 +1187,33 @@ class DatabaseManager:
             """,
                 (classification, confidence, source, classified_at, listing_id),
             )
+
+    def get_listing_classification(self, url: str) -> str | None:
+        """Возвращает classification листинга по URL, или None если не классифицирован.
+        URL может содержать ?context=.. — обрезаем до ? для поиска.
+        """
+        if not url:
+            return None
+        # Обрезаем query-параметры — Avito добавляет ?context=.. при переходе
+        # из поиска, а в БД хранится чистый URL.
+        clean_url = url.split("?")[0]
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT classification FROM listings WHERE url = ? LIMIT 1",
+                (clean_url,),
+            )
+            row = cur.fetchone()
+            if row:
+                return row[0]
+            # Fallback: LIKE поиск (URL в БД может быть обрезан).
+            # Используем ESCAPE чтобы wildcard символы в URL не ломали поиск.
+            # Добавляем '/' как boundary — чтобы /item/123 не совпало с /item/1234.
+            cur.execute(
+                "SELECT classification FROM listings WHERE url LIKE ? ESCAPE '\\' LIMIT 1",
+                (clean_url.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%",),
+            )
+            row = cur.fetchone()
+            return row[0] if row else None
 
     def get_classification_stats(self) -> dict:
         """
@@ -1221,13 +1279,13 @@ class DatabaseManager:
             return result[0] if result else 0
 
     def update_account_classification(
-        self, profile_id, classification, confidence, source, classified_at
+        self, profile_id, classification, confidence, source, classified_at, *, cursor=None
     ):
         """
         Update account with classification results
         """
-        with self._cursor(write=True) as cursor:
-            cursor.execute(
+        with self._with_cursor(write=True, cursor=cursor) as cur:
+            cur.execute(
                 """
                 UPDATE avito_accounts
                 SET classification = ?,
@@ -1248,31 +1306,18 @@ class DatabaseManager:
         Insert or update a phone number in the database.
 
         C4: cursor=... — для участия в общей транзакции с upsert_listing.
+        Uses INSERT ... ON CONFLICT for atomic UPSERT (no SELECT-then-INSERT race).
         """
         with self._with_cursor(write=True, cursor=cursor) as cursor:
             cursor.execute(
-                "SELECT listing_count FROM phones WHERE phone_normalized = ?", (phone_normalized,)
+                """
+                INSERT INTO phones (phone_normalized, listing_count, score)
+                VALUES (?, ?, ?)
+                ON CONFLICT(phone_normalized) DO UPDATE SET
+                    listing_count = listing_count + excluded.listing_count
+                """,
+                (phone_normalized, listing_count, score),
             )
-            result = cursor.fetchone()
-
-            if result:
-                new_count = result[0] + listing_count
-                cursor.execute(
-                    """
-                    UPDATE phones
-                    SET listing_count = ?
-                    WHERE phone_normalized = ?
-                """,
-                    (new_count, phone_normalized),
-                )
-            else:
-                cursor.execute(
-                    """
-                    INSERT INTO phones (phone_normalized, listing_count, score)
-                    VALUES (?, ?, ?)
-                """,
-                    (phone_normalized, listing_count, score),
-                )
 
     def get_phone_count(self, phone_normalized):
         """
@@ -1372,6 +1417,10 @@ class DatabaseManager:
         """
         Add a message to the database if it doesn't exist.
 
+        C2-fix: dedup по (dialog_id, direction, text) без timestamp — одно и то же
+        сообщение не дублируется при повторном парсинге в разных циклах.
+        Timestamp первого появления сохраняется (MIN семантика для F5).
+
         C4: cursor=... — для атомарной связки "обновить диалог + добавить
         исходящее сообщение" сразу после _send_message.
         """
@@ -1379,9 +1428,9 @@ class DatabaseManager:
             cursor.execute(
                 """
                 SELECT 1 FROM messages
-                WHERE dialog_id = ? AND direction = ? AND text = ? AND timestamp = ?
+                WHERE dialog_id = ? AND direction = ? AND text = ?
             """,
-                (dialog_id, direction, text, timestamp),
+                (dialog_id, direction, text),
             )
 
             if cursor.fetchone():

@@ -4,7 +4,9 @@ Avito Commercial Real Estate Parser Bot
 
 import json
 import logging
+import os
 import random
+import re
 import signal
 import sys
 import threading
@@ -123,6 +125,12 @@ class AdsPowerAPI:
             )
             # L1: print → logger.debug (debug-level чтобы не шуметь в обычных логах)
             _bot_logger.debug("[AdsPower] Using API Key: %s", key_hint)
+            # Warn if API key sent over non-localhost connection (MITM risk)
+            if not self.base.startswith(("http://localhost", "http://127.0.0.1")):
+                _bot_logger.warning(
+                    "[AdsPower] API key передаётся по не-localhost URL %s — MITM риск!",
+                    self.base,
+                )
 
         r = requests.get(
             self._url("/api/v1/browser/start"), params=params, headers=headers, timeout=60
@@ -149,11 +157,11 @@ class AdsPowerAPI:
             requests.get(
                 self._url("/api/v1/browser/stop"), params=params, headers=headers, timeout=15
             )
-        except (requests.RequestException, ValueError):
+        except (requests.RequestException, ValueError) as exc:
             # L12: bare → конкретные. RequestException — все сетевые/HTTP ошибки
             # requests, ValueError — на случай invalid params/url. Stop — fire-and-
-            # forget, нам всё равно нечего делать с ошибкой; лог только в DEBUG.
-            pass
+            # forget, но логируем для диагностики.
+            _bot_logger.debug("stop_profile(%s) failed: %s", user_id, exc)
 
     def update_proxy(self, user_id: str, proxy_str: str) -> bool:
         """L11: устанавливает прокси для AdsPower-профиля через REST API.
@@ -167,19 +175,51 @@ class AdsPowerAPI:
             ошибки и невалидный JSON в ответе). Ошибки молча подавляются —
             вызывающий код имеет fallback (см. `_apply_account_proxy`).
         """
-        parts = proxy_str.split(":")
-        if len(parts) < 2:
-            return False
-
-        proxy_config = {
+        # Парсинг прокси: поддерживаем IPv6 ([::1]:8080:user:pass) и
+        # обычный формат (host:port[:user:pass]), а также user:pass@host:port
+        proxy_config: dict[str, str] = {
             "proxy_soft": "other",
-            "proxy_type": "socks5",  # or http
-            "proxy_host": parts[0],
-            "proxy_port": parts[1],
+            "proxy_type": "socks5h",
         }
-        if len(parts) >= 4:
-            proxy_config["proxy_user"] = parts[2]
-            proxy_config["proxy_password"] = parts[3]
+
+        # Формат user:pass@host:port
+        if "@" in proxy_str:
+            creds_part, host_part = proxy_str.rsplit("@", 1)
+            # host_part может быть IPv6: [::1]:8080
+            if host_part.startswith("["):
+                bracket_end = host_part.index("]")
+                proxy_config["proxy_host"] = host_part[1:bracket_end]
+                proxy_config["proxy_port"] = host_part[bracket_end + 2 :]  # skip ]:
+            else:
+                hp = host_part.split(":")
+                if len(hp) < 2:
+                    return False
+                proxy_config["proxy_host"] = hp[0]
+                proxy_config["proxy_port"] = hp[1]
+            # creds_part: user:pass
+            creds = creds_part.split(":", 1)
+            proxy_config["proxy_user"] = creds[0]
+            if len(creds) > 1:
+                proxy_config["proxy_password"] = creds[1]
+        else:
+            parts = proxy_str.split(":")
+            if len(parts) < 2:
+                return False
+            # IPv6: [::1]:8080
+            if proxy_str.startswith("["):
+                bracket_end = proxy_str.index("]")
+                proxy_config["proxy_host"] = proxy_str[1:bracket_end]
+                rest = proxy_str[bracket_end + 2 :].split(":")  # skip ]:
+                proxy_config["proxy_port"] = rest[0]
+                if len(rest) >= 3:
+                    proxy_config["proxy_user"] = rest[1]
+                    proxy_config["proxy_password"] = rest[2]
+            else:
+                proxy_config["proxy_host"] = parts[0]
+                proxy_config["proxy_port"] = parts[1]
+                if len(parts) >= 4:
+                    proxy_config["proxy_user"] = parts[2]
+                    proxy_config["proxy_password"] = parts[3]
 
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         payload = {"user_id": user_id, "user_proxy_config": proxy_config}
@@ -321,7 +361,7 @@ def load_cookies(driver: webdriver.Chrome, cookies_path: str, domain: str):
         try:
             driver.add_cookie(cookie_dict)
         except Exception:
-            pass
+            _bot_logger.debug("load_cookies: failed to add cookie %s", cookie_dict.get("name"))
 
     try:
         driver.get(f"https://{domain}")
@@ -487,7 +527,18 @@ def check_block(driver, account_name):
         "Ваш IP временно заблокирован",
     ]
 
-    # Check page title - Yandex captcha often has "Ой!" as title
+    # Check URL first — cheapest operation (no DOM access)
+    try:
+        url = driver.current_url or ""
+        url_lower = url.lower()
+        for marker in ("/firewall/", "/captcha", "captcha.html", "/blocked"):
+            if marker in url_lower:
+                log(account_name, f"!!! ALERT: BLOCK DETECTED BY URL ({marker}) !!!")
+                return True
+    except Exception:
+        pass
+
+    # Check page title — cheap operation
     try:
         title = driver.title
         if "Ой!" in title or "Captcha" in title:
@@ -496,6 +547,7 @@ def check_block(driver, account_name):
     except Exception:
         pass
 
+    # page_source — expensive, only after cheap checks
     try:
         page_source = driver.page_source
     except Exception:
@@ -539,14 +591,615 @@ def _read_listing_meta(driver) -> tuple[str, int]:
     return description, image_count
 
 
+def _try_write_to_owner(
+    driver,
+    account_name,
+    *,
+    llm_classifier=None,
+    db_manager=None,
+    account=None,
+) -> None:
+    """Нажать «Написать» на странице листинга, сгенерировать первое сообщение
+    через LLM и отправить собственнику. Best-effort: не валит view_listing
+    при ошибке.
+
+    Пишем собственнику (outbound-канал, без message_rate). Dedup через
+    was_owner_contacted — если уже писали этому profile_id, скипаем.
+    После успешной отправки — record_outbound для аналитики.
+    """
+    # 0. Dedup: если у нас нет db_manager — пишем без проверки (best-effort).
+    profile_id = None
+    listing_url = None
+
+    # Извлекаем profile_id из DOM (селекторы из commercial_parser._extract_seller_info).
+    # Извлекаем profile_id из DOM — несколько способов:
+    # 1. Из seller-info (ссылка на профиль продавца)
+    # 2. Из href кнопки «Написать» (содержит путь /user/<id>/)
+    # 3. Из data-marker seller-link
+    try:
+        # Способ 1: seller-info links
+        profile_links = driver.find_elements(
+            By.XPATH,
+            "//*[@data-marker='item-view/item-view-contacts']"
+            "//a[contains(@href,'/user/') or contains(@href,'/brands/')]",
+        )
+        if not profile_links:
+            # Способ 2: seller-link data-marker
+            profile_links = driver.find_elements(By.CSS_SELECTOR, "a[data-marker*='seller-link']")
+        if not profile_links:
+            # Способ 3: любые ссылки на /user/ или /brands/
+            profile_links = driver.find_elements(
+                By.XPATH,
+                "//a[contains(@href,'/user/') or contains(@href,'/brands/')]"
+                "[not(contains(@href,'#login'))]",
+            )
+        if profile_links:
+            profile_url = profile_links[0].get_attribute("href") or ""
+            m = re.search(r"/user/([^/?]+)", profile_url)
+            if not m:
+                m = re.search(r"/brands/([^/?]+)", profile_url)
+            profile_id = m.group(1) if m else None
+    except Exception:
+        pass
+
+    # Текущий URL листинга.
+    try:
+        listing_url = driver.current_url
+    except Exception:
+        pass
+
+    # Фильтр: не пишем агентствам. Проверяем прямо на странице Avito —
+    # он показывает «Агентство» или «Собственник» в seller-info.
+    # Это точнее чем эвристическая классификация из БД.
+    try:
+        seller_type = driver.execute_script(
+            """
+            // Avito seller-info labels
+            var labels = document.querySelectorAll('[data-marker="seller-info/label"]');
+            for (var i = 0; i < labels.length; i++) {
+                var t = labels[i].textContent.trim().toLowerCase();
+                if (t === 'агентство' || t === 'agent') return 'agent';
+                if (t === 'собственник' || t === 'owner') return 'owner';
+            }
+            // Fallback: искать текст в seller-info секции
+            var info = document.querySelector('[data-marker="seller-info"]');
+            if (info) {
+                var txt = info.textContent.toLowerCase();
+                if (txt.indexOf('агентство') !== -1) return 'agent';
+                if (txt.indexOf('собственник') !== -1) return 'owner';
+            }
+            // Fallback: весь текст страницы
+            var body = document.body.innerText;
+            var hasAgent = body.indexOf('Агентство') !== -1;
+            var hasOwner = body.indexOf('Собственник') !== -1;
+            if (hasAgent && !hasOwner) return 'agent';
+            if (hasOwner && !hasAgent) return 'owner';
+            return 'unknown';
+        """
+        )
+        if seller_type == "agent":
+            log(account_name, "  Продавец = «Агентство» (Avito) — скип.")
+            return
+        log(account_name, f"  Продавец тип: {seller_type} (Avito)")
+    except Exception:
+        pass
+
+    # Если profile_id неизвестен — всё равно пишем (без dedup — не знаем кому).
+    if not profile_id:
+        log(account_name, "  profile_id не извлечён — пишем без dedup-проверки.")
+    else:
+        log(account_name, f"  profile_id={profile_id}, listing_url={listing_url}")
+
+    if db_manager is not None and profile_id:
+        if db_manager.was_owner_contacted(profile_id):
+            log(account_name, f"  Собственник {profile_id} уже контактирован — скип.")
+            return
+
+    log(account_name, "  Пишем собственнику...")
+
+    # 1. Клик «Написать» — селекторы Avito 2025-2026.
+    # Важно: используем presence_of_element_located (не element_to_be_clickable),
+    # потому что Avito часто рендерит кнопку за sticky-header или за overlay —
+    # Selenium считает её «not clickable», но JS-click работает.
+    # После нахождения — scrollIntoView + JS click.
+    chat_btn_selectors = [
+        (By.XPATH, "//a[@data-marker='messenger-button/link']"),
+        (By.CSS_SELECTOR, "a[data-marker='messenger-button/link']"),
+        (By.ID, "bx_contact-button_messenger"),
+        (By.XPATH, "//a[@id='bx_contact-button_messenger']"),
+        (By.XPATH, "//button[@data-marker='item-contact-bar/message-button']"),
+        (By.XPATH, "//a[@data-marker='item-contact-bar/message-button']"),
+        (By.XPATH, "//*[@data-marker='item-contact-bar/message-button']"),
+        (By.XPATH, "//a[contains(., 'Написать сообщение')]"),
+        (By.XPATH, "//button[contains(., 'Написать сообщение')]"),
+        (By.XPATH, "//a[contains(., 'Написать')]"),
+        (By.XPATH, "//button[contains(., 'Написать')]"),
+    ]
+    chat_btn = None
+    for by, selector in chat_btn_selectors:
+        try:
+            chat_btn = WebDriverWait(driver, 2).until(
+                EC.presence_of_element_located((by, selector))
+            )
+            break
+        except Exception:
+            continue
+
+    # Fallback: JS-поиск по data-marker или тексту.
+    if chat_btn is None:
+        try:
+            chat_btn = driver.execute_script(
+                """
+                var el = document.querySelector('a[data-marker="messenger-button/link"]');
+                if (el) return el;
+                var btns = document.querySelectorAll('a, button');
+                for (var i = 0; i < btns.length; i++) {
+                    var t = btns[i].textContent.trim();
+                    if (t.indexOf('Написать') === 0) return btns[i];
+                }
+                return null;
+            """
+            )
+            if chat_btn is not None:
+                log(account_name, "  Кнопка «Написать» найдена через JS-fallback.")
+        except Exception:
+            pass
+
+    if chat_btn is None:
+        # Debug: какие data-marker есть на странице.
+        try:
+            markers = driver.execute_script(
+                """
+                var result = [];
+                document.querySelectorAll('[data-marker]').forEach(function(el) {
+                    var m = el.getAttribute('data-marker');
+                    if (m.indexOf('message') !== -1 || m.indexOf('messenger') !== -1
+                        || m.indexOf('contact') !== -1) {
+                        result.push(m + '|' + el.tagName);
+                    }
+                });
+                return result.join('; ') || '(none)';
+            """
+            )
+            log(
+                account_name,
+                f"  Кнопка «Написать» не найдена. data-markers: {markers}",
+            )
+        except Exception:
+            log(account_name, "  Кнопка «Написать» не найдена (debug failed).")
+        return
+
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", chat_btn)
+        hp(1.0, 2.5)
+        # JS click — надёжнее чем Selenium click, обходит
+        # ElementClickInterceptedException от sticky-header/overlay.
+        driver.execute_script("arguments[0].click();", chat_btn)
+        log(account_name, "  Кнопка «Написать» нажата (JS click).")
+        hp(2, 4)
+    except Exception:
+        # Fallback: попробовать move_click если JS click не сработал.
+        try:
+            move_click(driver, chat_btn)
+            log(account_name, "  Кнопка «Написать» нажата (move_click).")
+            hp(2, 4)
+        except Exception:
+            log(account_name, "  Не удалось кликнуть «Написать».")
+            return
+
+    # 2. Текст сообщения — вариации от заказчика.
+    # Один смысл, разные формулировки — чтобы Avito не детектил спам
+    # и не давал теневой бан за идентичные сообщения.
+    text = random.choice(
+        [
+            # Вариант 1 — исходный
+            (
+                "Здравствуйте. Занимаюсь строительством и сдачей небольших торговых "
+                "центров, есть уже 15 готовых арендных бизнесов по Татарстану и сейчас "
+                "нахожусь в поиске финансовых партнеров для строительства новых объектов. "
+                "Средняя окупаемость объекта для инвестора от 6 до 8 лет.\n"
+                "Интересно обсудить?"
+            ),
+            # Вариант 2 — другой порядок предложений
+            (
+                "Добрый день! Строю и сдаю небольшие торговые центры — на данный "
+                "момент 15 арендных бизнесов работают по Татарстану. Сейчас ищу "
+                "финансовых партнёров для новых объектов. Окупаемость для инвестора "
+                "6-8 лет. Было бы интересно поговорить?"
+            ),
+            # Вариант 3 — короче, разговорнее
+            (
+                "Здравствуйте! У меня 15 действующих арендных бизнесов в Татарстане "
+                "(торговые центры). Сейчас запускаю новые объекты и ищу инвесторов-"
+                "партнёров. Срок окупаемости 6-8 лет. Подскажите, вам было бы "
+                "интересно рассмотреть?"
+            ),
+            # Вариант 4 — с вопроса
+            (
+                "Здравствуйте, подскажите, рассматриваете варианты инвестиций в "
+                "коммерческую недвижимость? Я занимаюсь строительством торговых "
+                "центров — 15 объектов уже работают по Татарстану. Сейчас набираю "
+                "партнёров на новые проекты, окупаемость 6-8 лет."
+            ),
+            # Вариант 5 — от первого лица, другой акцент
+            (
+                "Приветствую! Строю торговые центры и сдаю в аренду — 15 объектов "
+                "по Татарстану уже приносят доход. Расширяюсь и ищу финансового "
+                "партнёра на новые площадки. Инвестор выходит в плюс за 6-8 лет. "
+                "Готов обсудить детали, если интересно."
+            ),
+            # Вариант 6 — более деловой
+            (
+                "Здравствуйте. Мы строим и управляем небольшими торговыми центрами "
+                "в Татарстане — в портфолио 15 работающих арендных бизнесов. На "
+                "данный момент привлекаем соинвесторов на новые проекты. Средний "
+                "срок возврата инвестиций — от 6 до 8 лет. Есть ли интерес обсудить?"
+            ),
+            # Вариант 7 — короткий и прямой
+            (
+                "Добрый день! 15 арендных бизнесов в Татарстане (ТЦ) — мои. Ищу "
+                "инвесторов на новые объекты. Окупаемость 6-8 лет. Интересно?"
+            ),
+            # Вариант 8 — с упоминанием региона гибко
+            (
+                "Здравствуйте! Занимаюсь коммерческой недвижимостью — 15 торговых "
+                "центров уже сданы в аренду в Республике Татарстан. Сейчас ищу "
+                "партнёров-инвесторов для строительства следующих объектов. "
+                "Окупаемость порядка 6-8 лет. Хотелось бы обсудить, если актуально."
+            ),
+            # Вариант 9 — мягкий заход
+            (
+                "Здравствуйте! Увидел ваше объявление — интересно. Сам занимаюсь "
+                "торговыми центрами, 15 объектов по Татарстану уже работают. Ищу "
+                "финансовых партнёров для новых строек, окупаемость 6-8 лет. "
+                "Может быть рассмотрим варианты?"
+            ),
+            # Вариант 10 — акцент на цифрах
+            (
+                "Добрый день! 15 арендных бизнесов, 6-8 лет окупаемость, Татарстан — "
+                "это мои текущие объекты. Расширяюсь и ищу инвесторов-партнёров на "
+                "новые торговые центры. Рассмотрите предложение?"
+            ),
+        ]
+    )
+
+    # 3. Найти chat-input и ввести текст.
+    # Avito mini-messenger popup имеет ДВА textarea:
+    #   icebreakers/textarea — предзаполнен «Здравствуйте! », основной видимый
+    #   reply/input          — пустой, маленький, внизу (НЕ основной)
+    # Пишем в icebreakers/textarea (предпочтительный) или reply/input,
+    # но ВСЕГДА сначала очищаем Ctrl+A → Delete, иначе текст смешивается
+    # с предзаполненным айсбрейкером и сообщение уходит обрезанным.
+    input_selectors = [
+        # Приоритет 1: icebreakers/textarea — основной видимый input Avito
+        (By.CSS_SELECTOR, "textarea[data-marker='icebreakers/textarea']"),
+        (By.XPATH, "//textarea[@data-marker='icebreakers/textarea']"),
+        # Приоритет 2: reply/input — запасной
+        (By.CSS_SELECTOR, "textarea[data-marker='reply/input']"),
+        (By.XPATH, "//textarea[@data-marker='reply/input']"),
+        # Приоритет 3: другие
+        (By.XPATH, "//textarea[@data-marker='message-input']"),
+        (By.CSS_SELECTOR, "textarea[data-marker='message-input']"),
+        (By.XPATH, "//textarea[contains(@placeholder, 'Сообщ')]"),
+        (By.XPATH, "//textarea[contains(@placeholder, 'сообщ')]"),
+        (By.CSS_SELECTOR, "div[contenteditable='true'][role='textbox']"),
+        (By.XPATH, "//textarea"),
+    ]
+    input_el = None
+    for by, selector in input_selectors:
+        try:
+            # visibility_of — ждём что элемент реально видимый, не display:none
+            input_el = WebDriverWait(driver, 3).until(
+                EC.visibility_of_element_located((by, selector))
+            )
+            break
+        except Exception:
+            continue
+
+    # JS-fallback: найти ВИДИМЫЙ input через JS если Selenium не видит.
+    if input_el is None:
+        try:
+            input_el = driver.execute_script(
+                """
+                // Приоритет: icebreakers/textarea > reply/input > любой textarea
+                var candidates = [
+                    'textarea[data-marker="icebreakers/textarea"]',
+                    'textarea[data-marker="reply/input"]',
+                    'textarea[data-marker="message-input"]'
+                ];
+                for (var i = 0; i < candidates.length; i++) {
+                    var el = document.querySelector(candidates[i]);
+                    if (el && el.offsetParent !== null) return el;
+                }
+                var ce = document.querySelector('div[contenteditable="true"][role="textbox"]');
+                if (ce && ce.offsetParent !== null) return ce;
+                var tas = document.querySelectorAll('textarea');
+                for (var i = 0; i < tas.length; i++) {
+                    if (tas[i].offsetParent !== null) return tas[i];
+                }
+                return null;
+                """
+            )
+            if input_el is not None:
+                log(account_name, "  Chat-input найден через JS-fallback (visibility).")
+        except Exception:
+            pass
+
+    if input_el is None:
+        log(account_name, "  Chat-input не найден после клика «Написать».")
+        return
+
+    # Debug: показать tag + data-marker найденного элемента.
+    try:
+        tag = input_el.tag_name
+        marker = input_el.get_attribute("data-marker") or ""
+        log(account_name, f"  Chat-input найден: <{tag}> marker={marker}")
+    except Exception:
+        pass
+
+    try:
+        move_click(driver, input_el)
+        hp(0.4, 1.2)
+        # Очистка поля: Avito предзаполняет icebreakers/textarea текстом
+        # вроде «Здравствуйте! ». Если не очистить — наше сообщение
+        # смешивается с айсбрейкером и уходит обрезанным.
+        try:
+            input_el.send_keys(Keys.CONTROL + "a")
+            input_el.send_keys(Keys.DELETE)
+            hp(0.2, 0.4)
+        except Exception:
+            pass
+        # Реалистичный typing через human_typing.
+        from human_typing import length_speed_multiplier, persona_speed_multiplier, type_human
+
+        persona_id = (account or {}).get("persona")
+        speed_mul = persona_speed_multiplier(persona_id) * length_speed_multiplier(text)
+        if not type_human(
+            input_el,
+            text,
+            speed_range=(0.05, 0.20),
+            speed_multiplier=speed_mul,
+            enable_typos=True,
+            stop_event=_tg.get_account_stop_event(account_name),
+        ):
+            log(account_name, "  Ввод прерван (stop_event).")
+            return
+    except Exception as exc:
+        log(account_name, f"  Ошибка ввода текста: {exc}")
+        return
+
+    hp(1.5, 3.5)
+
+    # 4. Нажать Send.
+    # Avito 2026: кнопка отправки — <svg role="button" data-marker="icebreakers/send-message">.
+    # arguments[0].click() на SVG не работает (React не ловит программный клик).
+    # Надёжный способ: Enter в textarea (нативный для web-чатов).
+    # Запасной: dispatchEvent(MouseEvent) на SVG-элемент.
+    from selenium.webdriver.common.keys import Keys
+
+    # Способ 1: Enter в textarea — самый надёжный для Avito
+    try:
+        input_el.send_keys(Keys.ENTER)
+        log(account_name, "  Сообщение отправлено (Enter в textarea).")
+    except Exception:
+        log(account_name, "  Enter в textarea не удался, пробуем SVG-кнопку...")
+
+        # Способ 2: dispatchEvent на SVG[role="button"]
+        try:
+            clicked = driver.execute_script(
+                """
+                var svg = document.querySelector(
+                    '[data-marker="icebreakers/send-message"]'
+                ) || document.querySelector('[data-marker="send-message-button"]');
+                if (!svg) return false;
+                svg.dispatchEvent(new MouseEvent('click', {
+                    bubbles: true, cancelable: true, view: window
+                }));
+                return true;
+                """
+            )
+            if clicked:
+                log(account_name, "  Сообщение отправлено (SVG dispatchEvent).")
+            else:
+                raise RuntimeError("SVG not found")
+        except Exception:
+            # Способ 3: move_click на найденный элемент
+            try:
+                send_el = driver.find_element(
+                    By.CSS_SELECTOR, "[data-marker='icebreakers/send-message']"
+                )
+                if move_click(driver, send_el):
+                    log(account_name, "  Сообщение отправлено (move_click на SVG).")
+                else:
+                    log(account_name, "  Все способы отправки упали.")
+                    return
+            except Exception:
+                log(account_name, "  Все способы отправки упали.")
+                return
+
+    hp(2, 5)
+
+    # 5. Закрываем чат-оверлей — после отправки Avito может оставить overlay
+    # открытым, что ломает driver.back() в browse/find_and_view.
+    try:
+        # Пробуем нажать Escape (закрывает большинство overlay-окон Avito).
+        from selenium.webdriver.common.keys import Keys
+
+        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        hp(1, 2)
+    except Exception:
+        pass
+
+    # 6. Post-send: детект капчи + запись в БД.
+    from captcha_detect import detect_phone_captcha
+
+    if detect_phone_captcha(driver, log_func=log, account_name=account_name):
+        log(account_name, "  КАПЧА после отправки сообщения — записываем.")
+        account_state.mark_captcha(account_name, captcha_type="avito_message_send")
+        return
+
+    log(
+        account_name,
+        f"  ✉ Сообщение отправлено собственнику: {text[:80]}{'...' if len(text) > 80 else ''}",
+    )
+
+    # Записываем outbound-контакт + метрики.
+    # Запись только если profile_id извлечён — чтобы не дедупить "unknown"
+    # друг против друга (два разных собственника без profile_id != один и тот же).
+    if db_manager is not None and profile_id:
+        try:
+            persona_label = (account or {}).get("persona") or ""
+            with db_manager.transaction() as cur:
+                db_manager.record_outbound(
+                    account_name=account_name,
+                    profile_id=profile_id,
+                    listing_url=listing_url,
+                    status="sent",
+                    persona=persona_label,
+                    message_text=text,
+                    cursor=cur,
+                )
+                db_manager.incr_metric(account_name, "messages_sent", cursor=cur)
+                db_manager.incr_metric(account_name, "outbound_initiated", cursor=cur)
+        except Exception:
+            pass
+    elif db_manager is not None:
+        # profile_id неизвестен — только метрику, без record_outbound.
+        try:
+            db_manager.incr_metric(account_name, "messages_sent")
+        except Exception:
+            pass
+
+
+def _generate_view_listing_message(
+    driver,
+    llm_classifier,
+    account_name: str,
+    account: dict | None,
+) -> str | None:
+    """Генерация первого сообщения собственнику прямо из view_listing.
+    Извлекает данные листинга из DOM и вызывает LLM через outbound-промпты.
+    Возвращает sanitized текст или None.
+    """
+    # Извлекаем данные листинга из текущей страницы.
+    listing_info = {}
+    try:
+        title_el = driver.find_element(By.XPATH, "//h1[@data-marker='item-view/title-info']")
+        listing_info["title"] = title_el.text or ""
+    except Exception:
+        listing_info["title"] = ""
+    try:
+        price_el = driver.find_element(
+            By.XPATH,
+            "//span[@data-marker='item-view/item-price'] | "
+            "//div[contains(@class,'price-value')] | "
+            "//span[contains(@class,'price')]",
+        )
+        listing_info["price"] = price_el.text or "не указана"
+    except Exception:
+        listing_info["price"] = "не указана"
+    try:
+        desc_el = driver.find_element(By.XPATH, "//div[@data-marker='item-view/item-description']")
+        listing_info["description"] = (desc_el.text or "")[:600]
+    except Exception:
+        listing_info["description"] = ""
+    try:
+        loc_el = driver.find_element(
+            By.XPATH,
+            "//span[@data-marker='item-view/item-location'] | //div[contains(@class,'geo')]",
+        )
+        listing_info["location"] = loc_el.text or "—"
+    except Exception:
+        listing_info["location"] = "—"
+    listing_info["category"] = "коммерческая недвижимость"
+    listing_info["area"] = "—"
+
+    # Выбираем персону.
+    persona_id = (account or {}).get("persona") or ""
+    from outbound_messenger import (
+        _APPROACH_HINTS,
+        _FORMALITY_LEVELS,
+        _LENGTH_HINTS,
+        _PITCH_APPROACH_HINTS,
+        _PITCH_FORMALITY_LEVELS,
+        _PITCH_LENGTH_HINTS,
+        PERSONAS,
+        _is_pitch_persona,
+    )
+
+    persona_description = PERSONAS.get(persona_id, "")
+    is_pitch = _is_pitch_persona(persona_id)
+
+    if is_pitch:
+        formality = random.choice(_PITCH_FORMALITY_LEVELS)
+        length = random.choice(_PITCH_LENGTH_HINTS)
+        approach = random.choice(_PITCH_APPROACH_HINTS)
+        system_prompt_name = "outbound_first_message_pitch.system.txt"
+        user_prompt_name = "outbound_first_message_pitch.user.txt"
+    else:
+        formality = random.choice(_FORMALITY_LEVELS)
+        length = random.choice(_LENGTH_HINTS)
+        approach = random.choice(_APPROACH_HINTS)
+        system_prompt_name = "outbound_first_message.system.txt"
+        user_prompt_name = "outbound_first_message.user.txt"
+
+    try:
+        from llm_classifier import _load_prompt
+        from llm_sanitizer import sanitize_llm_reply
+
+        system_message = _load_prompt(system_prompt_name)
+        user_prompt = _load_prompt(user_prompt_name).format(
+            title=listing_info.get("title", "—"),
+            category=listing_info.get("category", "коммерческая недвижимость"),
+            location=listing_info.get("location", "—"),
+            area=listing_info.get("area", "—"),
+            price=listing_info.get("price", "не указана"),
+            description=listing_info.get("description", "")[:600],
+            persona_description=persona_description,
+            formality=formality,
+            length=length,
+            approach=approach,
+        )
+        raw = llm_classifier._call_llm(
+            system_message=system_message,
+            user_message=user_prompt,
+            temperature=0.95,
+        )
+        if not raw:
+            return None
+        raw = raw.strip('"').strip("'").strip()
+        clean, reason = sanitize_llm_reply(raw)
+        if clean is None:
+            log(account_name, f"  LLM sanitizer отбросил ({reason}): {raw[:60]}")
+            return None
+        return clean
+    except Exception as exc:
+        log(account_name, f"  Ошибка генерации сообщения: {exc}")
+        return None
+
+
 def view_listing(
-    driver, wait, account_name, *, favorite_rate=0.08, call_rate=0.05, db_manager=None
+    driver,
+    wait,
+    account_name,
+    *,
+    favorite_rate=0.08,
+    call_rate=None,
+    message_rate=0.05,
+    db_manager=None,
+    llm_classifier=None,
+    account=None,
 ):
     """
     F1: favorite_rate — вероятность «Добавить в избранное» (default 8%).
-    F1: call_rate    — вероятность нажать «Позвонить»       (default 5%).
+    F1: message_rate — вероятность нажать «Написать» и отправить сообщение (default 5%).
+    Пишем не каждому собственнику — только тем, кто прошёл вероятностный фильтр,
+    dedup через was_owner_contacted (если уже писали — скип).
     Оба параметра конфигурируются через config.json / accounts.json
-    (ключи view_listing_favorite_rate / view_listing_call_rate).
+    (ключи view_listing_favorite_rate / view_listing_message_rate).
+
+    call_rate — устаревший алиас для message_rate (back-compat).
+    Если передан call_rate и message_rate не задан — используем call_rate.
 
     T10: dwell_time теперь зависит от контента —
     `compute_reading_dwell(description, image_count, interest)`. Раньше
@@ -603,7 +1256,20 @@ def view_listing(
         except Exception as e:
             log(account_name, f"  T20: не смог записать dwell sample: {e}")
 
-    # T10/F9: совсем неинтересно → закрываем рано.
+    # F1: «Написать» — инициируем диалог с собственником.
+    # ВЫЗЫВАЕТСЯ ДО ранней остановки interest < 0.10 — мы должны написать
+    # каждому собственнику, даже если объявление «неинтересно» для browsing.
+    effective_message_rate = call_rate if call_rate is not None else message_rate
+    if random.random() < effective_message_rate:
+        _try_write_to_owner(
+            driver,
+            account_name,
+            llm_classifier=llm_classifier,
+            db_manager=db_manager,
+            account=account,
+        )
+
+    # T10/F9: совсем неинтересно → закрываем рано (после отправки сообщения).
     if interest < 0.10:
         log(account_name, "  T10: неинтересно, закрываем")
         return True
@@ -632,7 +1298,9 @@ def view_listing(
             hp(2, 6)
         elif action == "scroll_to_desc":
             try:
-                desc = driver.find_element(By.XPATH, "//div[@data-marker='item-view/item-description']")
+                desc = driver.find_element(
+                    By.XPATH, "//div[@data-marker='item-view/item-description']"
+                )
                 slow_scroll_to(driver, desc)
                 # T10: чтение описания пропорционально его длине + interest.
                 # Берём 50% от рассчитанного dwell — это «активное» чтение
@@ -671,35 +1339,6 @@ def view_listing(
             hp(2, 5)
         except Exception:
             pass
-
-    # F1: «Позвонить» — реалистичная вероятность 5% вместо 55%.
-    # A3: проверяем дневной/сессионный лимит phone_clicks перед кликом —
-    # та же защита, что и для «Показать телефон» в commercial_parser.
-    # Конфигурируется через view_listing_call_rate в config.json/accounts.json.
-    if random.random() < call_rate:
-        if account_state.should_skip_phone(account_name):
-            log(account_name, "  A3: Пропуск 'Позвонить' — дневной/сессионный лимит")
-        else:
-            try:
-                call_btn = WebDriverWait(driver, 8).until(
-                    EC.element_to_be_clickable(
-                        (
-                            By.XPATH,
-                        "//button[@data-marker='item-phone-button/card'] | "
-                        "//button[@data-marker='item-phone-button/header'] | "
-                        "//button[contains(@class,'phone-button')] | "
-                        "//button[.//span[contains(text(),'Позвонить')]]",
-                        )
-                    )
-                )
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", call_btn)
-                hp(1.5, 3.5)
-                move_click(driver, call_btn)
-                log(account_name, "  'Call' button pressed.")
-                account_state.record_phone_click(account_name)  # F1: учитываем в A3
-                hp(5, 12)  # Stay after call
-            except Exception:
-                log(account_name, "  'Call' button not found.")
 
     # Final dwell before leaving
     hp(2, 5)
@@ -822,21 +1461,43 @@ def update_profile_proxy(adspower_api, user_id, proxy_str):
     return adspower_api.update_proxy(user_id, proxy_str)
 
 
+def _mask_proxy(proxy_str: str) -> str:
+    """H4-fix: маскирует credentials в proxy строке для безопасного логирования.
+
+    Форматы: host:port, host:port:user:pass, user:pass@host:port, [::1]:8080
+    Возвращает только host:port.
+    """
+    if not proxy_str:
+        return "<empty>"
+    # user:pass@host:port — берём часть после @
+    if "@" in proxy_str:
+        return _mask_proxy(proxy_str.split("@", 1)[1])
+    # IPv6: [::1]:8080 или [::1]:8080:user:pass
+    if proxy_str.startswith("["):
+        bracket_end = proxy_str.index("]")
+        host = proxy_str[: bracket_end + 1]  # [::1]
+        rest = proxy_str[bracket_end + 2 :].split(":")  # skip ]:
+        port = rest[0] if rest else ""
+        return f"{host}:{port}" if port else host
+    parts = proxy_str.split(":")
+    if len(parts) >= 4:
+        # host:port:user:pass
+        return f"{parts[0]}:{parts[1]}"
+    # host:port (уже безопасно)
+    return proxy_str
+
+
 # F8: idle cycles — иногда только messenger или только профиль.
 # Default-распределение типов цикла. Реальный пользователь открывает Авито
 # с разными целями: проверить мессенджер, полистать главную, просто зайти
 # в профиль. Бот не должен ВСЕГДА делать «полный цикл» (browse + parse +
 # messenger) — это сильнейший behavioral fingerprint.
 _CYCLE_KINDS_DEFAULT: dict[str, float] = {
-    "full": 0.40,  # warmup → browse → find_and_view → messenger
-    "messenger_only": 0.15,  # только мессенджер (reactive replies)
-    "browse_only": 0.10,  # browse + find_and_view, без messenger
+    "full": 0.60,  # warmup → browse → find_and_view → messenger
+    "messenger_only": 0.10,  # только мессенджер (reactive replies)
+    "browse_only": 0.15,  # browse + find_and_view, без messenger
     "profile_check": 0.05,  # просто заходим в /profile
-    # H1: outbound — proactive контакты к собственникам по уже распарсенным
-    # листингам. Самый «продуктовый» режим — даёт основные leads. Доля 30%
-    # обеспечивает ~3-4 outbound-цикла в день (см. F7/F6 reduction); при
-    # max_per_cycle=2-3 это дает 6-12 outbound/день в нормальном режиме.
-    "outbound_only": 0.30,
+    "outbound_only": 0.10,
 }
 
 # Распределение для warmup-режима (B1): аккаунт пока не должен слать
@@ -891,6 +1552,8 @@ def _pick_cycle_kind(
         weights = {k: (0.0 if k == "outbound_only" else float(v)) for k, v in weights.items()}
     kinds = list(weights.keys())
     probs = [float(weights[k]) for k in kinds]
+    # Guard: NaN/inf/отрицательные — недопустимые веса, зануляем
+    probs = [p if p > 0 and p == p else 0.0 for p in probs]  # p==p исключает NaN
     # Guard: если все веса нулевые (кривой config) — fallback на "full".
     if sum(probs) <= 0:
         return "full"
@@ -1023,17 +1686,45 @@ def yandex_warmup(driver, wait, account_name, num_queries=2):
 
             # T2: рано детектим капчу (ещё до wait_yandex_results timeout 15s).
             if _is_yandex_captcha(driver):
-                captcha_count += 1
-                log(account_name, "    Yandex captcha detected — пропускаю query.")
-                continue
+                # Пробуем решить капчу бесплатно (checkbox click)
+                from captcha_solver import solve_yandex_smartcaptcha
+
+                solved = solve_yandex_smartcaptcha(driver, account_name, log_func=log)
+                if solved:
+                    log(account_name, "    Captcha solved! Retrying query...")
+                    # После решения капчи — повторяем навигацию
+                    if not safe_get(driver, url, account_name):
+                        continue
+                    if _is_yandex_captcha(driver):
+                        captcha_count += 1
+                        log(account_name, "    Captcha returned after solve — пропускаю.")
+                        continue
+                else:
+                    captcha_count += 1
+                    log(account_name, "    Captcha solve failed — пропускаю query.")
+                    continue
 
             if not _wait_yandex_results(driver, timeout=15):
                 # На SERP не появились результаты — либо разметка опять
                 # поменялась, либо это была капча (детект мог не сработать
                 # на новых маркерах). Перепроверяем капчу ещё раз.
                 if _is_yandex_captcha(driver):
-                    captcha_count += 1
-                    log(account_name, "    Yandex captcha (post-wait) — пропускаю.")
+                    from captcha_solver import solve_yandex_smartcaptcha
+
+                    solved = solve_yandex_smartcaptcha(driver, account_name, log_func=log)
+                    if solved:
+                        log(account_name, "    Captcha (post-wait) solved! Retrying...")
+                        if safe_get(driver, url, account_name) and _wait_yandex_results(
+                            driver, timeout=15
+                        ):
+                            success_count += 1
+                            hp(5, 10)
+                            human_scroll(driver, "down", iters=random.randint(2, 4))
+                        else:
+                            captcha_count += 1
+                    else:
+                        captcha_count += 1
+                        log(account_name, "    Captcha (post-wait) solve failed — пропускаю.")
                 else:
                     log(account_name, "    SERP results not found (markup changed?).")
                 continue
@@ -1083,10 +1774,13 @@ def browse_commercial_categories(
     ads_per_category=None,
     search_filters=None,
     favorite_rate=0.08,
-    call_rate=0.05,
+    call_rate=None,
+    message_rate=0.05,
     max_categories_per_browse=4,
     max_listings_per_browse=4,
     db_manager=None,
+    llm_classifier=None,
+    account=None,
 ):
     """
     F2: num_categories и ads_per_category по умолчанию None — тогда используется
@@ -1114,12 +1808,35 @@ def browse_commercial_categories(
     _sf = search_filters or {}
     _cities = _sf.get("cities")
     _city_prefix = ""
+    # При browse по городу Avito требует тип сделки в URL, иначе 404.
+    _deal_suffix = ""
+    _deal_type = "rent"
+    _pmin = None
     if _cities:
         _city_prefix = "/" + random.choice(_cities)
+        # Поддержка deal_types (список) и deal_type (строка).
+        _deal_types_list = _sf.get("deal_types") or (
+            [_sf["deal_type"]] if _sf.get("deal_type") else ["rent", "sale"]
+        )
+        _deal_type = random.choice(_deal_types_list)
+        _deal_suffix = (
+            "/sdam-ASgBAgICAUSwCMpB" if _deal_type == "rent" else "/prodam-ASgBAgICAUSwCMpB"
+        )
+        # Минимальная цена из конфига search_filters или COMMERCIAL_SEARCH_FILTERS.
+        _pmin = _sf.get("price_min")
+        if _pmin is None:
+            from commercial_realestate_config import COMMERCIAL_SEARCH_FILTERS
+
+            _pmin = COMMERCIAL_SEARCH_FILTERS.get(_deal_type, {}).get("min_price")
+        _pmax = _sf.get("price_max")
 
     for cat in chosen:
-        url = f"https://www.avito.ru{_city_prefix}{cat}?user=1"
-        log(account_name, f"  Category: {cat}")
+        url = f"https://www.avito.ru{_city_prefix}{cat}{_deal_suffix}"
+        if _pmin:
+            url += f"?pmin={_pmin}"
+            if _pmax:
+                url += f"&pmax={_pmax}"
+        log(account_name, f"  Category: {cat} (deal={_deal_type}, pmin={_pmin})")
         if not safe_get(driver, url, account_name):
             continue
 
@@ -1133,9 +1850,46 @@ def browse_commercial_categories(
         if not links:
             continue
 
+        # Фильтр: только коммерческая недвижимость. Avito подмешивает квартиры,
+        # дома и участки через localPriority (рекомендации). Фильтруем ДО
+        # сэмплирования, чтобы random.sample всегда выбирал из релевантных.
+        commercial_links = [
+            lnk
+            for lnk in links
+            if "/kommercheskaya_nedvizhimost/" in (lnk.get_attribute("href") or "")
+        ]
+        non_commercial_count = len(links) - len(commercial_links)
+        if non_commercial_count:
+            log(
+                account_name,
+                f"    Отфильтровано {non_commercial_count} некоммерческих (рекомендации). "
+                f"Осталось {len(commercial_links)} коммерческих.",
+            )
+        if not commercial_links:
+            continue
+
+        # D6: фильтруем уже просмотренные листинги.
+        if db_manager is not None:
+            before_dedup = len(commercial_links)
+            commercial_links = [
+                lnk
+                for lnk in commercial_links
+                if not db_manager.is_listing_url_seen(
+                    normalize_listing_url(lnk.get_attribute("href") or "")
+                )
+            ]
+            dup_count = before_dedup - len(commercial_links)
+            if dup_count:
+                log(
+                    account_name,
+                    f"    D6: {dup_count} уже просмотренных — пропускаем. Новых: {len(commercial_links)}",
+                )
+        if not commercial_links:
+            continue
+
         hrefs = [
             h
-            for lnk in random.sample(links, min(n_ads, len(links)))
+            for lnk in random.sample(commercial_links, min(n_ads, len(commercial_links)))
             if (h := lnk.get_attribute("href"))
         ]
 
@@ -1149,15 +1903,42 @@ def browse_commercial_categories(
                 account_name,
                 favorite_rate=favorite_rate,
                 call_rate=call_rate,
+                message_rate=message_rate,
                 db_manager=db_manager,
+                llm_classifier=llm_classifier,
+                account=account,
             ):
                 break
             driver.back()
             hp(2, 4)
 
 
+def _process_listing(driver, wait, account_name, log, db_manager, llm_classifier, account, is_new):
+    """Общая логика обработки листинга: extract → save → write to owner.
+    Возвращает listing_data (может быть None если extract упал).
+    """
+    listing_data = extract_listing_data(driver, wait, account_name, log)
+    save_listing_to_db(listing_data, db_manager, log, account_name)
+    # Пишем собственнику (outbound-канал).
+    _try_write_to_owner(
+        driver,
+        account_name,
+        llm_classifier=llm_classifier,
+        db_manager=db_manager,
+        account=account,
+    )
+    return listing_data
+
+
 def find_and_view_commercial_listings(
-    driver, wait, account_name, db_manager, search_filters=None, max_listings_per_search=7
+    driver,
+    wait,
+    account_name,
+    db_manager,
+    search_filters=None,
+    max_listings_per_search=7,
+    llm_classifier=None,
+    account=None,
 ):
     """Search for commercial real estate listings in million-plus cities with price filters.
 
@@ -1197,7 +1978,7 @@ def find_and_view_commercial_listings(
     min_price = _sf.get("price_min") if _sf.get("price_min") is not None else config["min_price"]
     max_price = _sf.get("price_max")
 
-    url = f"https://www.avito.ru/{city}{category_path}?user=1&pmin={min_price}"
+    url = f"https://www.avito.ru/{city}{category_path}?pmin={min_price}"
     if max_price is not None:
         url += f"&pmax={max_price}"
 
@@ -1214,12 +1995,53 @@ def find_and_view_commercial_listings(
         log(account_name, f"  No listings found in {city} for this category.")
         return 0, 0, 0
 
+    # Фильтр: только коммерческая недвижимость. Avito подмешивает квартиры,
+    # дома и участки через localPriority (рекомендации) — убираем всё
+    # кроме kommercheskaya_nedvizhimost. Фильтруем ДО сэмплирования,
+    # чтобы random.sample всегда выбирал из релевантных объявлений.
+    commercial_links = [
+        lnk for lnk in links if "/kommercheskaya_nedvizhimost/" in (lnk.get_attribute("href") or "")
+    ]
+    non_commercial_count = len(links) - len(commercial_links)
+    if non_commercial_count:
+        log(
+            account_name,
+            f"  Отфильтровано {non_commercial_count} некоммерческих листингов "
+            f"(квартиры/гаражи/рекомендации). Осталось {len(commercial_links)} коммерческих.",
+        )
+    if not commercial_links:
+        log(account_name, f"  Нет коммерческих листингов в выдаче {city}.")
+        return 0, 0, 0
+
+    # D6: фильтруем уже просмотренные листинги — не тратим Selenium-транзит
+    # и бюджет на повторные заходы. Сравниваем по нормализованному URL
+    # (без query/fragment), как в is_new_listing.
+    if db_manager is not None:
+        before_dedup = len(commercial_links)
+        commercial_links = [
+            lnk
+            for lnk in commercial_links
+            if not db_manager.is_listing_url_seen(
+                normalize_listing_url(lnk.get_attribute("href") or "")
+            )
+        ]
+        dup_count = before_dedup - len(commercial_links)
+        if dup_count:
+            log(
+                account_name,
+                f"  D6: {dup_count} уже просмотренных — пропускаем. Новых: {len(commercial_links)}",
+            )
+    if not commercial_links:
+        log(account_name, f"  Все коммерческие листинги уже просмотрены в {city}.")
+        return 0, 0, 0
+
     # F2: случайное число листингов [1, max_listings_per_search] с весами.
     _n = _weighted_listing_count(max_n=max_listings_per_search)
+    _n = min(_n, len(commercial_links))
     log(account_name, f"  F2: листингов в этом запросе={_n}")
     # T11: сохраняем только href — element'ы станут stale после первой навигации.
     # Ctrl+Click path (30%) будет re-find'ить элемент по href перед кликом.
-    sampled = random.sample(links, min(_n, len(links)))
+    sampled = random.sample(commercial_links, _n)
     targets = [lnk.get_attribute("href") for lnk in sampled if lnk.get_attribute("href")]
 
     for i, href in enumerate(targets, 1):
@@ -1247,9 +2069,19 @@ def find_and_view_commercial_listings(
             opened_in_tab = False
             if use_new_tab:
                 # Re-find element by href — previous references are stale after navigation.
-                link_elems = driver.find_elements(
-                    By.XPATH, f"//a[@data-marker='item-title'][@href='{href}']"
-                )
+                # XPath: если href содержит и ' и ", простой escaping невозможен —
+                # используем concat() для надёжной сборки строки.
+                if "'" not in href:
+                    xpath = f"//a[@data-marker='item-title'][@href='{href}']"
+                elif '"' not in href:
+                    xpath = f'//a[@data-marker="item-title"][@href="{href}"]'
+                else:
+                    # Оба типа кавычек — собираем через concat()
+                    parts = href.split("'")
+                    concat_parts = ",".join(f"'{p}'" for p in parts)
+                    concat_expr = f"concat({concat_parts})"
+                    xpath = f"//a[@data-marker='item-title'][@href={concat_expr}]"
+                link_elems = driver.find_elements(By.XPATH, xpath)
                 link_elem = link_elems[0] if link_elems else None
                 if link_elem is None:
                     use_new_tab = False  # fallback to safe_get
@@ -1260,11 +2092,18 @@ def find_and_view_commercial_listings(
                         if ok:
                             opened_in_tab = True
                             log(account_name, "  T11: открыли в новой вкладке (Ctrl+Click)")
-                            listing_data = extract_listing_data(driver, wait, account_name, log)
-                            save_listing_to_db(listing_data, db_manager, log, account_name)
-
+                            ldata = _process_listing(
+                                driver,
+                                wait,
+                                account_name,
+                                log,
+                                db_manager,
+                                llm_classifier,
+                                account,
+                                is_new,
+                            )
                             processed_count += 1
-                            if listing_data and is_new:
+                            if ldata and is_new:
                                 new_listings_count += 1
                     # context exit: вкладка закрыта, мы снова на search-page.
                     hp(1.5, 3.5)
@@ -1274,11 +2113,19 @@ def find_and_view_commercial_listings(
                 if not safe_get(driver, href, account_name):
                     break
 
-                listing_data = extract_listing_data(driver, wait, account_name, log)
-                save_listing_to_db(listing_data, db_manager, log, account_name)
+                ldata = _process_listing(
+                    driver,
+                    wait,
+                    account_name,
+                    log,
+                    db_manager,
+                    llm_classifier,
+                    account,
+                    is_new,
+                )
 
                 processed_count += 1
-                if listing_data and is_new:
+                if ldata and is_new:
                     new_listings_count += 1
 
                 driver.back()
@@ -1389,7 +2236,10 @@ def perform_login(driver, wait, account_name, phone, password):
     # (captcha_detect не должен импортироваться в module-load time bot.py).
     from captcha_detect import detect_captcha, detect_sms_form
 
-    log(account_name, f"=== Manual Login Attempt for {phone} ===")
+    log(
+        account_name,
+        f"=== Manual Login Attempt for {phone[:3]}****{phone[-2:] if len(phone) > 5 else ''} ===",
+    )
     try:
         # Navigate to login page
         driver.get("https://www.avito.ru/#login?next=%2F")
@@ -1512,7 +2362,11 @@ def perform_login(driver, wait, account_name, phone, password):
         return False
 
     except Exception as e:
-        log(account_name, f"  Manual login failed: {str(e)[:200]}")
+        # Маскируем credentials: телефон/пароль могут быть в str(e)
+        err_msg = str(e)[:200]
+        err_msg = err_msg.replace(phone or "", "<phone>") if phone else err_msg
+        err_msg = err_msg.replace(password or "", "<password>") if password else err_msg
+        log(account_name, f"  Manual login failed: {err_msg}")
         return False
 
 
@@ -1522,9 +2376,14 @@ def perform_login(driver, wait, account_name, phone, password):
 
 
 def get_random_proxy():
-    """Reads proxies.txt and returns a random proxy string."""
+    """Reads proxies.txt and returns a list of proxy strings."""
     try:
-        path = Path("proxies.txt")
+        # Сначала ищем рядом с bot.py (работает при запуске из любого каталога).
+        path = Path(__file__).resolve().parent / "proxies.txt"
+        if not path.exists():
+            # Fallback: CWD (для тестов и legacy-запуска).
+            path = Path("proxies.txt")
+
         if not path.exists():
             return None
         with open(path, encoding="utf-8") as f:
@@ -1543,7 +2402,10 @@ def _load_proxies_pool() -> list[str]:
     `get_random_proxy` (backward-compat для legacy-пути / тестов).
     """
     try:
-        path = Path("proxies.txt")
+        path = Path(__file__).resolve().parent / "proxies.txt"
+        if not path.exists():
+            # Fallback: CWD (для тестов и legacy-запуска).
+            path = Path("proxies.txt")
         if not path.exists():
             return []
         with open(path, encoding="utf-8") as f:
@@ -1696,8 +2558,7 @@ def _apply_account_proxy_with_probe(
     if chosen is None:
         last_err = result.error if result else "no_candidates"
         _bot_logger.error(
-            "[%s] A1: Все %d попыток probe прокси провалились. "
-            "Последняя ошибка: %s.",
+            "[%s] A1: Все %d попыток probe прокси провалились. Последняя ошибка: %s.",
             account_name,
             min(max_attempts, len(candidates)),
             last_err,
@@ -1728,6 +2589,9 @@ def _is_in_active_hours(account: dict, cfg: dict) -> bool:
     start = int(account.get("active_hours_start", cfg.get("active_hours_start", 9)))
     end = int(account.get("active_hours_end", cfg.get("active_hours_end", 23)))
     hour = time.localtime().tm_hour
+    # Overnight window: start > end (e.g. 22:00–06:00)
+    if start > end:
+        return hour >= start or hour < end
     return start <= hour < end
 
 
@@ -1737,9 +2601,16 @@ def _seconds_until_active_hours(account: dict, cfg: dict) -> float:
     Если сейчас уже в окне — вернёт 0.
     """
     start = int(account.get("active_hours_start", cfg.get("active_hours_start", 9)))
+    end = int(account.get("active_hours_end", cfg.get("active_hours_end", 23)))
     now = time.localtime()
     current_secs = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec
     target_secs = start * 3600
+    # Overnight window: start > end (e.g. 22:00–06:00)
+    if start > end:
+        if current_secs >= target_secs or current_secs < end * 3600:
+            return 0.0  # уже в окне
+        # сейчас до start — ждём до start сегодня
+        return float(target_secs - current_secs)
     if current_secs < target_secs:
         return float(target_secs - current_secs)
     # уже после start сегодня → ждём до завтра
@@ -1807,7 +2678,13 @@ def _active_probability(account: dict, cfg: dict, hour: int | None = None) -> fl
         if not (int(start) <= hour < int(end)):
             return 0.0
 
-    pattern = account.get("activity_pattern") or cfg.get("activity_pattern") or _ACTIVITY_BY_HOUR
+    pattern = (
+        account.get("activity_pattern")
+        if account.get("activity_pattern") is not None
+        else cfg.get("activity_pattern")
+        if cfg.get("activity_pattern") is not None
+        else _ACTIVITY_BY_HOUR
+    )
     # Ключи в JSON всегда строки — нормализуем оба варианта.
     if isinstance(pattern, dict):
         return float(pattern.get(hour, pattern.get(str(hour), 0.5)))
@@ -1914,7 +2791,9 @@ def _check_health_and_log(account_name: str, db_manager: DatabaseManager) -> Non
                 f"капч={health['captchas_7d']} за 7д).",
             )
     except Exception:
-        pass  # C1 не должен блокировать запуск
+        _bot_logger.debug(
+            "C1 health check failed", exc_info=True
+        )  # C1 не должен блокировать запуск
 
 
 def _pick_rotation_proxy(cfg: dict | None, exclude: set[str] | None = None) -> str | None:
@@ -1997,6 +2876,11 @@ def _connect_with_retry(
                     time.sleep(5)
                 if attempt < max_retries:
                     continue
+            # Другие RuntimeError (временная недоступность) — тоже retry
+            log(account_name, f"start_profile RuntimeError: {e}")
+            if attempt < max_retries:
+                time.sleep(3)
+                continue
             return None
         except Exception as e:
             log(account_name, f"start_profile failed: {e}")
@@ -2028,7 +2912,9 @@ def _connect_with_retry(
             new_proxy = _pick_rotation_proxy(cfg, exclude=tried_proxies)
             if new_proxy and update_profile_proxy(adspower, user_id, new_proxy):
                 tried_proxies.add(new_proxy)
-                log(account_name, f"Proxy updated to {new_proxy[:15]}...")
+                # H4-fix: маскируем credentials в логах — показываем только host:port
+                _proxy_display = _mask_proxy(new_proxy)
+                log(account_name, f"Proxy updated to {_proxy_display}")
             elif new_proxy is None and cfg is not None:
                 log(account_name, "Rotation: probe не нашёл живого прокси.")
             adspower.stop_profile(user_id)
@@ -2041,7 +2927,7 @@ def _connect_with_retry(
 def _build_avito_client(driver, wait, account: dict, cfg: dict, db_manager: DatabaseManager):
     """Конструируем AvitoClient с per-account overrides для F1/F2/F5/E2.
 
-    Все «волшебные числа» (favorite_rate, call_rate, max_listings_per_*,
+    Все «волшебные числа» (favorite_rate, message_rate, max_listings_per_*,
     messenger_*) собираются здесь по приоритету: account → cfg → дефолт.
     Возвращает готовый AvitoClient.
     """
@@ -2058,17 +2944,26 @@ def _build_avito_client(driver, wait, account: dict, cfg: dict, db_manager: Data
     }
     llm = LLMClassifier(llm_config, db_manager=db_manager)
 
-    # F1: вероятности кликов «Избранное»/«Позвонить» в view_listing.
+    # F1: вероятности кликов «Избранное»/«Написать» в view_listing.
     fav_rate = float(
         account.get(
             "view_listing_favorite_rate",
             cfg.get("view_listing_favorite_rate", 0.08),
         )
     )
-    call_rate = float(
+    # message_rate — вероятность «Написать» (замена старого call_rate/«Позвонить»).
+    # Default 5% — стелс-режим: не каждому собственнику пишем.
+    # Back-compat: если задан view_listing_message_rate/call_rate — используем его.
+    msg_rate = float(
         account.get(
-            "view_listing_call_rate",
-            cfg.get("view_listing_call_rate", 0.05),
+            "view_listing_message_rate",
+            cfg.get(
+                "view_listing_message_rate",
+                account.get(
+                    "view_listing_call_rate",
+                    cfg.get("view_listing_call_rate", 0.05),
+                ),
+            ),
         )
     )
 
@@ -2116,7 +3011,7 @@ def _build_avito_client(driver, wait, account: dict, cfg: dict, db_manager: Data
         if val is not None:
             outbound_cfg[key] = val
 
-    return AvitoClient(
+    client = AvitoClient(
         driver,
         wait,
         account_name,
@@ -2125,13 +3020,16 @@ def _build_avito_client(driver, wait, account: dict, cfg: dict, db_manager: Data
         llm_classifier=llm,
         search_filters=account.get("search_filters"),
         favorite_rate=fav_rate,
-        call_rate=call_rate,
+        message_rate=msg_rate,
         max_listings_per_search=max_listings,
         max_categories_per_browse=max_cats,
         max_listings_per_browse=max_browse_listings,
         messenger_config=messenger_cfg or None,
         outbound_config=outbound_cfg or None,
     )
+    # Сохраняем account на client для persona-driven messaging в view_listing.
+    client._account = account
+    return client
 
 
 def _sleep_until_tomorrow(account: dict, cfg: dict, account_name: str) -> None:
@@ -2145,9 +3043,16 @@ def _sleep_until_tomorrow(account: dict, cfg: dict, account_name: str) -> None:
 
     start_hour = int(account.get("active_hours_start", cfg.get("active_hours_start", 9)))
     now = _dt.datetime.now()
-    tomorrow = (now + _dt.timedelta(days=1)).replace(
-        hour=start_hour, minute=0, second=0, microsecond=0
-    )
+    try:
+        tomorrow = (now + _dt.timedelta(days=1)).replace(
+            hour=start_hour, minute=0, second=0, microsecond=0
+        )
+    except ValueError:
+        # DST transition: несуществующий час (например 2:00 при переходе вперёд)
+        # Сдвигаем на час вперёд
+        tomorrow = (now + _dt.timedelta(days=1)).replace(
+            hour=start_hour + 1, minute=0, second=0, microsecond=0
+        )
     wait_secs = max(0.0, (tomorrow - now).total_seconds())
     log(
         account_name,
@@ -2155,7 +3060,7 @@ def _sleep_until_tomorrow(account: dict, cfg: dict, account_name: str) -> None:
     )
     slept = 0.0
     stop_ev = _tg.get_account_stop_event(account_name)
-    while slept < wait_secs and not stop_ev.is_set():
+    while slept < wait_secs and not stop_ev.is_set() and not _tg.is_stop_requested():
         chunk = min(60.0, wait_secs - slept)
         time.sleep(chunk)
         slept += chunk
@@ -2169,8 +3074,6 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
     либо пропуск (F7 dead-day / F6 неудачный бросок). После каждого цикла
     — A4 пауза 30-90 мин (per-account overridable через session_pause_*).
     """
-    pause_min = float(account.get("session_pause_min", cfg.get("session_pause_min", 30)))
-    pause_max = float(account.get("session_pause_max", cfg.get("session_pause_max", 90)))
 
     while not _tg.is_stop_requested():
         # Per-account stop event — проверяем чаще для быстрого выхода
@@ -2190,20 +3093,12 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
         # окна prob=0 — поведение строго бинарное, как раньше.
         prob = _active_probability(account, cfg)
         if random.random() > prob:
-            hour = time.localtime().tm_hour
-            sleep_min = random.uniform(pause_min, pause_max)
-            wake_time = time.strftime("%H:%M", time.localtime(time.time() + sleep_min * 60))
+            pause_sec = pick_cycle_pause(account, cfg, kind="session_pause")
             log(
                 account_name,
-                f"F6: пропуск цикла (час={hour:02d}, prob={prob:.2f}). "
-                f"Следующая попытка через {sleep_min:.0f} мин (~{wake_time}).",
+                f"F6: prob={prob:.2f} < random — пропускаю цикл, пауза {pause_sec / 60:.0f} мин",
             )
-            _human_delay(
-                sleep_min * 60,
-                sleep_min * 60,
-                stop_event=_tg.get_account_stop_event(account_name),
-                distribution="uniform",
-            )
+            hp(pause_sec, pause_sec, stop_event=_tg.get_account_stop_event(account_name))
             continue
 
         # A3/A4: сбрасываем сессионные phone-счётчики в начале цикла.
@@ -2332,7 +3227,7 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerAPI, db_manager: Data
 
     # Guard: user_id (adspower_id) обязателен
     if not user_id:
-        _bot_logger.error("No adspower_id for account %s", account_name)
+        _bot_logger.error("No user_id/adspower_id for account %s", account_name)
         return
 
     # ── Pre-cycle setup ───────────────────────────────────────────────────
@@ -2586,9 +3481,11 @@ def _launch_commercial_bot_threads(cfg=None):
         return
 
     # Pre-flight ping: проверяем что AdsPower API доступен ДО создания потоков
+    # /status endpoint не существует в AdsPower — используем /api/v1/browser/active
     adspower_url = cfg.get("adspower_api_url", "")
     try:
-        requests.get(adspower_url.rstrip("/") + "/status", timeout=5)
+        r = requests.get(adspower_url.rstrip("/") + "/api/v1/browser/active", timeout=5)
+        r.raise_for_status()
     except requests.RequestException:
         msg = f"❌ AdsPower API недоступен по {adspower_url}. Запустите AdsPower и повторите."
         _bot_logger.error(msg)
@@ -2626,7 +3523,8 @@ def _launch_commercial_bot_threads(cfg=None):
             name="acc-" + acc["name"],
         )
         threads.append(t)
-        _tg.active_threads.append(t)
+        with _tg._threads_lock:
+            _tg.active_threads.append(t)
         t.start()
         # B3: случайная задержка 30-180 сек между стартами потоков.
         # Предотвращает регулярный паттерн «все аккаунты стартуют одновременно».
@@ -2658,8 +3556,9 @@ def _launch_commercial_bot_threads(cfg=None):
             acc_name = acc["name"]
 
             # Убираем из active_threads
-            if t in _tg.active_threads:
-                _tg.active_threads.remove(t)
+            with _tg._threads_lock:
+                if t in _tg.active_threads:
+                    _tg.active_threads.remove(t)
 
             # Проверяем лимит рестартов (скользящее окно 1 час)
             now = time.time()
@@ -2697,7 +3596,8 @@ def _launch_commercial_bot_threads(cfg=None):
                 name="acc-" + acc_name,
             )
             thread_account_map[new_t] = acc
-            _tg.active_threads.append(new_t)
+            with _tg._threads_lock:
+                _tg.active_threads.append(new_t)
             new_t.start()
             alive_threads.append(new_t)
 
@@ -2746,7 +3646,7 @@ def _graceful_shutdown(signum, frame):
     # Даём потокам SHUTDOWN_TIMEOUT секунд на cleanup (driver.quit + profile stop)
     shutdown_timeout = 30
     deadline = time.time() + shutdown_timeout
-    for t in _tg.active_threads:
+    for t in list(_tg.active_threads):
         remaining = deadline - time.time()
         if remaining <= 0:
             break
@@ -2762,7 +3662,9 @@ def _graceful_shutdown(signum, frame):
     else:
         _bot_logger.info("All threads stopped cleanly.")
 
-    sys.exit(0)
+    # C5-fix: НЕ вызываем sys.exit() из signal handler — это может повредить
+    # SQLite WAL. Вместо этого main loop проверяет stop_event и выходит сам.
+    # os._exit только как last resort если main loop завис.
 
 
 def main():
@@ -2771,6 +3673,33 @@ def main():
     from env_config import load_dotenv_if_present
 
     load_dotenv_if_present(Path(__file__).parent / ".env")
+
+    # ── Lockfile: защита от двойного запуска ─────────────────────────────
+    # На Windows 3+ процесса bot.py запускают各自的 TG-контроллер и
+    # stop_event, что ломает кнопки Стоп/Запуск (callback уходит не в тот
+    # процесс). Lockfile предотвращает запуск второй копии.
+    # Кроссплатформенный: msvcrt (Windows) / fcntl (Linux/macOS).
+    _lockfile_path = Path(__file__).parent / ".bot.lock"
+    try:
+        _lockfile_fd = os.open(str(_lockfile_path), os.O_CREAT | os.O_RDWR)
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.locking(_lockfile_fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(_lockfile_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(
+            "FATAL: другой экземпляр bot.py уже запущен. "
+            "Если это не так — удали .bot.lock и попробуй снова.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # Пишем PID для диагностики
+    os.write(_lockfile_fd, str(os.getpid()).encode())
+    os.fsync(_lockfile_fd)
 
     # E1: инициализируем логирование первым делом — так все последующие
     # модули, попадая в логи, получат единый формат и уровень.
@@ -2792,10 +3721,25 @@ def main():
         from tg_bot import TelegramController
 
         tg_ctrl = TelegramController(tg_token, tg_admin)
+        # Поддержка нескольких админов: telegram_admin_ids из config.json
+        admin_ids = cfg.get("telegram_admin_ids", [])
+        if admin_ids:
+            tg_ctrl.set_admin_ids(admin_ids)
         # Shared DB для TG-команд — один экземпляр на весь процесс.
         tg_ctrl.set_db_manager(DatabaseManager())
         _tg._tg_controller = tg_ctrl
-        tg_ctrl.set_run_callback(lambda: _launch_commercial_bot_threads(_load_cfg()))
+
+        def _safe_launch():
+            """Обёртка: ловит SystemExit от _load_cfg чтобы не убить весь процесс."""
+            try:
+                _launch_commercial_bot_threads(_load_cfg())
+            except SystemExit as e:
+                _bot_logger.critical("_load_cfg() упал с SystemExit(%s) — битый конфиг?", e.code)
+                from tg_bot import _send_message
+
+                _send_message("❌ Не удалось запустить бота: ошибка конфигурации. Проверь логи.")
+
+        tg_ctrl.set_run_callback(_safe_launch)
         # E4: ERROR/CRITICAL → мгновенно в TG админу.
         install_tg_alert_handler(tg_ctrl.notify)
         threading.Thread(target=tg_ctrl.start_polling, daemon=True).start()

@@ -78,12 +78,14 @@ def test_find_and_view_uses_weighted_count():
     driver = MagicMock()
     fake_links = [MagicMock() for _ in range(10)]
     for lnk in fake_links:
-        lnk.get_attribute.return_value = f"https://avito.ru/item/{id(lnk)}"
+        lnk.get_attribute.return_value = (
+            f"https://avito.ru/moskva/kommercheskaya_nedvizhimost/ofis_{id(lnk)}"
+        )
     driver.find_elements.return_value = fake_links
 
     db = MagicMock()
     db.is_new_listing.return_value = False
-    # Сбрасываем state функции-хелпера перед тестом
+    db.is_listing_url_seen.return_value = False  # D6: нет просмотренных
     if hasattr(_safe_get_first_true, "_called"):
         del _safe_get_first_true._called
 
@@ -109,11 +111,14 @@ def test_find_and_view_respects_max_listings_param():
     # Чтобы дойти до _weighted_listing_count, нужны ссылки на SERP
     fake_links = [MagicMock() for _ in range(5)]
     for lnk in fake_links:
-        lnk.get_attribute.return_value = f"https://avito.ru/item/{id(lnk)}"
+        lnk.get_attribute.return_value = (
+            f"https://avito.ru/moskva/kommercheskaya_nedvizhimost/sklad_{id(lnk)}"
+        )
     driver.find_elements.return_value = fake_links
 
     db = MagicMock()
     db.is_new_listing.return_value = False
+    db.is_listing_url_seen.return_value = False  # D6: нет просмотренных
     if hasattr(_safe_get_first_true, "_called"):
         del _safe_get_first_true._called
 

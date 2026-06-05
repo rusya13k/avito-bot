@@ -152,10 +152,7 @@ class TGAlertHandler(logging.Handler):
 
                 # Если были suppressed — добавляем инфо в текущее сообщение
                 if self._suppressed > 0:
-                    text = (
-                        f"⚠️ [{self._suppressed} alerts suppressed "
-                        f"(rate-limit)]\n\n" + text
-                    )
+                    text = f"⚠️ [{self._suppressed} alerts suppressed (rate-limit)]\n\n" + text
                     self._suppressed = 0
 
                 self._timestamps.append(now)
@@ -182,6 +179,7 @@ def setup_logging(level: str | None = None, json_format: bool | None = None) -> 
     Параметры можно задать через env:
         LOG_LEVEL=INFO|DEBUG|WARNING|ERROR
         LOG_FORMAT=human|json
+        LOG_DIR=путь к папке логов (по умолчанию ./logs)
     """
     root = logging.getLogger()
     if getattr(root, _INIT_FLAG, False):
@@ -195,12 +193,32 @@ def setup_logging(level: str | None = None, json_format: bool | None = None) -> 
     )
 
     root.setLevel(getattr(logging, lvl, logging.INFO))
+    # Не clear() — удаляем только наши handler'ы, не трогая хендлеры библиотек
+    # (например, selenium WebDriver добавляет свой StreamHandler).
     for h in list(root.handlers):
-        root.removeHandler(h)
+        if isinstance(h, (logging.StreamHandler, logging.handlers.RotatingFileHandler)):
+            root.removeHandler(h)
+            h.close()
 
     stream = logging.StreamHandler(sys.stderr)
     stream.setFormatter(JsonFormatter() if fmt == "json" else HumanFormatter())
     root.addHandler(stream)
+
+    # Файловый лог: RotatingFileHandler, 10 MB × 5 файлов.
+    base = os.path.dirname(__file__) or os.getcwd()
+    log_dir = os.getenv("LOG_DIR") or os.path.join(base, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    from logging.handlers import RotatingFileHandler
+
+    file_handler = RotatingFileHandler(
+        os.path.join(log_dir, "bot.log"),
+        maxBytes=10 * 1024 * 1024,  # 10 MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(JsonFormatter() if fmt == "json" else HumanFormatter())
+    file_handler.setLevel(getattr(logging, lvl, logging.INFO))
+    root.addHandler(file_handler)
 
     # Подавим шум сторонних библиотек.
     for noisy in ("urllib3", "selenium", "httpcore", "httpx", "openai", "TeleBot", "WDM"):

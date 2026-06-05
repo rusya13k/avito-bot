@@ -35,10 +35,13 @@ import logging
 import os
 import tempfile
 import threading
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+_nullcontext = nullcontext
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +300,12 @@ def _normalize_only(raw: list[Any], source: str) -> list[dict[str, Any]]:
     return out
 
 
-def save_accounts(repo_dir: Path | str, accounts: list[dict[str, Any]]) -> Path:
+def save_accounts(
+    repo_dir: Path | str,
+    accounts: list[dict[str, Any]],
+    *,
+    _skip_lock: bool = False,
+) -> Path:
     """
     K1: атомарно записывает список аккаунтов в `accounts.json`.
 
@@ -305,9 +313,16 @@ def save_accounts(repo_dir: Path | str, accounts: list[dict[str, Any]]) -> Path:
     (стандартная практика, чтобы не получить пустой/недоразрешённый JSON
     при сбое процесса посередине записи).
 
+    _skip_lock: внутренний параметр — не брать _WRITE_LOCK (вызывается
+    из add/update/remove, которые уже его держат). НЕ использовать
+    извне — deadlock гарантирован.
+
     Returns: путь к accounts.json (для логов).
     """
-    repo_dir = Path(repo_dir)
+    repo_dir = Path(repo_dir).resolve()
+    # Sanity check: repo_dir не должен быть корнем файловой системы
+    if len(repo_dir.parts) <= 1:
+        raise ValueError(f"save_accounts: подозрительный путь {repo_dir}")
     repo_dir.mkdir(parents=True, exist_ok=True)
     target = repo_dir / ACCOUNTS_JSON_FILENAME
 
@@ -319,7 +334,8 @@ def save_accounts(repo_dir: Path | str, accounts: list[dict[str, Any]]) -> Path:
             raise ValueError(f"save_accounts: item #{i} без валидного 'name'")
 
     payload = json.dumps(accounts, ensure_ascii=False, indent=2)
-    with _WRITE_LOCK:
+    lock_ctx = _WRITE_LOCK if not _skip_lock else _nullcontext()
+    with lock_ctx:
         # tempfile в той же директории, чтобы os.replace был атомарным
         # (cross-device replace не атомарен на некоторых FS).
         fd, tmp_path = tempfile.mkstemp(prefix=".accounts_", suffix=".json.tmp", dir=str(repo_dir))
@@ -386,6 +402,7 @@ def update_account(
                 acc.update(updates)
                 _atomic_write(repo_dir, all_accs)
                 return acc
+    logger.warning("update_account: аккаунт '%s' не найден", name)
     return None
 
 
@@ -435,23 +452,8 @@ def remove_account(
 def _atomic_write(repo_dir: Path, accounts: list[dict[str, Any]]) -> Path:
     """
     Внутренний хелпер: атомарная запись БЕЗ повторного взятия _WRITE_LOCK
-    (вызывается из add/update/remove, которые уже его держат).
+    (вызывается из add/update/remove, которые уже его держит).
 
-    Логически дублирует save_accounts — но save_accounts берёт лок сам,
-    что приводило бы к deadlock при вызове из add/update/remove.
+    Делегирует в save_accounts с _skip_lock=True — единая реализация записи.
     """
-    repo_dir.mkdir(parents=True, exist_ok=True)
-    target = repo_dir / ACCOUNTS_JSON_FILENAME
-    payload = json.dumps(accounts, ensure_ascii=False, indent=2)
-    fd, tmp_path = tempfile.mkstemp(prefix=".accounts_", suffix=".json.tmp", dir=str(repo_dir))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(payload)
-        os.replace(tmp_path, target)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return target
+    return save_accounts(repo_dir, accounts, _skip_lock=True)

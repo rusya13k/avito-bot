@@ -57,9 +57,24 @@ Thumbs.db
 # Устаревший анализ кода (описывает архитектуру до Sprint 1-5/G1/G2)
 codebase_analysis.md
 
+# Lockfile (защита от двойного запуска bot.py)
+.bot.lock
+
 # Страховочный патч от ruff format — временный, можно удалить вручную
 .ruff-format.undo.patch
 
 # Случайный мусор на диске (Windows reserved name + пустой шаблонный файл)
 nul
 Новый текстовый документ.txt
+
+# Диагностические скрипты и дампы (не прод-код)
+diag_*.py
+diag_*.png
+html.txt
+*.bak
+
+# Скриншоты, фотки
+Фотки/
+*.png
+*.jpg
+*.jpeg

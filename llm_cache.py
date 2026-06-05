@@ -21,7 +21,7 @@ class LLMResponseCache:
         self.ttl = ttl_sec
 
     def _key(self, dialog_id: str | int, last_in_msg: str, persona: str | None) -> str:
-        h = hashlib.sha1(f"{last_in_msg}:{persona or ''}".encode()).hexdigest()[:16]
+        h = hashlib.sha256(f"{last_in_msg}:{persona or ''}".encode()).hexdigest()[:24]
         return f"{dialog_id}:{h}"
 
     def get(self, dialog_id, last_in_msg: str, persona: str | None) -> str | None:

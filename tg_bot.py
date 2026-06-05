@@ -27,27 +27,37 @@ logger = logging.getLogger(__name__)
 stop_event = threading.Event()
 # Per-account stop events: account_name -> threading.Event
 account_stop_events: dict[str, threading.Event] = {}
+_stop_events_lock = threading.Lock()
 
 # Per-account log buffers: account_name -> deque
 account_log_buffers: dict[str, deque] = {}
+_log_buffers_lock = threading.Lock()
 # Global log buffer for system messages
 log_buffer: deque = deque(maxlen=200)
 
 active_threads: list = []
+_threads_lock = threading.Lock()
 _tg_controller = None  # устанавливается в main() из bot.py
+
+# C1-fix: rate limiting для TG-алертов (H9)
+_last_alert_time: float = 0.0
+_last_alert_lock = threading.Lock()
+_ALERT_MIN_INTERVAL: float = 5.0  # секунд между алертами
 
 
 def get_account_stop_event(account_name: str) -> threading.Event:
-    if account_name not in account_stop_events:
-        account_stop_events[account_name] = threading.Event()
-    return account_stop_events[account_name]
+    with _stop_events_lock:
+        if account_name not in account_stop_events:
+            account_stop_events[account_name] = threading.Event()
+        return account_stop_events[account_name]
 
 
 def clear_account_stop_event(account_name: str) -> None:
     """Явно сбрасывает per-account stop event (используется при TG /start)."""
-    ev = account_stop_events.get(account_name)
-    if ev is not None:
-        ev.clear()
+    with _stop_events_lock:
+        ev = account_stop_events.get(account_name)
+        if ev is not None:
+            ev.clear()
 
 
 def is_stop_requested(account_name: str | None = None) -> bool:
@@ -61,23 +71,56 @@ def is_stop_requested(account_name: str | None = None) -> bool:
 def add_log(line: str, account_name: str | None = None):
     log_buffer.append(line)
     if account_name:
-        if account_name not in account_log_buffers:
-            account_log_buffers[account_name] = deque(maxlen=200)
-        account_log_buffers[account_name].append(line)
+        with _log_buffers_lock:
+            if account_name not in account_log_buffers:
+                account_log_buffers[account_name] = deque(maxlen=200)
+            account_log_buffers[account_name].append(line)
 
 
 def is_running() -> bool:
-    return any(t.is_alive() for t in active_threads)
+    with _threads_lock:
+        return any(t.is_alive() for t in active_threads)
+
+
+def _count_alive_threads() -> int:
+    """Потокобезопасный подсчёт живых потоков."""
+    with _threads_lock:
+        return sum(1 for t in active_threads if t.is_alive())
+
+
+def _is_account_thread_alive(account_name: str) -> bool:
+    """Потокобезопасная проверка: работает ли поток данного аккаунта."""
+    with _threads_lock:
+        return any(t.is_alive() and t.name == f"acc-{account_name}" for t in active_threads)
 
 
 def _send_message(text: str) -> None:
-    """Отправляет сообщение админу через TG-контроллер (если настроен)."""
+    """Отправляет сообщение админам через TG-контроллер (если настроен).
+
+    H9-fix: rate limiting — не чаще 1 сообщения в _ALERT_MIN_INTERVAL секунд.
+    """
+    global _last_alert_time
+    with _last_alert_lock:
+        now = time.time()
+        if now - _last_alert_time < _ALERT_MIN_INTERVAL:
+            return
     ctrl = _tg_controller
-    if ctrl is not None and getattr(ctrl, "admin_id", 0):
-        try:
-            ctrl.bot.send_message(ctrl.admin_id, text)
-        except Exception:
-            pass
+    targets = (
+        ctrl.admin_ids
+        if ctrl and ctrl.admin_ids
+        else ({ctrl.admin_id} if ctrl and ctrl.admin_id else set())
+    )
+    if targets:
+        sent = False
+        for aid in targets:
+            try:
+                ctrl.bot.send_message(aid, text)
+                sent = True
+            except Exception:
+                pass
+        if sent:
+            with _last_alert_lock:
+                _last_alert_time = now
 
 
 def send_user_action_request(account_name: str, request_id: str, prompt: str) -> bool:
@@ -93,7 +136,12 @@ def send_user_action_request(account_name: str, request_id: str, prompt: str) ->
     `account_state.wait_user_resume(...)` для ожидания ответа админа.
     """
     ctrl = _tg_controller
-    if ctrl is None or not getattr(ctrl, "admin_id", 0):
+    targets = (
+        ctrl.admin_ids
+        if ctrl and ctrl.admin_ids
+        else ({ctrl.admin_id} if ctrl and ctrl.admin_id else set())
+    )
+    if not targets:
         add_log(
             f"[{account_name}] send_user_action_request: TG не настроен — "
             f"запрос {request_id!s} не доставлен"
@@ -111,7 +159,11 @@ def send_user_action_request(account_name: str, request_id: str, prompt: str) ->
             f"После того как разберёшься в браузере (AdsPower), нажми «Продолжить» "
             f"или «Отмена», чтобы прервать поток."
         )
-        ctrl.bot.send_message(ctrl.admin_id, text, reply_markup=kb)
+        for aid in targets:
+            try:
+                ctrl.bot.send_message(aid, text, reply_markup=kb)
+            except Exception:
+                pass
         add_log(f"[{account_name}] user-resume запрос отправлен админу (id={request_id})")
         return True
     except Exception as exc:
@@ -129,19 +181,18 @@ def kb_main() -> InlineKeyboardMarkup:
     m.add(
         InlineKeyboardButton("▶️ Запустить", callback_data="run"),
         InlineKeyboardButton("⏹ Остановить", callback_data="stop"),
-        InlineKeyboardButton("📊 Статус", callback_data="status"),
+        InlineKeyboardButton("📊 Отчёт", callback_data="report"),
         InlineKeyboardButton("📋 Логи", callback_data="logs"),
         InlineKeyboardButton("👤 Аккаунты", callback_data="accounts_menu"),
-        InlineKeyboardButton("🔒 Прокси", callback_data="proxies_menu"),
+        InlineKeyboardButton("➕ Добавить аккаунт", callback_data="acc_add"),
         InlineKeyboardButton("⚙️ Настройки", callback_data="settings_menu"),
-        InlineKeyboardButton("🔍 Классификация", callback_data="classification_menu"),
     )
     return m
 
 
-def kb_back(target: str = "main") -> InlineKeyboardMarkup:
+def kb_back(target: str = "menu_main") -> InlineKeyboardMarkup:
     m = InlineKeyboardMarkup()
-    m.add(InlineKeyboardButton("◀️ Назад", callback_data=f"menu_{target}"))
+    m.add(InlineKeyboardButton("◀️ Назад", callback_data=target))
     return m
 
 
@@ -161,11 +212,13 @@ def kb_accounts(accounts: list) -> InlineKeyboardMarkup:
 def kb_account_detail(idx: int) -> InlineKeyboardMarkup:
     m = InlineKeyboardMarkup(row_width=2)
     m.add(
-        InlineKeyboardButton("🍪 Обновить куки", callback_data=f"acc_cookies_{idx}"),
-        InlineKeyboardButton("🆔 Изменить AdsPower ID", callback_data=f"acc_userid_{idx}"),
-        # T12: запуск большого прогрева (10 нейтральных сайтов + Yandex).
+        InlineKeyboardButton("📞 Телефон", callback_data=f"acc_phone_{idx}"),
+        InlineKeyboardButton("🔑 Пароль", callback_data=f"acc_password_{idx}"),
+        InlineKeyboardButton("🆔 AdsPower ID", callback_data=f"acc_userid_{idx}"),
+        InlineKeyboardButton("👤 Персона", callback_data=f"acc_persona_{idx}"),
+        InlineKeyboardButton("🧊 Капча кулдаун (мин)", callback_data=f"acc_captcha_cd_{idx}"),
         InlineKeyboardButton("🔥 Большой прогрев", callback_data=f"acc_bigwarmup_{idx}"),
-        InlineKeyboardButton("🛑 Остановть", callback_data=f"acc_stop_{idx}"),
+        InlineKeyboardButton("💤 Отключить/Включить", callback_data=f"acc_toggle_{idx}"),
         InlineKeyboardButton("🗑 Удалить", callback_data=f"acc_del_{idx}"),
         InlineKeyboardButton("◀️ Назад", callback_data="accounts_menu"),
     )
@@ -175,8 +228,16 @@ def kb_account_detail(idx: int) -> InlineKeyboardMarkup:
 def kb_proxies(proxies: list) -> InlineKeyboardMarkup:
     m = InlineKeyboardMarkup(row_width=1)
     for i, p in enumerate(proxies):
-        parts = p.split(":")
-        label = f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else p
+        # Поддержка IPv6 [::1]:port:user:pass и обычных host:port
+        try:
+            if p.startswith("["):
+                bracket_end = p.index("]")
+                label = f"[{p[1:bracket_end]}]:{p[bracket_end + 2 :].split(':')[0]}"
+            else:
+                parts = p.split(":")
+                label = f"{parts[0]}:{parts[1]}" if len(parts) >= 2 else p
+        except (ValueError, IndexError):
+            label = p
         m.add(InlineKeyboardButton(f"🔒 {i + 1}. {label}", callback_data=f"proxy_del_confirm_{i}"))
     m.row(
         InlineKeyboardButton("➕ Добавить прокси", callback_data="proxy_add"),
@@ -186,24 +247,12 @@ def kb_proxies(proxies: list) -> InlineKeyboardMarkup:
     return m
 
 
-def kb_classification() -> InlineKeyboardMarkup:
-    m = InlineKeyboardMarkup(row_width=1)
-    m.add(
-        InlineKeyboardButton("🔄 Переклассифицировать базу", callback_data="reclassify_all"),
-        InlineKeyboardButton("📊 Статистика классификации", callback_data="classification_stats"),
-        InlineKeyboardButton("📋 Разметка 50 объявлений", callback_data="create_ground_truth"),
-        InlineKeyboardButton("📈 Оценка качества", callback_data="evaluate_quality"),
-        InlineKeyboardButton("◀️ Назад", callback_data="menu_main"),
-    )
-    return m
-
-
 def kb_settings() -> InlineKeyboardMarkup:
     m = InlineKeyboardMarkup(row_width=1)
     m.add(
         InlineKeyboardButton("🔗 Ссылка на объявление", callback_data="set_url"),
-        InlineKeyboardButton("🤖 OpenAI API Key", callback_data="set_openai_key"),
-        InlineKeyboardButton("🧠 OpenAI Model", callback_data="set_openai_model"),
+        InlineKeyboardButton("🤖 DeepSeek API Key", callback_data="set_openai_key"),
+        InlineKeyboardButton("🧠 LLM Model", callback_data="set_openai_model"),
         InlineKeyboardButton("🌐 AdsPower API URL", callback_data="set_adspower_url"),
         InlineKeyboardButton("🔑 AdsPower API Key", callback_data="set_adspower_key"),
         InlineKeyboardButton("🧵 Кол-во потоков", callback_data="set_threads"),
@@ -259,6 +308,9 @@ class TelegramController:
     def __init__(self, token: str, admin_id: int = 0):
         self.token = token
         self.admin_id = int(admin_id) if admin_id else 0
+        # Поддержка нескольких админов: telegram_admin_ids из config.json
+        # Если задан — _allowed проверяет по списку. Иначе — по self.admin_id.
+        self.admin_ids: set[int] = set()
         self.bot = telebot.TeleBot(token, parse_mode=None)
         self._run_callback = None
         # Shared DatabaseManager — передаётся через set_db_manager() из bot.main().
@@ -274,6 +326,7 @@ class TelegramController:
         # T12: набор имён аккаунтов, для которых сейчас крутится фоновый
         # большой прогрев. Защита от двойного запуска.
         self._big_warmup_running: set[str] = set()
+        self._big_warmup_lock = threading.Lock()
         self._last_msg_time: dict[int, float] = {}
         self._setup()
 
@@ -281,6 +334,10 @@ class TelegramController:
 
     def set_run_callback(self, fn):
         self._run_callback = fn
+
+    def set_admin_ids(self, ids: list[int] | list[float]) -> None:
+        """Установить список разрешённых Telegram user ID из config.json."""
+        self.admin_ids = {int(i) for i in ids if int(i) != 0}
 
     def set_db_manager(self, db_manager) -> None:
         """Передать shared DatabaseManager из bot.main() — один на весь процесс."""
@@ -291,22 +348,30 @@ class TelegramController:
         if self._db is not None:
             return self._db
         from database import DatabaseManager
+
         self._db = DatabaseManager()
         return self._db
 
     def notify(self, text: str):
-        if self.admin_id:
+        targets = (
+            self.admin_ids if self.admin_ids else ({self.admin_id} if self.admin_id else set())
+        )
+        for aid in targets:
             try:
-                self.bot.send_message(self.admin_id, text)
+                self.bot.send_message(aid, text)
             except Exception:
                 pass
 
     def _allowed(self, uid: int) -> bool:
         import time as _time
+
         now = _time.time()
         if now - self._last_msg_time.get(uid, 0.0) < 0.5:
             return False
         self._last_msg_time[uid] = now
+        # Если есть admin_ids — проверяем по списку. Иначе — по admin_id.
+        if self.admin_ids:
+            return uid in self.admin_ids
         return not self.admin_id or uid == self.admin_id
 
     def _cfg(self) -> dict:
@@ -334,17 +399,32 @@ class TelegramController:
         # читатель не увидит partial-write при крэше.
         # L5: после успешной записи обновляем кэш и mtime.
         path = self.BASE / "config.json"
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(self.BASE),
+        fd, tmp_path = tempfile.mkstemp(
             prefix=".config-",
             suffix=".tmp",
-            delete=False,
-        ) as tmp:
-            json.dump(cfg, tmp, ensure_ascii=False, indent=2)
-            tmp_path = tmp.name
-        os.replace(tmp_path, path)
+            dir=str(self.BASE),
+        )
+        try:
+            os.chmod(tmp_path, 0o600)  # Только владелец может читать
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                json.dump(cfg, tmp, ensure_ascii=False, indent=2)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        try:
+            os.replace(tmp_path, path)
+        except OSError:
+            # Windows: файл может быть заблокирован другим процессом.
+            # Пробуем direct write как fallback.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
         try:
             self._cfg_cache_mtime = path.stat().st_mtime
             self._cfg_cache = copy.deepcopy(cfg)
@@ -364,7 +444,25 @@ class TelegramController:
     def _save_proxies(self, proxies: list):
         cfg = self._cfg()
         path = self.BASE / cfg.get("proxies_file", "proxies.txt")
-        path.write_text("\n".join(proxies) + ("\n" if proxies else ""), encoding="utf-8")
+        # Atomic write: tempfile + os.replace
+        fd, tmp_path = tempfile.mkstemp(prefix=".proxies-", suffix=".tmp", dir=str(self.BASE))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                tmp.write("\n".join(proxies) + ("\n" if proxies else ""))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        try:
+            os.replace(tmp_path, str(path))
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            path.write_text("\n".join(proxies) + ("\n" if proxies else ""), encoding="utf-8")
 
     def _keywords(self) -> list:
         cfg = self._cfg()
@@ -378,13 +476,34 @@ class TelegramController:
     def _save_keywords(self, keywords: list):
         cfg = self._cfg()
         path = self.BASE / cfg.get("keywords_file", "keywords.txt")
-        path.write_text("\n".join(keywords) + "\n", encoding="utf-8")
+        # Atomic write: tempfile + os.replace
+        fd, tmp_path = tempfile.mkstemp(prefix=".keywords-", suffix=".tmp", dir=str(self.BASE))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+                tmp.write("\n".join(keywords) + "\n")
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+        try:
+            os.replace(tmp_path, str(path))
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            path.write_text("\n".join(keywords) + "\n", encoding="utf-8")
 
     def _set_dialog(self, chat_id: int, state: str, data: dict = None):
-        self._state[chat_id] = {"state": state, "data": data or {}}
+        self._state[chat_id] = {"state": state, "data": dict(data) if data else {}}
 
     def _clear_dialog(self, chat_id: int):
-        self._state.pop(chat_id, None)
+        # Зануляем sensitive data перед удалением (password может висеть в памяти)
+        entry = self._state.pop(chat_id, None)
+        if entry and isinstance(entry.get("data"), dict):
+            entry["data"].pop("password", None)
 
     def _get_dialog(self, chat_id: int) -> dict:
         return self._state.get(chat_id, {})
@@ -396,8 +515,19 @@ class TelegramController:
         if md:
             kwargs["parse_mode"] = "Markdown"
         if len(text) > 4000:
+            # Обрезаем, не ломая многобайтовый UTF-8 символ на границе.
             text = "...\n" + text[-3997:]
-        self.bot.send_message(chat_id, text, **kwargs)
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError:
+                # Убираем битый trailing byte
+                while len(text) > 4000:
+                    text = text[:-1]
+                text = text.encode("utf-8", errors="ignore").decode("utf-8")
+        try:
+            self.bot.send_message(chat_id, text, **kwargs)
+        except Exception:
+            logger.debug("_send failed for chat_id=%s", chat_id, exc_info=True)
 
     def _edit_or_send(self, chat_id, message_id, text, kb=None) -> None:
         """S2: пытается edit_message_text для inline-кнопок (обновляет
@@ -422,7 +552,7 @@ class TelegramController:
         text = (
             f"Avito-бот\n"
             f"Статус: {'🟢 работает' if running else '🔴 остановлен'}\n"
-            f"Потоков: {sum(1 for t in active_threads if t.is_alive())}"
+            f"Потоков: {_count_alive_threads()}"
         )
         if edit_msg:
             self._edit_or_send(edit_msg.chat.id, edit_msg.message_id, text, kb_main())
@@ -440,10 +570,23 @@ class TelegramController:
         Возвращаем НЕ-фильтрованный список (вместе с disabled), чтобы
         пользователь видел все аккаунты в TG-меню — даже временно
         отключённые `enabled=false`.
+
+        Результат кэшируется до изменения файла (mtime-check).
         """
         from accounts import load_all_accounts
 
-        return load_all_accounts(self.BASE, self._cfg())
+        accs_path = self.BASE / "accounts.json"
+        try:
+            mtime = accs_path.stat().st_mtime
+        except OSError:
+            mtime = 0
+        cached = getattr(self, "_accounts_cache", None)
+        if cached is not None and getattr(self, "_accounts_mtime", 0) == mtime:
+            return cached
+        result = load_all_accounts(self.BASE, self._cfg())
+        self._accounts_cache = result
+        self._accounts_mtime = mtime
+        return result
 
     def _show_accounts(self, chat_id, edit_msg=None):
         accs = self._accounts()
@@ -468,8 +611,9 @@ class TelegramController:
             f"Потоков: {cfg.get('threads', 0) or 'без ограничений'}\n"
             f"URL: {cfg.get('target_url', '—')[:60]}...\n"
             f"Ключевых слов: {len(self._keywords())}\n"
-            f"OpenAI Key: {'✅ задан' if cfg.get('openai_api_key', '') else '❌ не задан'}\n"
-            f"OpenAI Model: {cfg.get('openai_model', 'gpt-3.5-turbo')}\n"
+            f"LLM Key: {'✅ задан' if cfg.get('openai_api_key', '') else '❌ не задан'}\n"
+            f"LLM Model: {cfg.get('openai_model', 'deepseek-v4-flash')}\n"
+            f"LLM API: {cfg.get('openai_api_base', 'https://api.deepseek.com/v1')}\n"
             f"AdsPower URL: {cfg.get('adspower_api_url', '—')}\n"
             f"AdsPower Key: {'✅ задан' if cfg.get('adspower_api_key', '') else '❌ не задан'}"
         )
@@ -477,13 +621,6 @@ class TelegramController:
             self._edit_or_send(edit_msg.chat.id, edit_msg.message_id, text, kb_settings())
             return
         self._send(chat_id, text, kb_settings())
-
-    def _show_classification(self, chat_id, edit_msg=None):
-        text = "🔍 Классификация объявлений"
-        if edit_msg:
-            self._edit_or_send(edit_msg.chat.id, edit_msg.message_id, text, kb_classification())
-            return
-        self._send(chat_id, text, kb_classification())
 
     # ══════════════════════════════════════════════════════════════════════════
     # S2 Stage 1: Message-handler'ы как методы класса. Регистрируются в _setup
@@ -523,18 +660,18 @@ class TelegramController:
             lines = [
                 f"📊 Сводка {title}",
                 "",
-                f"Листингов распарсено: {s['listings_parsed']}",
-                f"  ok: {s['listings_ok']}  "
-                f"captcha: {s['listings_captcha']}  "
-                f"error: {s['listings_error']}",
+                f"Листингов распарсено: {s.get('listings_parsed', 0)}",
+                f"  ok: {s.get('listings_ok', 0)}  "
+                f"captcha: {s.get('listings_captcha', 0)}  "
+                f"error: {s.get('listings_error', 0)}",
                 "",
                 "Классификация:",
-                f"  собственники: {s['classified_owner']}",
-                f"  агенты: {s['classified_agent']}",
-                f"  uncertain: {s['classified_uncertain']}",
+                f"  собственники: {s.get('classified_owner', 0)}",
+                f"  агенты: {s.get('classified_agent', 0)}",
+                f"  uncertain: {s.get('classified_uncertain', 0)}",
                 "",
-                f"Активных диалогов: {s['dialogs_active']}",
-                f"Сообщений всего: {s['messages_total']}",
+                f"Активных диалогов: {s.get('dialogs_active', 0)}",
+                f"Сообщений всего: {s.get('messages_total', 0)}",
                 "",
                 # E2: счётчики per period (берутся из metrics-таблицы)
                 f"Диалогов обработано: {s.get('dialogs_handled', 0)}",
@@ -563,6 +700,13 @@ class TelegramController:
             lines = ["💰 Бюджет аккаунтов на сегодня", ""]
             if not accounts_list:
                 lines.append("Нет активных аккаунтов.")
+            # E2-opt: один запрос вместо N+1 — забираем все метрики за сегодня
+            all_metrics_rows = db.get_metrics(since=today, group_by="metric")
+            # Строим lookup: (account_name, metric) → value
+            metrics_lookup: dict[tuple[str, str], int] = {}
+            for r in all_metrics_rows:
+                key = (r.get("account_name", ""), r.get("metric", ""))
+                metrics_lookup[key] = int(r.get("value", 0))
             for acc in accounts_list:
                 name = acc["name"]
                 lines.append(f"▪ {name}:")
@@ -574,13 +718,7 @@ class TelegramController:
                     if action == "phone":
                         used = _astate.phone_clicks_today(name)
                     else:
-                        rows = db.get_metrics(
-                            since=today,
-                            account_name=name,
-                            metric=metric,
-                            group_by="metric",
-                        )
-                        used = int(rows[0]["value"]) if rows else 0
+                        used = metrics_lookup.get((name, metric), 0)
                     limit = _astate.get_effective_limit(name, action)
                     pct = used * 100 // limit if limit > 0 else 0
                     icon = "🔴" if pct >= 100 else "🟡" if pct >= 80 else "🟢"
@@ -821,93 +959,91 @@ class TelegramController:
         if any(a["name"] == name for a in self._accounts()):
             self.bot.reply_to(message, f"Аккаунт '{name}' уже существует.")
             return
-        self._set_dialog(cid, "acc_add_cookies", {"name": name})
+        self._set_dialog(cid, "acc_add_phone", {"name": name})
         self.bot.reply_to(
             message,
-            f"Аккаунт: {name}\n\nОтправь файл cookies.json "
-            f"или вставь JSON-текст кук.\n\nОтправь /cancel для отмены.",
+            f"Аккаунт: {name}\n\nОтправь номер телефона (например +79673639403).\n/cancel — отмена.",
         )
 
-    def _dialog_acc_cookies(self, message, data):
-        """State: ожидание кук (файл или текст). Используется и для нового
-        аккаунта (acc_add_cookies, idx=None), и для обновления существующего
-        (acc_update_cookies, idx=число).
-        """
+    def _dialog_acc_add_phone(self, message, data):
+        """State: ввод телефона для нового аккаунта."""
         cid = message.chat.id
-        idx = data.get("idx")  # None = новый, число = обновление
-        name = data.get("name")
+        phone = (message.text or "").strip()
+        if not phone:
+            self.bot.reply_to(message, "Телефон не может быть пустым. Отправь номер или /cancel.")
+            return
+        data["phone"] = phone
+        self._set_dialog(cid, "acc_add_password", data)
+        self.bot.reply_to(
+            message,
+            f"Телефон: {phone}\n\nОтправь пароль от аккаунта Avito.\n/cancel — отмена.",
+        )
 
-        # 1. Получаем cookies_json из файла или текста
-        if message.content_type == "document":
-            try:
-                file_info = self.bot.get_file(message.document.file_id)
-                downloaded = self.bot.download_file(file_info.file_path)
-                cookies_json = json.loads(downloaded.decode("utf-8"))
-            except Exception as e:
-                self.bot.reply_to(message, f"Ошибка чтения файла: {e}")
-                return
+    def _dialog_acc_add_password(self, message, data):
+        """State: ввод пароля для нового аккаунта."""
+        cid = message.chat.id
+        password = (message.text or "").strip()
+        if not password:
+            self.bot.reply_to(message, "Пароль не может быть пустым. Отправь пароль или /cancel.")
+            return
+        data["password"] = password
+        self._set_dialog(cid, "acc_add_adspower", data)
+        self.bot.reply_to(
+            message,
+            "Пароль сохранён.\n\nОтправь AdsPower ID профиля "
+            "(например k1c2utgb).\nИли отправь /skip если пока нет.\n/cancel — отмена.",
+        )
+
+    def _dialog_acc_add_adspower(self, message, data):
+        """State: ввод AdsPower ID (опционально)."""
+        cid = message.chat.id
+        text = (message.text or "").strip()
+        name = data["name"]
+        phone = data["phone"]
+        password = data["password"]
+
+        # /skip = без AdsPower ID
+        if text.lower() != "/skip":
+            data["adspower_id"] = text
         else:
-            # L10: `or ""` защищает от non-text сообщений (фото без подписи
-            # → message.text=None → AttributeError при .strip()).
-            text = (message.text or "").strip()
-            try:
-                cookies_json = json.loads(text)
-            except json.JSONDecodeError:
-                self.bot.reply_to(
-                    message,
-                    "Не удалось распознать JSON. Отправь файл .json или валидный JSON-текст.",
-                )
-                return
+            data["adspower_id"] = ""
 
-        if not isinstance(cookies_json, list):
-            self.bot.reply_to(message, "Куки должны быть массивом [].")
+        # Сохраняем аккаунт в accounts.json
+        try:
+            from accounts import add_account
+
+            safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+            cookies_path = f"accounts/{safe_name}/cookies.json"
+            account_data = {
+                "name": name,
+                "phone": phone,
+                "password": password,
+                "cookies_path": cookies_path,
+                "enabled": True,
+            }
+            if data.get("adspower_id"):
+                account_data["adspower_id"] = data["adspower_id"]
+            add_account(self.BASE, account_data, cfg=self._cfg())
+        except ValueError as exc:
+            self.bot.reply_to(message, f"Не удалось добавить аккаунт: {exc}")
+            self._clear_dialog(cid)
+            return
+        except Exception as exc:
+            logger.exception("add_account failed")
+            self.bot.reply_to(message, f"Ошибка записи accounts.json: {exc}")
+            self._clear_dialog(cid)
             return
 
-        # 2. Определяем cookies_path и acc_name
-        accs = self._accounts()
-        if idx is not None:
-            if idx >= len(accs):
-                self.bot.reply_to(message, "Аккаунт не найден.")
-                self._clear_dialog(cid)
-                return
-            cookies_path = self.BASE / accs[idx]["cookies_path"]
-            acc_name = accs[idx]["name"]
-        else:
-            safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
-            cookies_path = self.BASE / "accounts" / safe_name / "cookies.json"
-            acc_name = name
-
-        # 3. Сохраняем куки на диск
-        cookies_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(cookies_path, "w", encoding="utf-8") as f:
-            json.dump(cookies_json, f, ensure_ascii=False, indent=2)
-
-        # 4. K1: для нового аккаунта — пишем в accounts.json.
-        # Раньше TG-бот добавлял в cfg["accounts"], но bot.py читает
-        # accounts.json приоритетно (G2) — изменения через TG не доходили.
-        if idx is None:
-            rel_path = cookies_path.relative_to(self.BASE).as_posix()
-            try:
-                from accounts import add_account
-
-                add_account(
-                    self.BASE,
-                    {"name": acc_name, "cookies_path": rel_path, "enabled": True},
-                    cfg=self._cfg(),
-                )
-            except ValueError as exc:
-                self.bot.reply_to(message, f"Не удалось добавить аккаунт: {exc}")
-                self._clear_dialog(cid)
-                return
-            except Exception as exc:
-                logger.exception("add_account failed")
-                self.bot.reply_to(message, f"Ошибка записи accounts.json: {exc}")
-                self._clear_dialog(cid)
-                return
-
         self._clear_dialog(cid)
+        adspower_info = (
+            f"\nAdsPower ID: {data.get('adspower_id')}" if data.get("adspower_id") else ""
+        )
         self.bot.reply_to(
-            message, f"✅ Куки сохранены для '{acc_name}' ({len(cookies_json)} записей)."
+            message,
+            f"✅ Аккаунт добавлен!\n"
+            f"Имя: {name}\n"
+            f"Телефон: {phone}\n"
+            f"Пароль: {'*' * len(password)}{adspower_info}",
         )
         self._show_accounts(cid)
 
@@ -976,11 +1112,8 @@ class TelegramController:
     def _dialog_set_url(self, message, data):
         self._save_cfg_text_field(message, "target_url", "✅ URL обновлён.", require_url=True)
 
-    def _dialog_set_sphere_key(self, message, data):
-        self._save_cfg_text_field(message, "sphere_api_key", "✅ Sphere API-ключ обновлён.")
-
     def _dialog_set_openai_key(self, message, data):
-        self._save_cfg_text_field(message, "openai_api_key", "✅ OpenAI API Key обновлён.")
+        self._save_cfg_text_field(message, "openai_api_key", "✅ DeepSeek API Key обновлён.")
 
     def _dialog_set_openai_model(self, message, data):
         # Особый success-text с показом модели — не подходит generic helper.
@@ -993,7 +1126,7 @@ class TelegramController:
         cfg["openai_model"] = model
         self._save_cfg(cfg)
         self._clear_dialog(cid)
-        self.bot.reply_to(message, f"✅ OpenAI Model установлена: {model}")
+        self.bot.reply_to(message, f"✅ LLM Model установлена: {model}")
         self._show_settings(cid)
 
     def _dialog_set_adspower_url(self, message, data):
@@ -1055,8 +1188,122 @@ class TelegramController:
             return
         if updated is None:
             self.bot.reply_to(message, f"Аккаунт '{acc_name}' не найден.")
+            self._clear_dialog(cid)
+            return
+        self._show_accounts(cid)
+
+    def _dialog_acc_set_phone(self, message, data):
+        """State: обновление телефона для существующего аккаунта."""
+        cid = message.chat.id
+        idx = data.get("idx")
+        phone = (message.text or "").strip()
+        if not phone:
+            self.bot.reply_to(message, "Телефон не может быть пустым.")
+            return
+        accs = self._accounts()
+        if idx is None or idx >= len(accs):
+            self.bot.reply_to(message, "Аккаунт не найден.")
+            self._clear_dialog(cid)
+            return
+        acc_name = accs[idx]["name"]
+        try:
+            from accounts import update_account
+
+            update_account(self.BASE, acc_name, {"phone": phone}, cfg=self._cfg())
+        except Exception as exc:
+            logger.exception("update_account phone failed")
+            self.bot.reply_to(message, f"Ошибка: {exc}")
+            self._clear_dialog(cid)
+            return
         self._clear_dialog(cid)
-        self.bot.reply_to(message, f"✅ AdsPower ID для '{acc_name}' установлен: {user_id}")
+        self.bot.reply_to(message, f"✅ Телефон для '{acc_name}' обновлён: {phone}")
+        self._show_accounts(cid)
+
+    def _dialog_acc_set_password(self, message, data):
+        """State: обновление пароля для существующего аккаунта."""
+        cid = message.chat.id
+        idx = data.get("idx")
+        password = (message.text or "").strip()
+        if not password:
+            self.bot.reply_to(message, "Пароль не может быть пустым.")
+            return
+        accs = self._accounts()
+        if idx is None or idx >= len(accs):
+            self.bot.reply_to(message, "Аккаунт не найден.")
+            self._clear_dialog(cid)
+            return
+        acc_name = accs[idx]["name"]
+        try:
+            from accounts import update_account
+
+            update_account(self.BASE, acc_name, {"password": password}, cfg=self._cfg())
+        except Exception as exc:
+            logger.exception("update_account password failed")
+            self.bot.reply_to(message, f"Ошибка: {exc}")
+            self._clear_dialog(cid)
+            return
+        self._clear_dialog(cid)
+        self.bot.reply_to(message, f"✅ Пароль для '{acc_name}' обновлён.")
+        self._show_accounts(cid)
+
+    def _dialog_acc_set_persona(self, message, data):
+        """State: обновление персоны для аккаунта."""
+        cid = message.chat.id
+        idx = data.get("idx")
+        persona = (message.text or "").strip()
+        if not persona:
+            persona = None  # Сброс на дефолт
+        accs = self._accounts()
+        if idx is None or idx >= len(accs):
+            self.bot.reply_to(message, "Аккаунт не найден.")
+            self._clear_dialog(cid)
+            return
+        acc_name = accs[idx]["name"]
+        try:
+            from accounts import update_account
+
+            update_account(self.BASE, acc_name, {"persona": persona}, cfg=self._cfg())
+        except Exception as exc:
+            logger.exception("update_account persona failed")
+            self.bot.reply_to(message, f"Ошибка: {exc}")
+            self._clear_dialog(cid)
+            return
+        self._clear_dialog(cid)
+        display = persona or "по умолчанию"
+        self.bot.reply_to(message, f"✅ Персона для '{acc_name}': {display}")
+        self._show_accounts(cid)
+
+    def _dialog_acc_set_captcha_cd(self, message, data):
+        """State: обновление captcha_cooldown_minutes для аккаунта."""
+        cid = message.chat.id
+        idx = data.get("idx")
+        text = (message.text or "").strip()
+        if not text.isdigit():
+            self.bot.reply_to(
+                message, "Введи число минут (напр. 30). Или 0 для сброса на глобальный."
+            )
+            return
+        minutes = int(text)
+        accs = self._accounts()
+        if idx is None or idx >= len(accs):
+            self.bot.reply_to(message, "Аккаунт не найден.")
+            self._clear_dialog(cid)
+            return
+        acc_name = accs[idx]["name"]
+        try:
+            from accounts import update_account
+
+            # 0 = сброс (вернётся к глобальному из config.json)
+            val = minutes if minutes > 0 else None
+            update_account(self.BASE, acc_name, {"captcha_cooldown_minutes": val}, cfg=self._cfg())
+        except Exception as exc:
+            logger.exception("update_account captcha_cd failed")
+            self.bot.reply_to(message, f"Ошибка: {exc}")
+            self._clear_dialog(cid)
+            return
+        self._clear_dialog(cid)
+        display = f"{minutes} мин" if minutes > 0 else "глобальный"
+        self.bot.reply_to(message, f"✅ Капча кулдаун для '{acc_name}': {display}")
         self._show_accounts(cid)
 
     def _handle_dialog(self, message):
@@ -1066,6 +1313,11 @@ class TelegramController:
         """
         if not self._allowed(message.from_user.id):
             return
+        # /cancel может попасть сюда если пользователь написал /cancel
+        # во время диалога — передаём в _cmd_cancel
+        if (message.text or "").strip().lower() == "/cancel":
+            self._cmd_cancel(message)
+            return
         dialog = self._get_dialog(message.chat.id)
         state = dialog.get("state")
         data = dialog.get("data", {})
@@ -1074,13 +1326,17 @@ class TelegramController:
         # отличаются только через data["idx"]: None vs число.
         handlers = {
             "acc_add_name": self._dialog_acc_add_name,
-            "acc_add_cookies": self._dialog_acc_cookies,
-            "acc_update_cookies": self._dialog_acc_cookies,
+            "acc_add_phone": self._dialog_acc_add_phone,
+            "acc_add_password": self._dialog_acc_add_password,
+            "acc_add_adspower": self._dialog_acc_add_adspower,
+            "acc_set_phone": self._dialog_acc_set_phone,
+            "acc_set_password": self._dialog_acc_set_password,
+            "acc_set_persona": self._dialog_acc_set_persona,
+            "acc_set_captcha_cd": self._dialog_acc_set_captcha_cd,
             "proxy_add": self._dialog_proxy_add,
             "proxy_replace": self._dialog_proxy_replace,
             "set_keywords": self._dialog_set_keywords,
             "set_url": self._dialog_set_url,
-            "set_sphere_key": self._dialog_set_sphere_key,
             "set_openai_key": self._dialog_set_openai_key,
             "set_openai_model": self._dialog_set_openai_model,
             "set_adspower_url": self._dialog_set_adspower_url,
@@ -1091,6 +1347,12 @@ class TelegramController:
         handler = handlers.get(state)
         if handler:
             handler(message, data)
+        elif state:
+            logger.warning("Неизвестный dialog state: %s (chat_id=%s)", state, message.chat.id)
+            self.bot.reply_to(
+                message,
+                "❓ Неизвестное состояние диалога. Отправь /cancel чтобы начать заново.",
+            )
 
     # ══════════════════════════════════════════════════════════════════════════
     # S2 Stage 3: Callback router. on_callback раньше был ~370 строк if/elif
@@ -1111,11 +1373,17 @@ class TelegramController:
         d = call.data
         try:
             payload = d[len("b1_res_") :]
-            if payload.endswith("_c"):
-                request_id = payload[:-2]
+            # Парсим с конца: последний _c/_x — это response, всё до него — request_id.
+            # Защита от request_id, содержащего _c/_x внутри.
+            last_underscore = payload.rfind("_")
+            if last_underscore < 0:
+                self.bot.answer_callback_query(call.id, "Bad payload")
+                return
+            suffix = payload[last_underscore + 1 :]
+            request_id = payload[:last_underscore]
+            if suffix == "c":
                 response = "continue"
-            elif payload.endswith("_x"):
-                request_id = payload[:-2]
+            elif suffix == "x":
                 response = "cancel"
             else:
                 self.bot.answer_callback_query(call.id, "Bad payload")
@@ -1157,31 +1425,47 @@ class TelegramController:
     def _cb_settings_menu(self, call):
         self._show_settings(call.message.chat.id, call.message)
 
-    def _cb_classification_menu(self, call):
-        self._show_classification(call.message.chat.id, call.message)
-
-    # ── Запуск/стоп/статус/логи ────────────────────────────────────────────
+    # ── Запуск/стоп/логи ────────────────────────────────────────────
 
     def _cb_run(self, call):
         cid = call.message.chat.id
+
+        # Если бот уже работает — сначала останавливаем, потом запускаем.
         if is_running():
-            self._send(cid, "Бот уже запущен.")
-            return
+            self.bot.answer_callback_query(call.id, "⏳ Останавливаю и перезапускаю...")
+            stop_event.set()
+            # Ждём завершения до 15s
+            deadline = time.time() + 15
+            with _threads_lock:
+                old_threads = list(active_threads)
+                # Не clear() — Supervisor thread (bot.py) ещё может делать remove().
+                # Вместо этого убираем только те, что уже завершились.
+                active_threads[:] = [t for t in active_threads if not t.is_alive()]
+            for t in old_threads:
+                remaining = max(0.5, deadline - time.time())
+                try:
+                    t.join(timeout=remaining)
+                except Exception:
+                    pass
+            # Убиваем AdsPower-профили перед перезапуском
+            self._cleanup_adspower()
+
         if not self._run_callback:
             self._send(cid, "Ошибка: run_callback не задан.")
             return
         stop_event.clear()
-        active_threads.clear()
-        for ev in account_stop_events.values():
-            ev.clear()
-        self._send(cid, "Запускаю потоки...")
+        with _stop_events_lock:
+            for ev in account_stop_events.values():
+                ev.clear()
+        self._send(cid, "🚀 Запускаю потоки...")
         threading.Thread(target=self._run_callback, daemon=True, name="tg-runner").start()
         self._show_main(cid, call.message)
 
     def _cb_stop(self, call):
         cid = call.message.chat.id
         if not is_running():
-            self._send(cid, "Бот не запущен.")
+            self.bot.answer_callback_query(call.id, "🔴 Бот не запущен.")
+            self._show_main(cid, call.message)
             return
         add_log("🛑 Stop signal sent. Threads will exit at next checkpoint.")
         stop_event.set()
@@ -1189,7 +1473,6 @@ class TelegramController:
         self._send(
             cid,
             "Сигнал остановки отправлен. Жду завершения потоков (до 30s)...",
-            kb_back(),
         )
         # C2: ждём фактического завершения потоков в отдельном потоке,
         # чтобы не блокировать handler TG (callback должен возвращаться быстро).
@@ -1199,6 +1482,34 @@ class TelegramController:
             daemon=True,
             name="tg-stop-joiner",
         ).start()
+
+    def _cleanup_adspower(self):
+        """Остановить AdsPower-профили всех аккаунтов (параллельно)."""
+        try:
+            cfg = self._cfg()
+            from accounts import load_all_accounts
+
+            accs = load_all_accounts(self.BASE, cfg)
+            adspower_url = cfg.get("adspower_api_url", "")
+            adspower_key = cfg.get("adspower_api_key") or os.environ.get("ADSPOWER_API_KEY", "")
+            if not adspower_url:
+                return
+            from bot import AdsPowerAPI
+
+            api = AdsPowerAPI(adspower_url, adspower_key or None)
+            uids = [uid for acc in accs if (uid := acc.get("adspower_id") or acc.get("user_id"))]
+            if not uids:
+                return
+            # Параллельная остановка — быстрее чем последовательная
+            threads = []
+            for uid in uids:
+                t = threading.Thread(target=api.stop_profile, args=(uid,), daemon=True)
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join(timeout=10)
+        except Exception:
+            pass
 
     def _join_threads_and_report(self, threads, chat_id):
         """C2: дожидаемся завершения потоков (до 30s) и отправляем итоговый
@@ -1228,50 +1539,39 @@ class TelegramController:
         except Exception:
             pass
 
-    def _cb_status(self, call):
-        """Status callback"""
+    def _cb_report(self, call):
+        """📊 Отчёт — кнопка-обёртка над _cmd_report."""
         cid = call.message.chat.id
-        self._show_accounts(cid, call.message)
-
-        if not active_threads:
-            text = "Потоков нет."
-        else:
-            lines = [
-                f"{'🟢' if t.is_alive() else '🔴'} {t.name}: "
-                f"{'работает' if t.is_alive() else 'завершён'}"
-                for t in active_threads
-            ]
-            text = "\n".join(lines)
         try:
-            self._send(cid, text, kb_back())
-        except Exception:
-            pass
-
-    def _cb_acc_stop(self, call):
-        """Stop a specific account"""
-        cid = call.message.chat.id
-        idx = int(call.data.replace("acc_stop_", ""))
-
-        # G2: читаем аккаунты из единого источника (accounts.json → legacy cfg).
-        accounts = self._accounts()
-        if 0 <= idx < len(accounts):
-            acc_name = accounts[idx]["name"]
-            get_account_stop_event(acc_name).set()
-            add_log(f"🛑 Stop signal sent for account {acc_name}.", acc_name)
-            self.bot.answer_callback_query(call.id, f"🛑 Останавливаю {acc_name}...")
-            self._send(cid, f"Сигнал остановки отправлен аккаунту {acc_name}.")
-        self._show_accounts(cid, call.message)
-
-        if not active_threads:
-            text = "Потоков нет."
-        else:
+            since = time.strftime("%Y-%m-%d 00:00:00", time.localtime())
+            title = f"за сегодня ({since[:10]})"
+            db = self._get_db()
+            s = db.get_daily_summary(since)
             lines = [
-                f"{'🟢' if t.is_alive() else '🔴'} {t.name}: "
-                f"{'работает' if t.is_alive() else 'завершён'}"
-                for t in active_threads
+                f"📊 Сводка {title}",
+                "",
+                f"Листингов распарсено: {s.get('listings_parsed', 0)}",
+                f"  ok: {s.get('listings_ok', 0)}  "
+                f"captcha: {s.get('listings_captcha', 0)}  "
+                f"error: {s.get('listings_error', 0)}",
+                "",
+                "Классификация:",
+                f"  собственники: {s.get('classified_owner', 0)}",
+                f"  агенты: {s.get('classified_agent', 0)}",
+                f"  uncertain: {s.get('classified_uncertain', 0)}",
+                "",
+                f"Активных диалогов: {s.get('dialogs_active', 0)}",
+                f"Сообщений всего: {s.get('messages_total', 0)}",
+                "",
+                f"Диалогов обработано: {s.get('dialogs_handled', 0)}",
+                f"Сообщений отправлено: {s.get('messages_sent', 0)}",
+                f"LLM ошибок: {s.get('llm_errors', 0)}",
+                f"Капчей поймано: {s.get('captcha_hits', 0)}",
             ]
-            text = "\n".join(lines)
-        self._edit_or_send(call.message.chat.id, call.message.message_id, text, kb_back())
+            self._edit_or_send(cid, call.message.message_id, "\n".join(lines), kb_back())
+        except Exception as exc:
+            logger.exception("cb_report failed")
+            self._send(cid, f"Ошибка отчёта: {exc}", kb_back())
 
     def _cb_logs(self, call):
         recent = list(log_buffer)[-30:]
@@ -1280,22 +1580,30 @@ class TelegramController:
 
     # ── Аккаунты (K1: все CRUD идёт через accounts.json) ──────────────────
 
-    def _cb_acc_detail(self, call):
+    def _cb_acc_detail(self, call, force_idx=None):
         """Показать карточку аккаунта (callback_data: acc_detail_<idx>)."""
         cid = call.message.chat.id
-        idx = int(call.data.split("_")[-1])
+        idx = force_idx if force_idx is not None else int(call.data.split("_")[-1])
         accs = self._accounts()
         if idx >= len(accs):
             self._send(cid, "Аккаунт не найден.")
             return
         acc = accs[idx]
-        cookie_ok = (self.BASE / acc.get("cookies_path", "")).exists()
+        phone = acc.get("phone") or "❌ не задан"
+        password = acc.get("password", "")
+        pwd_display = "✅ задан" if password else "❌ не задан"
+        adspower = acc.get("adspower_id") or acc.get("user_id") or "❌ не задан"
+        persona = acc.get("persona") or "по умолчанию"
+        captcha_cd = acc.get("captcha_cooldown_minutes") or "глобальный"
+        enabled = "✅ включён" if acc.get("enabled", True) else "💤 disabled"
         text = (
             f"👤 {acc['name']}\n"
-            f"AdsPower ID: {acc.get('user_id') or acc.get('adspower_id') or '❌ НЕ ЗАДАН'}\n"
-            f"Куки: {'✅ есть' if cookie_ok else '❌ нет'}\n"
-            f"Путь: {acc.get('cookies_path', '—')}\n"
-            f"Enabled: {'✅' if acc.get('enabled', True) else '💤 (disabled)'}"
+            f"📞 Телефон: {phone}\n"
+            f"🔑 Пароль: {pwd_display}\n"
+            f"🆔 AdsPower: {adspower}\n"
+            f"👤 Персона: {persona}\n"
+            f"🧊 Капча кулдаун: {captcha_cd} мин\n"
+            f"💬 Статус: {enabled}"
         )
         self._edit_or_send(cid, call.message.message_id, text, kb_account_detail(idx))
 
@@ -1303,17 +1611,6 @@ class TelegramController:
         cid = call.message.chat.id
         self._set_dialog(cid, "acc_add_name")
         self._send(cid, "Введи имя нового аккаунта:")
-
-    def _cb_acc_cookies(self, call):
-        """Запрос обновления cookies для существующего аккаунта (acc_cookies_<idx>)."""
-        cid = call.message.chat.id
-        idx = int(call.data.split("_")[-1])
-        accs = self._accounts()
-        if idx >= len(accs):
-            self._send(cid, "Аккаунт не найден.")
-            return
-        self._set_dialog(cid, "acc_update_cookies", {"idx": idx})
-        self._send(cid, f"Отправь новый cookies.json для '{accs[idx]['name']}':")
 
     def _cb_acc_userid(self, call):
         """Запрос ввода AdsPower User ID для аккаунта (acc_userid_<idx>)."""
@@ -1325,6 +1622,79 @@ class TelegramController:
             return
         self._set_dialog(cid, "acc_set_userid", {"idx": idx})
         self._send(cid, f"Введите AdsPower User ID для аккаунта '{accs[idx]['name']}':")
+
+    def _cb_acc_phone(self, call):
+        """Запрос ввода телефона для аккаунта (acc_phone_<idx>)."""
+        cid = call.message.chat.id
+        idx = int(call.data.split("_")[-1])
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        self._set_dialog(cid, "acc_set_phone", {"idx": idx})
+        self._send(cid, f"Введите телефон для '{accs[idx]['name']}' (например +79673639403):")
+
+    def _cb_acc_password(self, call):
+        """Запрос ввода пароля для аккаунта (acc_password_<idx>)."""
+        cid = call.message.chat.id
+        idx = int(call.data.split("_")[-1])
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        self._set_dialog(cid, "acc_set_password", {"idx": idx})
+        self._send(cid, f"Введите пароль для '{accs[idx]['name']}':")
+
+    def _cb_acc_persona(self, call):
+        """Запрос ввода персоны для аккаунта (acc_persona_<idx>)."""
+        cid = call.message.chat.id
+        idx = int(call.data.split("_")[-1])
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        current = accs[idx].get("persona") or "по умолчанию"
+        self._set_dialog(cid, "acc_set_persona", {"idx": idx})
+        self._send(
+            cid,
+            f"Текущая персона: {current}\n\n"
+            f"Введите имя персоны для '{accs[idx]['name']}' "
+            f"(стиль общения в чате). Или /skip для сброса:",
+        )
+
+    def _cb_acc_captcha_cd(self, call):
+        """Запрос ввода captcha_cooldown_minutes (acc_captcha_cd_<idx>)."""
+        cid = call.message.chat.id
+        idx = int(call.data.split("_")[-1])
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        current = accs[idx].get("captcha_cooldown_minutes") or "глобальный"
+        self._set_dialog(cid, "acc_set_captcha_cd", {"idx": idx})
+        self._send(
+            cid,
+            f"Текущий кулдаун: {current}\n\n"
+            f"Введите минуты (напр. 30). 0 = сброс на глобальный из config.json:",
+        )
+
+    def _cb_acc_toggle(self, call):
+        """Переключить enabled/disabled для аккаунта (acc_toggle_<idx>)."""
+        cid = call.message.chat.id
+        idx = int(call.data.split("_")[-1])
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        acc = accs[idx]
+        new_state = not acc.get("enabled", True)
+        from accounts import update_account
+
+        update_account(self.BASE, acc["name"], {"enabled": new_state}, cfg=self._cfg())
+        status = "включён ✅" if new_state else "отключён 💤"
+        self.bot.answer_callback_query(call.id, f"Аккаунт {status}")
+        # Обновляем карточку — вызываем напрямую вместо мутации call.data
+        self._cb_acc_detail(call, force_idx=idx)
 
     def _cb_acc_del_confirm(self, call):
         """Подтверждение удаления аккаунта (acc_del_<idx>, НЕ acc_del_ok_)."""
@@ -1364,6 +1734,7 @@ class TelegramController:
             return
         if not removed:
             self._send(cid, f"Аккаунт '{acc_name}' не найден.", kb_back("accounts_menu"))
+            return
         self._show_accounts(cid, call.message)
 
     # ── T12: Большой прогрев аккаунта ────────────────────────────────────
@@ -1384,16 +1755,17 @@ class TelegramController:
             self._send(cid, "Аккаунт не найден.")
             return
         name = accs[idx]["name"]
-        if name in self._big_warmup_running:
-            self._send(
-                cid,
-                f"⚠️ Большой прогрев для '{name}' уже идёт.",
-                kb_account_detail(idx),
-            )
-            return
+        with self._big_warmup_lock:
+            if name in self._big_warmup_running:
+                self._send(
+                    cid,
+                    f"⚠️ Большой прогрев для '{name}' уже идёт.",
+                    kb_account_detail(idx),
+                )
+                return
         # Если основной цикл бота крутится для этого аккаунта — нельзя:
         # AdsPower-профиль будет занят, start_profile упадёт.
-        if any(t.is_alive() and t.name == f"acc-{name}" for t in active_threads):
+        if _is_account_thread_alive(name):
             self._send(
                 cid,
                 (
@@ -1431,10 +1803,12 @@ class TelegramController:
             return
         account = accs[idx]
         name = account["name"]
-        if name in self._big_warmup_running:
-            self._send(cid, f"⚠️ Прогрев для '{name}' уже идёт.")
-            return
-        self._big_warmup_running.add(name)
+        # Атомарная проверка+add: защищаем от двойного клика (TOCTOU)
+        with self._big_warmup_lock:
+            if name in self._big_warmup_running:
+                self._send(cid, f"⚠️ Прогрев для '{name}' уже идёт.")
+                return
+            self._big_warmup_running.add(name)
         self._send(
             cid,
             (
@@ -1459,7 +1833,10 @@ class TelegramController:
             from bot import AdsPowerAPI, run_big_warmup_for_account
 
             cfg = self._cfg()
-            adspower = AdsPowerAPI(cfg["adspower_api_url"], cfg.get("adspower_api_key"))
+            adspower_url = cfg.get("adspower_api_url", "")
+            if not adspower_url:
+                raise RuntimeError("adspower_api_url не задан в конфиге")
+            adspower = AdsPowerAPI(adspower_url, cfg.get("adspower_api_key"))
             result = run_big_warmup_for_account(account, cfg, adspower)
             if result.get("ok"):
                 stats = result.get("stats") or {}
@@ -1513,14 +1890,19 @@ class TelegramController:
         if name in self._big_warmup_running:
             self.bot.reply_to(message, f"⚠️ Прогрев '{name}' уже идёт.")
             return
-        if any(t.is_alive() and t.name == f"acc-{name}" for t in active_threads):
+        if _is_account_thread_alive(name):
             self.bot.reply_to(
                 message,
                 f"⚠️ Аккаунт '{name}' сейчас работает в основном цикле бота. "
                 f"Останови бота и запусти прогрев заново.",
             )
             return
-        self._big_warmup_running.add(name)
+        # Атомарная проверка+add под локом — убираем TOCTOU
+        with self._big_warmup_lock:
+            if name in self._big_warmup_running:
+                self.bot.reply_to(message, f"⚠️ Прогрев '{name}' уже идёт.")
+                return
+            self._big_warmup_running.add(name)
         self.bot.reply_to(
             message,
             (
@@ -1590,22 +1972,20 @@ class TelegramController:
             f"Текущий URL:\n{cfg.get('target_url', '—')}\n\nОтправь новую ссылку на объявление:",
         )
 
-    def _cb_set_sphere_key(self, call):
-        cid = call.message.chat.id
-        self._set_dialog(cid, "set_sphere_key")
-        self._send(cid, "Отправь API-ключ Sphere:")
-
     def _cb_set_openai_key(self, call):
         cid = call.message.chat.id
         self._set_dialog(cid, "set_openai_key")
-        self._send(cid, "Отправь OpenAI API Key:")
+        self._send(cid, "Отправь DeepSeek API Key:")
 
     def _cb_set_openai_model(self, call):
         cid = call.message.chat.id
         self._set_dialog(cid, "set_openai_model")
         cfg = self._cfg()
-        cur = cfg.get("openai_model", "gpt-3.5-turbo")
-        self._send(cid, f"Текущая модель: {cur}\n\nОтправь название новой модели (напр. gpt-4o):")
+        cur = cfg.get("openai_model", "deepseek-v4-flash")
+        self._send(
+            cid,
+            f"Текущая модель: {cur}\n\nОтправь название новой модели (напр. deepseek-v4-flash, deepseek-chat):",
+        )
 
     def _cb_set_adspower_url(self, call):
         cid = call.message.chat.id
@@ -1640,62 +2020,6 @@ class TelegramController:
             f"Текущие ключевые слова:\n{current}\n\nОтправь новый список (по одному на строку):",
         )
 
-    # ── Классификация ──────────────────────────────────────────────────────
-
-    def _cb_reclassify_all(self, call):
-        cid = call.message.chat.id
-        try:
-            from listing_classifier import ListingClassifier
-
-            db_manager = self._get_db()
-            # L4: один _cfg() вместо двух — не дёргаем диск дважды.
-            cfg = self._cfg()
-            llm_config = {
-                "api_key": cfg.get("openai_api_key", ""),
-                "model": cfg.get("openai_model", "gpt-3.5-turbo"),
-            }
-            classifier = ListingClassifier(db_manager, llm_config)
-            results = classifier.classify_all_listings()
-            text = (
-                f"Переклассификация завершена:\n"
-                f"Всего обработано: {results['total_processed']}\n"
-                f"Собственники: {results['owners']}\n"
-                f"Агенты: {results['agents']}\n"
-                f"Неопределенные: {results['uncertain']}"
-            )
-            self._send(cid, text, kb_classification())
-        except Exception as e:
-            self._send(cid, f"Ошибка переклассификации: {str(e)}", kb_classification())
-
-    def _cb_classification_stats(self, call):
-        # K3: используем DatabaseManager.get_classification_stats() вместо
-        # прямого sqlite3.connect (соблюдаем AGENTS.md "Never bypass
-        # DatabaseManager"). Раньше: ручной conn без WAL/busy_timeout,
-        # без write_lock, без надёжного close при exception.
-        cid = call.message.chat.id
-        try:
-
-            stats = self._get_db().get_classification_stats()
-            if not stats["total"]:
-                self._send(cid, "📊 Нет классифицированных объявлений.", kb_classification())
-            else:
-                lines = ["📊 Статистика классификации:"]
-                for label, count in sorted(stats["by_label"].items()):
-                    lines.append(f"{label}: {count}")
-                lines.append(f"Всего: {stats['total']}")
-                self._send(cid, "\n".join(lines), kb_classification())
-        except Exception as e:
-            logger.exception("classification_stats failed")
-            self._send(cid, f"Ошибка получения статистики: {e}", kb_classification())
-
-    def _cb_create_ground_truth(self, call):
-        # Stub: triggers ground-truth dataset creation flow.
-        self._send(call.message.chat.id, "Создание разметки 50 объявлений...", kb_classification())
-
-    def _cb_evaluate_quality(self, call):
-        # Stub: triggers classification-quality evaluation script.
-        self._send(call.message.chat.id, "Оценка качества классификации...", kb_classification())
-
     # ── Главный диспетчер callback-кнопок ─────────────────────────────────
 
     def _on_callback(self, call):
@@ -1727,9 +2051,12 @@ class TelegramController:
             # acc_bigwarmup_ok_5 заматчится как acc_bigwarmup_ с idx="ok".
             ("acc_bigwarmup_ok_", self._cb_acc_bigwarmup_ok),
             ("acc_bigwarmup_", self._cb_acc_bigwarmup_confirm),
-            ("acc_stop_", self._cb_acc_stop),
-            ("acc_cookies_", self._cb_acc_cookies),
             ("acc_userid_", self._cb_acc_userid),
+            ("acc_phone_", self._cb_acc_phone),
+            ("acc_password_", self._cb_acc_password),
+            ("acc_persona_", self._cb_acc_persona),
+            ("acc_captcha_cd_", self._cb_acc_captcha_cd),
+            ("acc_toggle_", self._cb_acc_toggle),
             ("proxy_del_ok_", self._cb_proxy_del_ok),
             ("proxy_del_confirm_", self._cb_proxy_del_confirm),
         )
@@ -1745,11 +2072,10 @@ class TelegramController:
             "accounts_menu": self._cb_accounts_menu,
             "proxies_menu": self._cb_proxies_menu,
             "settings_menu": self._cb_settings_menu,
-            "classification_menu": self._cb_classification_menu,
             # Управление
             "run": self._cb_run,
             "stop": self._cb_stop,
-            "status": self._cb_status,
+            "report": self._cb_report,
             "logs": self._cb_logs,
             # Аккаунты
             "acc_add": self._cb_acc_add,
@@ -1758,18 +2084,12 @@ class TelegramController:
             "proxy_replace": self._cb_proxy_replace,
             # Настройки
             "set_url": self._cb_set_url,
-            "set_sphere_key": self._cb_set_sphere_key,
             "set_openai_key": self._cb_set_openai_key,
             "set_openai_model": self._cb_set_openai_model,
             "set_adspower_url": self._cb_set_adspower_url,
             "set_adspower_key": self._cb_set_adspower_key,
             "set_threads": self._cb_set_threads,
             "set_keywords": self._cb_set_keywords,
-            # Классификация
-            "reclassify_all": self._cb_reclassify_all,
-            "classification_stats": self._cb_classification_stats,
-            "create_ground_truth": self._cb_create_ground_truth,
-            "evaluate_quality": self._cb_evaluate_quality,
         }
         handler = exact_handlers.get(d)
         if handler:

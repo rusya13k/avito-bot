@@ -103,26 +103,6 @@ def test_handle_dialog_blocks_when_not_allowed(tg_ctrl, monkeypatch):
     assert called == []
 
 
-def test_handle_dialog_acc_add_cookies_and_update_share_handler(tg_ctrl, monkeypatch):
-    """acc_add_cookies и acc_update_cookies маппятся на ОДИН метод
-    _dialog_acc_cookies (отличаются только data["idx"])."""
-    calls = []
-
-    def fake_handler(message, data):
-        calls.append(data.get("idx"))
-
-    monkeypatch.setattr(tg_ctrl, "_dialog_acc_cookies", fake_handler)
-
-    # acc_add_cookies → idx=None
-    tg_ctrl._state[100] = {"state": "acc_add_cookies", "data": {"name": "newone"}}
-    tg_ctrl._handle_dialog(_make_message(chat_id=100))
-    # acc_update_cookies → idx=число
-    tg_ctrl._state[200] = {"state": "acc_update_cookies", "data": {"idx": 5}}
-    tg_ctrl._handle_dialog(_make_message(chat_id=200))
-
-    assert calls == [None, 5]
-
-
 # ── _on_callback ─────────────────────────────────────────────────────────────
 
 

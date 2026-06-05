@@ -34,6 +34,7 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -218,7 +219,9 @@ def _generate_first_message(llm_classifier, listing: dict, persona_id: str) -> s
         except Exception as exc:
             logger.warning(
                 "outbound: generate_first_message attempt %d/%d failed: %s",
-                attempt + 1, max_attempts, exc,
+                attempt + 1,
+                max_attempts,
+                exc,
             )
             if attempt < max_attempts - 1:
                 time.sleep(3)
@@ -394,14 +397,13 @@ class OutboundMessenger:
             if "avito.ru" not in current:
                 self.driver.get("https://www.avito.ru/")
                 _human_delay(
-                    2, 4,
+                    2,
+                    4,
                     stop_event=_tg.get_account_stop_event(self.account_name),
                     distribution="normal",
                 )
             # Переход на листинг через JS — сохраняет referrer текущей страницы
-            self.driver.execute_script(
-                "window.location.href = arguments[0];", listing_url
-            )
+            self.driver.execute_script("window.location.href = arguments[0];", listing_url)
         except WebDriverException as exc:
             log_func(self.account_name, f"H1: navigate to {listing_url} fail: {exc}")
             return False
@@ -506,6 +508,11 @@ class OutboundMessenger:
         способами (textarea / contenteditable / overlay), пробуем варианты.
         """
         input_xpaths = [
+            # Приоритет 1: icebreakers/textarea — основной видимый input Avito
+            "//textarea[@data-marker='icebreakers/textarea']",
+            # Приоритет 2: reply/input
+            "//textarea[@data-marker='reply/input']",
+            # Приоритет 3: другие
             "//textarea[@data-marker='message-input']",
             "//*[@data-marker='message-input']//textarea",
             "//textarea[contains(@placeholder, 'Сообщение')]",
@@ -517,7 +524,7 @@ class OutboundMessenger:
         for xpath in input_xpaths:
             try:
                 input_el = WebDriverWait(self.driver, 4).until(
-                    EC.element_to_be_clickable((By.XPATH, xpath))
+                    EC.visibility_of_element_located((By.XPATH, xpath))
                 )
                 break
             except TimeoutException:
@@ -532,6 +539,15 @@ class OutboundMessenger:
             self.driver, input_el, stop_event=_tg.get_account_stop_event(self.account_name)
         )
         _human_delay(0.4, 1.2, stop_event=_tg.get_account_stop_event(self.account_name))
+
+        # Очистка поля: Avito предзаполняет icebreakers/textarea текстом
+        # вроде «Здравствуйте! ». Без очистки сообщение обрезается.
+        try:
+            input_el.send_keys(Keys.CONTROL + "a")
+            input_el.send_keys(Keys.DELETE)
+            _human_delay(0.2, 0.4, stop_event=_tg.get_account_stop_event(self.account_name))
+        except Exception:
+            pass
 
         # T5: реалистичный typing — бёрсты + опечатки + persona-driven темп.
         # Раньше: уравномерно 30-90ms/char (антифрод детектил по гистограмме).
@@ -561,35 +577,55 @@ class OutboundMessenger:
 
         _human_delay(1.5, 3.5, stop_event=_tg.get_account_stop_event(self.account_name))
 
-        # Кнопка Send: data-marker='send-message-button' или icon-кнопка.
-        send_xpaths = [
-            "//button[@data-marker='send-message-button']",
-            "//*[@data-marker='send-message-button']",
-            "//button[contains(., 'Отправить')]",
-            "//button[@type='submit']",
-        ]
-        send_el = None
-        for xpath in send_xpaths:
+        # Avito 2026: кнопка отправки — <svg role="button" data-marker="icebreakers/send-message">.
+        # arguments[0].click() на SVG не работает (React не ловит программный клик).
+        # Надёжный способ: Enter в textarea. Запасной: dispatchEvent на SVG.
+
+        # Способ 1: Enter в textarea
+        try:
+            input_el.send_keys(Keys.ENTER)
+            log_func(self.account_name, "H1: сообщение отправлено (Enter в textarea).")
+        except Exception:
+            log_func(self.account_name, "H1: Enter не удался, пробуем SVG-кнопку...")
+
+            # Способ 2: dispatchEvent на SVG
             try:
-                send_el = WebDriverWait(self.driver, 3).until(
-                    EC.element_to_be_clickable((By.XPATH, xpath))
+                clicked = self.driver.execute_script(
+                    """
+                    var svg = document.querySelector(
+                        '[data-marker="icebreakers/send-message"]'
+                    ) || document.querySelector('[data-marker="send-message-button"]');
+                    if (!svg) return false;
+                    svg.dispatchEvent(new MouseEvent('click', {
+                        bubbles: true, cancelable: true, view: window
+                    }));
+                    return true;
+                    """
                 )
-                break
-            except TimeoutException:
-                continue
-
-        if send_el is None:
-            log_func(self.account_name, "H1: кнопка Отправить не найдена.")
-            return False
-
-        # T6: human_click сам делает scrollIntoView + Bezier-движение +
-        # fallback'и (native click → JS click) — старая обвязка с
-        # ElementClickInterceptedException больше не нужна.
-        if not _human_click(
-            self.driver, send_el, stop_event=_tg.get_account_stop_event(self.account_name)
-        ):
-            log_func(self.account_name, "H1: не удалось кликнуть Send (все 3 пути упали).")
-            return False
+                if clicked:
+                    log_func(self.account_name, "H1: сообщение отправлено (SVG dispatchEvent).")
+                else:
+                    raise RuntimeError("SVG not found")
+            except Exception:
+                # Способ 3: human_click
+                try:
+                    send_el = self.driver.find_element(
+                        By.CSS_SELECTOR, "[data-marker='icebreakers/send-message']"
+                    )
+                    if _human_click(
+                        self.driver,
+                        send_el,
+                        stop_event=_tg.get_account_stop_event(self.account_name),
+                    ):
+                        log_func(
+                            self.account_name, "H1: сообщение отправлено (human_click на SVG)."
+                        )
+                    else:
+                        log_func(self.account_name, "H1: все способы отправки упали.")
+                        return False
+                except Exception:
+                    log_func(self.account_name, "H1: все способы отправки упали.")
+                    return False
 
         _human_delay(2, 5, stop_event=_tg.get_account_stop_event(self.account_name))
 

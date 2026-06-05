@@ -726,6 +726,13 @@ class AccountState:
                 return False
             return int(dialog_id) in entry.ignored_dialogs
 
+    def unignore_dialog(self, account_name: str, dialog_id: int) -> None:
+        """Снять пометку ignored с диалога (ответить вопреки предыдущему решению)."""
+        with self._lock:
+            entry = self._entries.get(account_name)
+            if entry is not None:
+                entry.ignored_dialogs.pop(int(dialog_id), None)
+
     def _evict_ignored_dialogs(self, entry: _Entry) -> None:
         """Удаляет записи старше 7 дней из ignored_dialogs. Вызывать под lock."""
         cutoff = time.time() - 7 * 86400

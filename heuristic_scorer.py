@@ -105,8 +105,8 @@ class HeuristicScorer:
         # Сигнал 1: много активных объявлений
         # Приоритет: реальный счётчик из профиля продавца (если визит был),
         # иначе fallback на количество в нашей БД.
-        active_listings = listing_data.get("active_listings_count") or 0
-        if active_listings == 0:
+        active_listings = listing_data.get("active_listings_count")
+        if active_listings is None:
             active_listings = self.count_active_listings_signal(profile_id)
         if active_listings > w["active_listings_threshold"]:
             contrib = w["active_listings_weight"]
@@ -122,9 +122,7 @@ class HeuristicScorer:
             score += contrib
             msg = f"похожих объявлений в недвижимости: {similar_listings}"
             reasons.append(msg)
-            self._add_signal(
-                breakdown, "similar_listings_count", similar_listings, contrib, msg
-            )
+            self._add_signal(breakdown, "similar_listings_count", similar_listings, contrib, msg)
 
         # Сигнал 2: телефон встречается в N+ листингах
         phone_count = self.phone_frequency_signal(phone)

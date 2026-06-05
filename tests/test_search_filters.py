@@ -32,6 +32,7 @@ def _driver_no_links():
 def _db():
     db = MagicMock()
     db.is_new_listing.return_value = True
+    db.is_listing_url_seen.return_value = False  # D6: нет просмотренных
     return db
 
 

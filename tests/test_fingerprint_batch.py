@@ -37,7 +37,9 @@ def test_scroll_gallery_uses_random_iters():
         scroll_gallery(driver, wait)
 
     # Проверяем что random.choices вызывался (weighted distribution).
-    assert mock_rng.choices.call_count >= 1, "scroll_gallery должен делать random.choices (weighted)"
+    assert mock_rng.choices.call_count >= 1, (
+        "scroll_gallery должен делать random.choices (weighted)"
+    )
 
 
 def test_view_listing_calls_scroll_only_with_60pct_probability():
