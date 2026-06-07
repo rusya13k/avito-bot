@@ -79,24 +79,24 @@ def test_handle_dialog_dispatches_by_state(tg_ctrl, monkeypatch):
     called = {"name": None, "data": None}
 
     def fake_handler(message, data):
-        called["name"] = "proxy_add"
+        called["name"] = "set_url"
         called["data"] = data
 
-    monkeypatch.setattr(tg_ctrl, "_dialog_proxy_add", fake_handler)
+    monkeypatch.setattr(tg_ctrl, "_dialog_set_url", fake_handler)
 
-    tg_ctrl._state[123] = {"state": "proxy_add", "data": {"x": 1}}
-    tg_ctrl._handle_dialog(_make_message(text="my-proxy"))
+    tg_ctrl._state[123] = {"state": "set_url", "data": {"x": 1}}
+    tg_ctrl._handle_dialog(_make_message(text="https://avito.ru/123"))
 
-    assert called["name"] == "proxy_add"
+    assert called["name"] == "set_url"
     assert called["data"] == {"x": 1}
 
 
 def test_handle_dialog_blocks_when_not_allowed(tg_ctrl, monkeypatch):
     """_allowed=False → handler НЕ вызывается."""
     called = []
-    monkeypatch.setattr(tg_ctrl, "_dialog_proxy_add", lambda m, d: called.append("called"))
+    monkeypatch.setattr(tg_ctrl, "_dialog_set_url", lambda m, d: called.append("called"))
 
-    tg_ctrl._state[123] = {"state": "proxy_add", "data": {}}
+    tg_ctrl._state[123] = {"state": "set_url", "data": {}}
     msg = _make_message(user_id=999)  # not admin_id=42
     tg_ctrl._handle_dialog(msg)
 
@@ -193,20 +193,3 @@ def test_on_callback_b1_res_routed_to_special_handler(tg_ctrl, monkeypatch):
 
     tg_ctrl._on_callback(_make_call(callback_data="b1_res_abc123_c"))
     assert received == ["b1_res_abc123_c"]
-
-
-def test_on_callback_proxy_del_ok_wins_over_proxy_del_confirm(tg_ctrl, monkeypatch):
-    """proxy_del_ok_5 → _cb_proxy_del_ok (НЕ proxy_del_confirm).
-    Хотя proxy_del_confirm длиннее, чем proxy_del_, разница в том что у
-    нас нет prefix 'proxy_del_' — есть 'proxy_del_ok_' и 'proxy_del_confirm_'.
-    Тест проверяет что они корректно разделены."""
-    confirm_calls = []
-    ok_calls = []
-    monkeypatch.setattr(tg_ctrl, "_cb_proxy_del_confirm", lambda c: confirm_calls.append(c.data))
-    monkeypatch.setattr(tg_ctrl, "_cb_proxy_del_ok", lambda c: ok_calls.append(c.data))
-
-    tg_ctrl._on_callback(_make_call(callback_data="proxy_del_ok_5"))
-    tg_ctrl._on_callback(_make_call(callback_data="proxy_del_confirm_5"))
-
-    assert ok_calls == ["proxy_del_ok_5"]
-    assert confirm_calls == ["proxy_del_confirm_5"]
