@@ -22,6 +22,7 @@ import platform
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -99,21 +100,29 @@ def _start_chrome(
         # флаги после URL на Windows). cmd_template[0]=chrome_bin, [-1]=URL.
         cmd = cmd_template[:-1] + [f"--remote-debugging-port={port}", cmd_template[-1]]
 
-        # На Windows открываем nul явно — subprocess.DEVNULL глючит с
-        # UnicodeDecodeError в _readerthread при бинарном выводе Chrome
-        with open(os.devnull, "wb") as nul:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=nul,
-                stderr=nul,
-            )
+        # Stderr пишем во временный файл — при падении сможем прочитать причину.
+        # На Windows stdout=nul в open глючит с UnicodeDecodeError (см. код),
+        # поэтому stdout тоже в файл.
+        stderr_tmp = tempfile.TemporaryFile()
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_tmp,
+        )
 
         try:
             _wait_chrome_ready(port)
+            stderr_tmp.close()
             return proc, port
         except RuntimeError:
-            # Chrome не стартанул — убиваем и пробуем другой порт
-            _logger.warning("Chrome start attempt %d failed on port %d", attempt + 1, port)
+            # Chrome не стартанул — читаем stderr чтобы понять почему
+            stderr_tmp.seek(0)
+            stderr_data = stderr_tmp.read().decode("utf-8", errors="replace")[:500]
+            stderr_tmp.close()
+            _logger.warning(
+                "Chrome start attempt %d failed on port %d. Stderr: %s",
+                attempt + 1, port, stderr_data or "(empty)",
+            )
             try:
                 proc.kill()
                 proc.wait(timeout=5)
@@ -439,6 +448,15 @@ class ChromeLauncher:
 
         # --disable-gpu для headless-серверов без видеокарты
         cmd.append("--disable-gpu")
+
+        # Headless-режим на Linux-серверах без X-сервера.
+        # Включается если:
+        #   1. Явно задан CHROME_HEADLESS=1 (env)
+        #   2. Или Linux + нет DISPLAY (нет X-сервера)
+        if os.environ.get("CHROME_HEADLESS") == "1" or (
+            platform.system() == "Linux" and not os.environ.get("DISPLAY")
+        ):
+            cmd.append("--headless=new")
 
         # Дополнительные флаги
         if extra_flags:
