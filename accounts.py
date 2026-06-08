@@ -367,9 +367,9 @@ def add_account(
 
     with _WRITE_LOCK:
         # Внутри лока: re-read, mutate, write — чтобы не потерять параллельные
-        # изменения. _WRITE_LOCK реентрантным НЕ является, поэтому save_accounts
-        # тоже не должен брать его — он берёт свой; но мы пишем БЕЗ помощи
-        # save_accounts, чтобы избежать двойного захвата.
+        # изменения. _WRITE_LOCK реентрантным НЕ является, поэтому пишем через
+        # _atomic_write -> save_accounts(_skip_lock=True), которая пропускает
+        # захват своего лока.
         all_accs = load_all_accounts(repo_dir, cfg)
         if any(a["name"] == name for a in all_accs):
             raise ValueError(f"add_account: аккаунт {name!r} уже существует")

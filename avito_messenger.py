@@ -132,7 +132,7 @@ def _avito_time_to_iso(time_text: str) -> str | None:
         hour, minute = int(m.group(4)), int(m.group(5))
         if month:
             try:
-                return datetime(year, month, day, hour, minute, 0).strftime("%Y-%m-%d %H:%M:%S")
+                return datetime.datetime(year, month, day, hour, minute, 0).strftime("%Y-%m-%d %H:%M:%S")
             except ValueError:
                 pass
 

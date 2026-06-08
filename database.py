@@ -585,11 +585,13 @@ class DatabaseManager:
             out["messages_total"] = (cur.fetchone() or (0,))[0] or 0
 
             # E2: подмешиваем счётчики из metrics за тот же период.
-            # `since_date` имеет формат 'YYYY-MM-DD HH:MM:SS' и
-            # сравнивается лексикографически с bucket_hour (тоже строкой).
+            # bucket_hour округлён до HH:00:00, а since_date может быть
+            # HH:MM:SS — лексикографическое сравнение отсечёт текущий час.
+            # Округляем since_date до начала часа.
+            since_hour = since_date[:14] + "00:00"
             cur.execute(
                 "SELECT metric, SUM(value) FROM metrics WHERE bucket_hour >= ? GROUP BY metric",
-                (since_date,),
+                (since_hour,),
             )
             counters = {m: int(v or 0) for m, v in cur.fetchall()}
             # Только те метрики, которые имеет смысл показывать в общей
@@ -1564,9 +1566,12 @@ class DatabaseManager:
             return cur.rowcount > 0
 
     def get_owners_to_contact(
-        self, account_name: str, limit: int = 10, *, min_age_hours: float = 0.0
+        self, _account_name: str, limit: int = 10, *, min_age_hours: float = 0.0
     ) -> list:
-        """H1: вернуть кандидатов для outbound от этого аккаунта.
+        """H1: вернуть кандидатов для outbound.
+
+        Параметр _account_name зарезервирован для будущей per-account фильтрации;
+        сейчас dedup глобальный (по profile_id), что корректно.
 
         Критерии:
           - listing.classification = 'owner'

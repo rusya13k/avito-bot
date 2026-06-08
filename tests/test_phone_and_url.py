@@ -44,8 +44,8 @@ def test_extract_phones_finds_multiple():
     assert "+74951234567" in phones
     assert "+79165552233" in phones
     assert "+78129990011" in phones
-    assert "+14155550123" in phones
-    assert len(phones) == 4
+    # US-номер +1 415... не начинается с +7/8 — корректно отфильтрован
+    assert len(phones) == 3
 
 
 def test_extract_phones_dedups():

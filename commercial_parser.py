@@ -1,5 +1,4 @@
 import logging
-import random
 import re
 import time
 
@@ -8,12 +7,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-import tg_bot as _tg
-from account_state import account_state
-from captcha_detect import detect_phone_captcha
-from human_delay import human_delay
-from human_mouse import human_click as _human_click
-
 # E1: модульный logger. Раньше парсер писал только через переданный
 # log_func (account-aware строки в TG-буфер). Теперь критичные ошибки —
 # через logger.exception, чтобы алерт-хендлер их увидел.
@@ -21,13 +14,8 @@ logger = logging.getLogger(__name__)
 
 # Module for parsing commercial real estate listings from Avito
 
-# Внутренний sentinel-ключ в listing_data: True -> при сохранении в БД
-# проставим parse_status='captcha'. Не часть schema и не предназначен
-# для внешних потребителей.
-_CAPTCHA_FLAG = "_a3_captcha_hit"
-
-# A3: флаг в listing_data: True -> при сохранении инкрементируем метрику phone_clicks.
-_PHONE_CLICKED_FLAG = "_a3_phone_clicked"
+# A3 (удалён): _try_show_phone, флаги _CAPTCHA_FLAG/_PHONE_CLICKED_FLAG
+# и метрика phone_clicks — убраны по решению Бакугана. Телефон всегда None.
 
 
 def _wf(driver, xpath, timeout=3):
@@ -80,7 +68,7 @@ def normalize_phone(phone_text):
 # Покрывает форматы: +7..., 8..., (495) ..., с разделителями любыми.
 # Минимум 10 цифр в кандидате (после удаления всего нецифрового).
 _PHONE_RE = re.compile(
-    r"(?:\+?\d[\d\s\-\(\)]{8,}\d)",
+    r"(?:\+?[78][\d\s\-\(\)]{8,}\d)",
     flags=re.UNICODE,
 )
 
@@ -540,109 +528,7 @@ def _extract_coordinates(driver) -> dict:
         return {}
 
 
-def _try_show_phone(driver, account_name: str, log_func, listing_data: dict) -> None:
-    """A3: попытка клика «Показать телефон» с многоуровневыми проверками.
 
-    Этапы (в порядке гарантированной строгости):
-      1. captcha-cooldown — аккаунт «остывает» после прошлой капчи
-      2. Дневной in-memory лимит (should_skip_phone — hard limit + prev session >5)
-      3. Session soft-limit: random.random() < 0.3 (кликаем только в 30% случаев)
-      4. Pre-click captcha check
-      5. Сам клик + 30-90s human_delay
-      6. Post-click captcha check / попытка прочесть номер
-
-    Мутирует listing_data:
-      listing_data["phone"]            -> str | None
-      listing_data[_CAPTCHA_FLAG]      -> True если поймали капчу
-      listing_data[_PHONE_CLICKED_FLAG] -> True если успешно прочли номер
-    """
-    listing_data["phone"] = None
-
-    if account_state.is_cooled_down(account_name):
-        log_func(
-            account_name,
-            f"Skip 'Показать телефон' — аккаунт в cooldown ещё "
-            f"{account_state.cooldown_remaining_seconds(account_name)}s",
-        )
-        return
-    if account_state.should_skip_phone(account_name):
-        # A3: дневной hard-limit достигнут ИЛИ предыдущая сессия >5 кликов
-        log_func(account_name, "A3: Пропуск 'Показать телефон' — дневной/сессионный лимит")
-        return
-    if random.random() >= 0.3:
-        # A3: session soft-limit — кликаем только в ~30% случаев
-        log_func(account_name, "A3: Пропуск 'Показать телефон' — session soft-limit (30%)")
-        return
-    if detect_phone_captcha(driver, log_func=log_func, account_name=account_name):
-        log_func(account_name, "Капча обнаружена ДО клика 'Показать телефон' — пропускаем")
-        listing_data[_CAPTCHA_FLAG] = True
-        # T17: phone-page капча, но клик ещё НЕ был — это «листинг-уровень»
-        # (не наш клик триггерил). Менее опасно, чем пост-клик ниже.
-        account_state.mark_captcha(account_name, captcha_type="avito_listing")
-        return
-
-    try:
-        phone_btn = driver.find_element(
-            By.XPATH,
-            "//button[@data-marker='item-phone-button/card']"
-            " | //button[@data-marker='item-phone-button/header']",
-        )
-        # T6: «Показать телефон» — самое палевное действие, кликаем
-        # через Bezier-движение курсора + jitter, не «телепорт-click».
-        _human_click(driver, phone_btn, stop_event=_tg.get_account_stop_event(account_name))
-        # A3: cooldown 30-90 сек после клика (ранее было 0.8-1.6с).
-        # Реальный пользователь не кликает "Показать телефон" каждые 2 секунды.
-        # uniform (более равномерный), чтобы не быть предсказуемым.
-        human_delay(
-            30, 90, stop_event=_tg.get_account_stop_event(account_name), distribution="uniform"
-        )
-    except Exception as e:
-        log_func(account_name, f"Ошибка клика 'Показать телефон': {e}")
-        return
-
-    # Post-click captcha check
-    if detect_phone_captcha(driver, log_func=log_func, account_name=account_name):
-        log_func(
-            account_name,
-            "!!! Капча после клика 'Показать телефон' — аккаунт уйдёт в cooldown",
-        )
-        listing_data[_CAPTCHA_FLAG] = True
-        # T17: avito_phone — самый опасный тип (×2 multiplier).
-        # Сам бот спровоцировал клик, и Avito ответил капчей.
-        account_state.mark_captcha(account_name, captcha_type="avito_phone")
-        return
-
-    try:
-        # После клика номер появляется внутри кнопки или в соседнем элементе.
-        # Новая вёрстка: телефон рендерится как текст внутри item-phone-button
-        # или в отдельном span/a рядом. Пробуем несколько стратегий.
-        phone_elem = WebDriverWait(driver, 5).until(
-            EC.visibility_of_element_located(
-                (
-                    By.XPATH,
-                    "//a[contains(@href,'tel:')]"
-                    " | //button[@data-marker='item-phone-button/card']//span[contains(text(),'+')]"
-                    " | //button[@data-marker='item-phone-button/card']//a"
-                    " | //*[contains(@class,'phone-number')]"
-                    " | //span[@data-marker='item-contact-bar/phone']",
-                )
-            )
-        )
-        phone_text = phone_elem.text or phone_elem.get_attribute("href") or ""
-        # href может быть tel:+79001234567
-        if phone_text.startswith("tel:"):
-            phone_text = phone_text[4:]
-        listing_data["phone"] = normalize_phone(phone_text)
-        # A3: успешный клик — обновляем in-memory счётчики.
-        # Метрика phone_clicks в БД инкрементируется в save_listing_to_db
-        # через флаг _PHONE_CLICKED_FLAG.
-        account_state.record_phone_click(account_name)
-        listing_data[_PHONE_CLICKED_FLAG] = True
-    except TimeoutException:
-        # Телефон не появился, но и капчи нет -> просто не показали номер.
-        log_func(account_name, "Номер не появился после клика (без капчи)")
-    except Exception as inner:
-        log_func(account_name, f"Ошибка чтения номера: {inner}")
 
 
 def _enrich_phones_from_description(listing_data: dict) -> None:
@@ -667,11 +553,10 @@ def _enrich_phones_from_description(listing_data: dict) -> None:
 def extract_listing_data(driver, wait, account_name, log_func):
     """Извлечь данные с открытой страницы листинга в dict.
 
-    Тонкий оркестратор поверх _extract_*-helpers + _try_show_phone +
-    _enrich_phones_from_description. Каждое поле — отдельный try/except
-    внутри своего helper, чтобы один сбойный селектор не положил весь
-    парс. Возвращает None только при критической ошибке (Exception
-    наружу из любого helper'а), иначе — dict со всеми полями.
+    Тонкий оркестратор поверх _extract_*-helpers + _enrich_phones_from_description.
+    Каждое поле — отдельный try/except внутри своего helper, чтобы один сбойный
+    селектор не положил весь парс. Возвращает None только при критической ошибке
+    (Exception наружу из любого helper'а), иначе — dict со всеми полями.
     """
     listing_data = {}
     try:
@@ -693,8 +578,7 @@ def extract_listing_data(driver, wait, account_name, log_func):
         # Открываем в новой вкладке, парсим, закрываем — не теряем текущую страницу.
         _visit_seller_profile(driver, listing_data, log_func, account_name)
 
-        # A3: попытка клика «Показать телефон» — TEMP DISABLED (Бакуган: убрать)
-        # _try_show_phone(driver, account_name, log_func, listing_data)
+        # A3 (удалён): _try_show_phone убран. Телефон всегда None.
         listing_data["phone"] = None
 
         # D4: нормализуем URL до канонического вида — иначе один и тот же
@@ -787,13 +671,11 @@ def _save_phones_for_listing(db_manager, cur, listing_data: dict) -> None:
 def _record_listing_outcome_metrics(
     db_manager, cur, account_name: str, listing_data: dict, status: str
 ) -> None:
-    """E2/A3/C3: счётчики и журнал для уже сохранённого листинга.
+    """Счётчики и журнал для уже сохранённого листинга.
 
     listings_parsed/<status> — общая статистика и разбивка по исходу.
     captcha_hits + log_captcha — отдельно при status='captcha' (не каждый
     captcha-инцидент привязан к листингу, например login captcha).
-    phone_clicks — если был успешный клик «Показать телефон»
-    (флаг _PHONE_CLICKED_FLAG из extract_listing_data).
 
     Лежит в той же транзакции, что и сам листинг — если что-то упадёт,
     откатятся и метрики, и сохранение.
@@ -814,10 +696,7 @@ def _record_listing_outcome_metrics(
             cursor=cur,
         )
 
-    # A3: метрика phone_clicks — для аналитики кликов «Показать телефон».
-    # Флаг выставляется в _try_show_phone после успешного получения номера.
-    if listing_data.get(_PHONE_CLICKED_FLAG):
-        db_manager.incr_metric(account_name, "phone_clicks", cursor=cur)
+    # A3 (удалён): phone_clicks метрика убрана вместе с _try_show_phone.
 
 
 def save_listing_to_db(listing_data, db_manager, log_func, account_name):
@@ -907,9 +786,9 @@ def save_listing_to_db(listing_data, db_manager, log_func, account_name):
                 except Exception:
                     pass  # не ломаем save если классификация упала
 
-            # A3: parse_status — 'ok' или 'captcha' (если поймали капчу).
+            # A3 (удалён): _try_show_phone убран — captcha не ставится через листинг.
             if listing_id is not None:
-                status = "captcha" if listing_data.get(_CAPTCHA_FLAG) else "ok"
+                status = "ok"
                 db_manager.mark_listing_parse_status(
                     url=listing_data["url"],
                     status=status,

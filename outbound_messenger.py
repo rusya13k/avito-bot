@@ -629,6 +629,13 @@ class OutboundMessenger:
 
         _human_delay(2, 5, stop_event=_tg.get_account_stop_event(self.account_name))
 
+        # Пост-проверка: Enter в Avito-textarea часто даёт перенос строки вместо
+        # отправки. Если сообщение реально не ушло — возвращаем False сейчас,
+        # иначе record_outbound запишет вечный dedup по profile_id.
+        if not self._verify_message_appeared(log_func):
+            log_func(self.account_name, "H1: сообщение не появилось в чате — Enter дал перенос.")
+            return False
+
         # Post-send capture-check: иногда Avito подсовывает капчу сразу
         # после первого outbound — это самый детектируемый момент.
         if detect_phone_captcha(self.driver, log_func=log_func, account_name=self.account_name):
@@ -639,3 +646,19 @@ class OutboundMessenger:
             return False
 
         return True
+
+    def _verify_message_appeared(self, log_func) -> bool:
+        """После отправки проверить что сообщение появилось в DOM чата.
+        Считаем количество элементов messenger/message до и после отправки."""
+        xpath = "//*[@data-marker='messenger/message']"
+        try:
+            before = len(self.driver.find_elements(By.XPATH, xpath))
+            # Ждём до 3 секунд появления нового сообщения
+            WebDriverWait(self.driver, 3).until(
+                lambda d: len(d.find_elements(By.XPATH, xpath)) > before
+            )
+            return True
+        except TimeoutException:
+            return False
+        except Exception:
+            return False
