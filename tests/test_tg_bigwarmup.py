@@ -88,31 +88,30 @@ def test_run_big_warmup_happy_path(tg_ctrl, monkeypatch):
             "error": None,
         }
     )
-    fake_adspower_class = MagicMock()
-    fake_cfg = {
-        "adspower_api_url": "http://localhost:50325",
-        "adspower_api_key": "test",
-    }
+    fake_chrome_launcher_cls = MagicMock()
+    fake_cfg = {}
 
     # Подменяем _cfg (lazy-import возвращает копию).
     monkeypatch.setattr(tg_ctrl, "_cfg", lambda: dict(fake_cfg))
-    # Симулируем `from bot import AdsPowerAPI, run_big_warmup_for_account`.
+    # Симулируем `from bot import run_big_warmup_for_account`.
+    # и `from chrome_launcher import ChromeLauncher`
     fake_bot_module = MagicMock()
-    fake_bot_module.AdsPowerAPI = fake_adspower_class
     fake_bot_module.run_big_warmup_for_account = fake_runner
     monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
+    monkeypatch.setitem(
+        sys.modules, "chrome_launcher", MagicMock(ChromeLauncher=fake_chrome_launcher_cls)
+    )
 
     tg_ctrl._big_warmup_running.add("acc_x")
     tg_ctrl._run_big_warmup({"name": "acc_x", "user_id": "u1"})
 
-    # AdsPowerAPI(constructor)
-    fake_adspower_class.assert_called_once_with("http://localhost:50325", "test")
-    # run_big_warmup_for_account(account, cfg, adspower)
+    # run_big_warmup_for_account(account, cfg, chrome_launcher)
     assert fake_runner.call_count == 1
     args, _ = fake_runner.call_args
     assert args[0] == {"name": "acc_x", "user_id": "u1"}
     assert args[1] == fake_cfg
-    assert args[2] is fake_adspower_class.return_value
+    # третий аргумент — ChromeLauncher instance
+    assert args[2] is not None
 
     # notify со статистикой
     assert len(notify_calls) == 1
@@ -133,10 +132,10 @@ def test_run_big_warmup_failure_path(tg_ctrl, monkeypatch):
 
     fake_runner = MagicMock(return_value={"ok": False, "stats": None, "error": "no proxy"})
     fake_bot_module = MagicMock()
-    fake_bot_module.AdsPowerAPI = MagicMock()
     fake_bot_module.run_big_warmup_for_account = fake_runner
     monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
-    monkeypatch.setattr(tg_ctrl, "_cfg", lambda: {"adspower_api_url": "x", "adspower_api_key": ""})
+    monkeypatch.setitem(sys.modules, "chrome_launcher", MagicMock(ChromeLauncher=MagicMock()))
+    monkeypatch.setattr(tg_ctrl, "_cfg", lambda: {})
 
     tg_ctrl._big_warmup_running.add("acc_x")
     tg_ctrl._run_big_warmup({"name": "acc_x"})
@@ -152,11 +151,15 @@ def test_run_big_warmup_exception_clears_state(tg_ctrl, monkeypatch):
     notify_calls = []
     monkeypatch.setattr(tg_ctrl, "notify", lambda text: notify_calls.append(text))
 
+    # ChromeLauncher constructor raises
+    fake_chrome_cls = MagicMock(side_effect=RuntimeError("boom"))
+    fake_chrome_module = MagicMock()
+    fake_chrome_module.ChromeLauncher = fake_chrome_cls
+    monkeypatch.setitem(sys.modules, "chrome_launcher", fake_chrome_module)
     fake_bot_module = MagicMock()
-    fake_bot_module.AdsPowerAPI = MagicMock(side_effect=RuntimeError("boom"))
     fake_bot_module.run_big_warmup_for_account = MagicMock()
     monkeypatch.setitem(sys.modules, "bot", fake_bot_module)
-    monkeypatch.setattr(tg_ctrl, "_cfg", lambda: {"adspower_api_url": "x", "adspower_api_key": ""})
+    monkeypatch.setattr(tg_ctrl, "_cfg", lambda: {})
 
     tg_ctrl._big_warmup_running.add("acc_x")
     tg_ctrl._run_big_warmup({"name": "acc_x"})

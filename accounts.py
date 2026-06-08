@@ -66,6 +66,9 @@ class AccountConfig(BaseModel):
     cookies_path: str | None = None
     persona: str | None = None
     captcha_cooldown_minutes: int | None = None
+    chrome_profile_dir: str | None = None
+    user_agent: str | None = None
+    proxy: str | None = None
 
     @field_validator("name")
     def name_must_not_be_empty(cls, v):
@@ -208,12 +211,10 @@ def _normalize_account(
 
     out = validated.model_dump()
 
-    # Alias: новый формат — adspower_id, старый — user_id. Поддерживаем оба
-    # и гарантируем наличие обоих для совместимости.
-    if out.get("adspower_id") and not out.get("user_id"):
-        out["user_id"] = out["adspower_id"]
-    elif out.get("user_id") and not out.get("adspower_id"):
-        out["adspower_id"] = out["user_id"]
+    # Авто-генерация chrome_profile_dir если не задан:
+    # accounts/<name>/chrome_profile
+    if not out.get("chrome_profile_dir"):
+        out["chrome_profile_dir"] = f"accounts/{out['name']}/chrome_profile"
 
     return out
 
@@ -292,10 +293,8 @@ def _normalize_only(raw: list[Any], source: str) -> list[dict[str, Any]]:
         seen_names.add(name)
 
         normalized = validated.model_dump()
-        if normalized.get("adspower_id") and not normalized.get("user_id"):
-            normalized["user_id"] = normalized["adspower_id"]
-        elif normalized.get("user_id") and not normalized.get("adspower_id"):
-            normalized["adspower_id"] = normalized["user_id"]
+        if not normalized.get("chrome_profile_dir"):
+            normalized["chrome_profile_dir"] = f"accounts/{normalized['name']}/chrome_profile"
         out.append(normalized)
     return out
 

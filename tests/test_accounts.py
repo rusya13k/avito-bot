@@ -44,20 +44,16 @@ def test_loads_from_accounts_json(repo):
     _write_accounts(
         repo,
         [
-            {"name": "acc1", "adspower_id": "abc", "phone": "+7..."},
-            {"name": "acc2", "user_id": "xyz"},  # старый ключ
+            {"name": "acc1", "user_id": "abc", "phone": "+7..."},
+            {"name": "acc2", "user_id": "xyz"},
         ],
     )
     accounts = load_accounts(repo)
     assert len(accounts) == 2
     assert accounts[0]["name"] == "acc1"
     assert accounts[0]["enabled"] is True
-    # alias: adspower_id -> user_id (заполнили оба)
-    assert accounts[0]["adspower_id"] == "abc"
     assert accounts[0]["user_id"] == "abc"
-    # обратный alias: user_id -> adspower_id
     assert accounts[1]["user_id"] == "xyz"
-    assert accounts[1]["adspower_id"] == "xyz"
 
 
 def test_disabled_accounts_are_filtered(repo):
@@ -272,8 +268,8 @@ def test_save_accounts_writes_and_load_roundtrips(repo):
     from accounts import load_all_accounts, save_accounts
 
     data = [
-        {"name": "alpha", "adspower_id": "a1", "enabled": True},
-        {"name": "beta", "adspower_id": "b1", "enabled": False, "phone": "+7..."},
+        {"name": "alpha", "user_id": "a1", "enabled": True},
+        {"name": "beta", "user_id": "b1", "enabled": False, "phone": "+7..."},
     ]
     target = save_accounts(repo, data)
     assert target.exists()
@@ -283,10 +279,9 @@ def test_save_accounts_writes_and_load_roundtrips(repo):
     on_disk = json.loads(target.read_text(encoding="utf-8"))
     assert on_disk == data
 
-    # load_all_accounts возвращает то же содержимое (с alias-нормализацией)
+    # load_all_accounts возвращает то же содержимое
     loaded = load_all_accounts(repo)
     assert [a["name"] for a in loaded] == ["alpha", "beta"]
-    # alias adspower_id → user_id
     assert loaded[0]["user_id"] == "a1"
 
 

@@ -135,58 +135,6 @@ def check_openai(r: Result):
             r.fail("OpenAI/LLM API", f"{type(exc).__name__}: {msg[:120]}")
 
 
-def check_adspower(r: Result):
-    url = (os.getenv("ADSPOWER_API_URL") or "http://local.adspower.net:50325").rstrip("/")
-    api_key = (os.getenv("ADSPOWER_API_KEY") or "").strip()
-    # AdsPower-конвенция (см. bot.AdsPowerAPI): Authorization: Bearer <key>.
-    # Без ключа AdsPower с включённой защитой API вернёт "Require api-key".
-    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    key_state = "с ADSPOWER_API_KEY" if api_key else "без ADSPOWER_API_KEY"
-    try:
-        import requests
-
-        # Запрашиваем список профилей с маленьким page_size — быстрая проверка
-        resp = requests.get(
-            f"{url}/api/v1/user/list",
-            params={"page_size": 1},
-            headers=headers,
-            timeout=3,
-        )
-        data = resp.json()
-        if data.get("code") == 0:
-            # Реальная схема ответа: {"data": {"list": [...], "page": int, "page_size": int}, ...}.
-            # Поле "page" — номер текущей страницы (int), а не dict. Поэтому
-            # пытаемся читать total из явных полей, иначе показываем хотя бы
-            # размер текущей страницы.
-            d = data.get("data", {}) or {}
-            total = d.get("total") or d.get("count") or len(d.get("list") or [])
-            r.ok("AdsPower API", f"OK ({url}, профилей в ответе: {total}, {key_state})")
-        else:
-            msg = data.get("msg", str(data))
-            if "api-key" in msg.lower() or "api key" in msg.lower():
-                if api_key:
-                    r.fail(
-                        "AdsPower API",
-                        f"ключ невалиден: {msg} (url={url})",
-                    )
-                else:
-                    r.fail(
-                        "AdsPower API",
-                        f"требуется ADSPOWER_API_KEY (в .env пусто, url={url})",
-                    )
-            else:
-                r.fail("AdsPower API", f"ответ ошибочный: {msg}")
-    except requests.exceptions.ConnectionError:
-        r.fail(
-            "AdsPower API",
-            f"соединение отказано ({url}). AdsPower не запущен?",
-        )
-    except requests.exceptions.Timeout:
-        r.fail("AdsPower API", f"таймаут ({url}). AdsPower не отвечает")
-    except Exception as exc:
-        r.fail("AdsPower API", f"{type(exc).__name__}: {str(exc)[:120]}")
-
-
 def check_telegram(r: Result):
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     admin = (os.getenv("TELEGRAM_ADMIN_ID") or "").strip()
@@ -266,8 +214,8 @@ def check_accounts(r: Result):
     issues = []
     for acc in enabled:
         name = acc.get("name", "?")
-        if not acc.get("adspower_id") and not acc.get("user_id"):
-            issues.append(f"'{name}': нет adspower_id/user_id")
+        if not acc.get("user_id"):
+            issues.append(f"'{name}': нет user_id")
         cookies = acc.get("cookies_path")
         if cookies and not (ROOT / cookies).exists():
             issues.append(f"'{name}': cookies файл не найден ({cookies})")
@@ -328,7 +276,6 @@ def main():
 
     check_env_file(r)
     check_openai(r)
-    check_adspower(r)
     check_telegram(r)
     check_proxies(r)
     check_accounts(r)

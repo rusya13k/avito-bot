@@ -14,6 +14,7 @@ from collections import deque
 from pathlib import Path
 
 import telebot
+from telebot import apihelper as _tg_apihelper
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 
 # E1: модульный logger
@@ -25,9 +26,16 @@ logger = logging.getLogger(__name__)
 
 # Global event for shutting down the entire bot
 stop_event = threading.Event()
+# Отдельное событие для main thread — НЕ выставляется из TG-команд.
+# Только SIGTERM/SIGINT. Предотвращает выход процесса при Run/Stop из TG.
+_exit_event = threading.Event()
 # Per-account stop events: account_name -> threading.Event
 account_stop_events: dict[str, threading.Event] = {}
 _stop_events_lock = threading.Lock()
+# Persistent «Stop» flag: выставляется _cb_stop, снимается _cb_run.
+# Нужен чтобы supervisor НЕ перезапускал треды после TG Stop,
+# при этом не задевая main thread (в отличие от stop_event).
+_stop_requested = threading.Event()
 
 # Per-account log buffers: account_name -> deque
 account_log_buffers: dict[str, deque] = {}
@@ -156,7 +164,7 @@ def send_user_action_request(account_name: str, request_id: str, prompt: str) ->
         text = (
             f"⚠️ Аккаунту «{account_name}» требуется ручное действие.\n\n"
             f"{prompt}\n\n"
-            f"После того как разберёшься в браузере (AdsPower), нажми «Продолжить» "
+            f"После того как разберёшься в браузере, нажми «Продолжить» "
             f"или «Отмена», чтобы прервать поток."
         )
         for aid in targets:
@@ -216,6 +224,9 @@ def kb_account_detail(idx: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🔑 Пароль", callback_data=f"acc_password_{idx}"),
         InlineKeyboardButton("👤 Персона", callback_data=f"acc_persona_{idx}"),
         InlineKeyboardButton("🧊 Капча кулдаун (мин)", callback_data=f"acc_captcha_cd_{idx}"),
+        InlineKeyboardButton("🌐 Прокси", callback_data=f"acc_proxy_{idx}"),
+        InlineKeyboardButton("💰 Бюджеты", callback_data=f"acc_budget_{idx}"),
+        InlineKeyboardButton("🖐 Отпечаток (FP)", callback_data=f"acc_fingerprint_{idx}"),
         InlineKeyboardButton("💤 Отключить/Включить", callback_data=f"acc_toggle_{idx}"),
         InlineKeyboardButton("🗑 Удалить", callback_data=f"acc_del_{idx}"),
         InlineKeyboardButton("◀️ Назад", callback_data="accounts_menu"),
@@ -230,6 +241,18 @@ def kb_settings() -> InlineKeyboardMarkup:
         InlineKeyboardButton("🤖 DeepSeek API Key", callback_data="set_openai_key"),
         InlineKeyboardButton("🧠 LLM Model", callback_data="set_openai_model"),
         InlineKeyboardButton("◀️ Назад", callback_data="menu_main"),
+    )
+    return m
+
+
+def kb_budget(idx: int) -> InlineKeyboardMarkup:
+    m = InlineKeyboardMarkup(row_width=2)
+    m.add(
+        InlineKeyboardButton("📋 Листинги/день", callback_data=f"acc_budget_listings_{idx}"),
+        InlineKeyboardButton("✉️ Сообщения/день", callback_data=f"acc_budget_messages_{idx}"),
+        InlineKeyboardButton("📞 Телефон/день", callback_data=f"acc_budget_phone_{idx}"),
+        InlineKeyboardButton("📤 Аутбаунд/день", callback_data=f"acc_budget_outbound_{idx}"),
+        InlineKeyboardButton("◀️ Назад", callback_data=f"acc_detail_{idx}"),
     )
     return m
 
@@ -300,9 +323,28 @@ class TelegramController:
         self._big_warmup_running: set[str] = set()
         self._big_warmup_lock = threading.Lock()
         self._last_msg_time: dict[int, float] = {}
+        # TELEGRAM_PROXY: если задан в config.json / .env, применяем к telebot API
+        self._apply_tg_proxy()
         self._setup()
 
     # ── Утилиты ──────────────────────────────────────────────────────────────
+
+    def _apply_tg_proxy(self) -> None:
+        """Читает telegram_proxy из config.json или TELEGRAM_PROXY из env
+        и применяет к telebot.apihelper.proxy.
+
+        Формат: https://host:port, socks5://host:port, или socks5://u:p@h:p
+        """
+        try:
+            cfg = self._cfg()
+        except FileNotFoundError:
+            cfg = {}
+        proxy_url = os.environ.get("TELEGRAM_PROXY", "") or cfg.get("telegram_proxy", "")
+        if proxy_url:
+            logger.info(
+                "TG proxy applied: %s", proxy_url.split("@")[-1] if "@" in proxy_url else proxy_url
+            )
+            _tg_apihelper.proxy = {"https": proxy_url}
 
     def set_run_callback(self, fn):
         self._run_callback = fn
@@ -508,10 +550,9 @@ class TelegramController:
         cfg = self._cfg()
         text = (
             f"⚙️ Настройки\n\n"
-            f"URL: {cfg.get('target_url', '—')[:60]}...\n"
-            f"LLM Key: {'✅ задан' if cfg.get('openai_api_key', '') else '❌ не задан'}\n"
-            f"LLM Model: {cfg.get('openai_model', 'deepseek-v4-flash')}\n"
-            f"LLM API: {cfg.get('openai_api_base', 'https://api.deepseek.com/v1')}"
+            f"🔗 URL: {cfg.get('target_url', '—')[:60]}...\n"
+            f"🤖 LLM Key: {'✅ задан' if cfg.get('openai_api_key', '') else '❌ не задан'}\n"
+            f"🧠 LLM Model: {cfg.get('openai_model', 'deepseek-v4-flash')}\n"
         )
         if edit_msg:
             self._edit_or_send(edit_msg.chat.id, edit_msg.message_id, text, kb_settings())
@@ -882,27 +923,9 @@ class TelegramController:
         if not password:
             self.bot.reply_to(message, "Пароль не может быть пустым. Отправь пароль или /cancel.")
             return
+        name = data.get("name", "?")
+        phone = data.get("phone", "?")
         data["password"] = password
-        self._set_dialog(cid, "acc_add_adspower", data)
-        self.bot.reply_to(
-            message,
-            "Пароль сохранён.\n\nОтправь AdsPower ID профиля "
-            "(например k1c2utgb).\nИли отправь /skip если пока нет.\n/cancel — отмена.",
-        )
-
-    def _dialog_acc_add_adspower(self, message, data):
-        """State: ввод AdsPower ID (опционально)."""
-        cid = message.chat.id
-        text = (message.text or "").strip()
-        name = data["name"]
-        phone = data["phone"]
-        password = data["password"]
-
-        # /skip = без AdsPower ID
-        if text.lower() != "/skip":
-            data["adspower_id"] = text
-        else:
-            data["adspower_id"] = ""
 
         # Сохраняем аккаунт в accounts.json
         try:
@@ -917,8 +940,6 @@ class TelegramController:
                 "cookies_path": cookies_path,
                 "enabled": True,
             }
-            if data.get("adspower_id"):
-                account_data["adspower_id"] = data["adspower_id"]
             add_account(self.BASE, account_data, cfg=self._cfg())
         except ValueError as exc:
             self.bot.reply_to(message, f"Не удалось добавить аккаунт: {exc}")
@@ -931,22 +952,16 @@ class TelegramController:
             return
 
         self._clear_dialog(cid)
-        adspower_info = (
-            f"\nAdsPower ID: {data.get('adspower_id')}" if data.get("adspower_id") else ""
-        )
         self.bot.reply_to(
             message,
-            f"✅ Аккаунт добавлен!\n"
-            f"Имя: {name}\n"
-            f"Телефон: {phone}\n"
-            f"Пароль: {'*' * len(password)}{adspower_info}",
+            f"✅ Аккаунт добавлен!\nИмя: {name}\nТелефон: {phone}\nПароль: {'*' * len(password)}",
         )
         self._show_accounts(cid)
 
     def _save_cfg_text_field(
         self, message, cfg_key: str, success_text: str, *, require_url: bool = False
     ):
-        """Helper для set_url/set_sphere_key/set_openai_*/set_adspower_*:
+        """Helper для set_url/set_sphere_key/set_openai_*:
         читает message.text, валидирует (URL prefix если require_url),
         сохраняет в cfg[cfg_key], показывает settings-меню.
         """
@@ -1101,6 +1116,79 @@ class TelegramController:
         self.bot.reply_to(message, f"✅ Капча кулдаун для '{acc_name}': {display}")
         self._show_accounts(cid)
 
+    def _dialog_acc_set_proxy(self, message, data):
+        """State: обновление прокси для аккаунта."""
+        cid = message.chat.id
+        idx = data.get("idx")
+        text = (message.text or "").strip()
+        if not text:
+            self.bot.reply_to(
+                message,
+                "Прокси не может быть пустым. Формат: host:port[:user:pass] или /skip для сброса.",
+            )
+            return
+        accs = self._accounts()
+        if idx is None or idx >= len(accs):
+            self.bot.reply_to(message, "Аккаунт не найден.")
+            self._clear_dialog(cid)
+            return
+        acc_name = accs[idx]["name"]
+        try:
+            from accounts import update_account
+
+            val = text if text.lower() != "/skip" else None
+            update_account(self.BASE, acc_name, {"proxy": val}, cfg=self._cfg())
+        except Exception as exc:
+            logger.exception("update_account proxy failed")
+            self.bot.reply_to(message, f"Ошибка: {exc}")
+            self._clear_dialog(cid)
+            return
+        self._clear_dialog(cid)
+        display = text if text.lower() != "/skip" else "сброшен"
+        self.bot.reply_to(message, f"✅ Прокси для '{acc_name}': {display}")
+        self._show_accounts(cid)
+
+    def _dialog_acc_budget(self, message, data):
+        """State: установка per-account бюджета (listings/messages/phone/outbound)."""
+        cid = message.chat.id
+        idx = data.get("idx")
+        action = data.get("action")
+        text = (message.text or "").strip()
+        if not text.isdigit():
+            self.bot.reply_to(message, "Введи число. Или 0 для сброса на глобальный.")
+            return
+        val = int(text)
+        accs = self._accounts()
+        if idx is None or idx >= len(accs):
+            self.bot.reply_to(message, "Аккаунт не найден.")
+            self._clear_dialog(cid)
+            return
+        acc_name = accs[idx]["name"]
+        cfg_key = f"daily_budget_{action}"
+        try:
+            from accounts import update_account
+
+            update_account(
+                self.BASE, acc_name, {cfg_key: val if val > 0 else None}, cfg=self._cfg()
+            )
+        except Exception as exc:
+            logger.exception("update_account budget failed")
+            self.bot.reply_to(message, f"Ошибка: {exc}")
+            self._clear_dialog(cid)
+            return
+        self._clear_dialog(cid)
+        action_labels = {
+            "listings": "Листинги",
+            "messages": "Сообщения",
+            "phone": "Телефон",
+            "outbound": "Аутбаунд",
+        }
+        label = action_labels.get(action, action)
+        display = f"{val}/день" if val > 0 else "глобальный"
+        self.bot.reply_to(message, f"✅ {label} для '{acc_name}': {display}")
+        # Показываем меню бюджетов
+        self._cb_acc_budget_menu(None, idx=idx, cid=cid)
+
     def _handle_dialog(self, message):
         """S2 Stage 2: dispatch-table вместо большого if/elif. Маппинг
         state → method, неизвестные state'ы (легаси) тихо игнорируются —
@@ -1123,11 +1211,15 @@ class TelegramController:
             "acc_add_name": self._dialog_acc_add_name,
             "acc_add_phone": self._dialog_acc_add_phone,
             "acc_add_password": self._dialog_acc_add_password,
-            "acc_add_adspower": self._dialog_acc_add_adspower,
             "acc_set_phone": self._dialog_acc_set_phone,
             "acc_set_password": self._dialog_acc_set_password,
             "acc_set_persona": self._dialog_acc_set_persona,
             "acc_set_captcha_cd": self._dialog_acc_set_captcha_cd,
+            "acc_set_proxy": self._dialog_acc_set_proxy,
+            "acc_budget_listings": self._dialog_acc_budget,
+            "acc_budget_messages": self._dialog_acc_budget,
+            "acc_budget_phone": self._dialog_acc_budget,
+            "acc_budget_outbound": self._dialog_acc_budget,
             "set_url": self._dialog_set_url,
             "set_openai_key": self._dialog_set_openai_key,
             "set_openai_model": self._dialog_set_openai_model,
@@ -1212,13 +1304,23 @@ class TelegramController:
 
     # ── Запуск/стоп/логи ────────────────────────────────────────────
 
+    def _set_all_account_stop_events(self) -> None:
+        """Установить per-account stop events для всех аккаунтов.
+        Не трогает глобальный stop_event — он только для SIGTERM/SIGINT.
+        """
+        with _stop_events_lock:
+            for ev in account_stop_events.values():
+                ev.set()
+
     def _cb_run(self, call):
         cid = call.message.chat.id
+        _stop_requested.clear()
 
-        # Если бот уже работает — сначала останавливаем, потом запускаем.
+        # Если бот уже работает — останавливаем через per-account events,
+        # чтобы не задеть main thread (глобальный stop_event).
         if is_running():
             self.bot.answer_callback_query(call.id, "⏳ Останавливаю и перезапускаю...")
-            stop_event.set()
+            self._set_all_account_stop_events()
             # Ждём завершения до 15s
             deadline = time.time() + 15
             with _threads_lock:
@@ -1232,13 +1334,12 @@ class TelegramController:
                     t.join(timeout=remaining)
                 except Exception:
                     pass
-            # Убиваем AdsPower-профили перед перезапуском
-            self._cleanup_adspower()
+            # Убиваем Chrome-процессы перед перезапуском
+            self._cleanup_chrome()
 
         if not self._run_callback:
             self._send(cid, "Ошибка: run_callback не задан.")
             return
-        stop_event.clear()
         with _stop_events_lock:
             for ev in account_stop_events.values():
                 ev.clear()
@@ -1253,7 +1354,8 @@ class TelegramController:
             self._show_main(cid, call.message)
             return
         add_log("🛑 Stop signal sent. Threads will exit at next checkpoint.")
-        stop_event.set()
+        _stop_requested.set()
+        self._set_all_account_stop_events()
         self.bot.answer_callback_query(call.id, "🛑 Останавливаю...")
         self._send(
             cid,
@@ -1268,31 +1370,14 @@ class TelegramController:
             name="tg-stop-joiner",
         ).start()
 
-    def _cleanup_adspower(self):
-        """Остановить AdsPower-профили всех аккаунтов (параллельно)."""
+    def _cleanup_chrome(self):
+        """Остановить Chrome-процессы всех аккаунтов через ChromeLauncher."""
         try:
-            cfg = self._cfg()
-            from accounts import load_all_accounts
+            from chrome_launcher import ChromeLauncher
 
-            accs = load_all_accounts(self.BASE, cfg)
-            adspower_url = cfg.get("adspower_api_url", "")
-            adspower_key = cfg.get("adspower_api_key") or os.environ.get("ADSPOWER_API_KEY", "")
-            if not adspower_url:
-                return
-            from bot import AdsPowerAPI
-
-            api = AdsPowerAPI(adspower_url, adspower_key or None)
-            uids = [uid for acc in accs if (uid := acc.get("adspower_id") or acc.get("user_id"))]
-            if not uids:
-                return
-            # Параллельная остановка — быстрее чем последовательная
-            threads = []
-            for uid in uids:
-                t = threading.Thread(target=api.stop_profile, args=(uid,), daemon=True)
-                t.start()
-                threads.append(t)
-            for t in threads:
-                t.join(timeout=10)
+            repo_dir = self.BASE.parent if hasattr(self.BASE, "parent") else Path(".")
+            launcher = ChromeLauncher(repo_dir=repo_dir)
+            launcher.stop_all()
         except Exception:
             pass
 
@@ -1379,6 +1464,11 @@ class TelegramController:
         pwd_display = "✅ задан" if password else "❌ не задан"
         persona = acc.get("persona") or "по умолчанию"
         captcha_cd = acc.get("captcha_cooldown_minutes") or "глобальный"
+        proxy = acc.get("proxy") or "—"
+        b_listings = acc.get("daily_budget_listings") or "глобальный"
+        b_messages = acc.get("daily_budget_messages") or "глобальный"
+        b_phone = acc.get("daily_budget_phone") or "глобальный"
+        b_outbound = acc.get("daily_budget_outbound") or "глобальный"
         enabled = "✅ включён" if acc.get("enabled", True) else "💤 disabled"
         text = (
             f"👤 {acc['name']}\n"
@@ -1386,6 +1476,8 @@ class TelegramController:
             f"🔑 Пароль: {pwd_display}\n"
             f"👤 Персона: {persona}\n"
             f"🧊 Капча кулдаун: {captcha_cd} мин\n"
+            f"🌐 Прокси: {proxy}\n"
+            f"💰 Бюджеты: Л:{b_listings} С:{b_messages} Т:{b_phone} А:{b_outbound}\n"
             f"💬 Статус: {enabled}"
         )
         self._edit_or_send(cid, call.message.message_id, text, kb_account_detail(idx))
@@ -1509,22 +1601,113 @@ class TelegramController:
             return
         self._show_accounts(cid, call.message)
 
+    # ── Новые кнопки аккаунта: Прокси, Бюджеты, Отпечаток ──
+
+    def _cb_acc_proxy(self, call):
+        """Запрос ввода прокси (acc_proxy_<idx>)."""
+        cid = call.message.chat.id
+        idx = int(call.data.split("_")[-1])
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        current = accs[idx].get("proxy") or "—"
+        self._set_dialog(cid, "acc_set_proxy", {"idx": idx})
+        self._send(
+            cid,
+            f"Текущий прокси: {current}\n\nВведи proxy (host:port[:user:pass]) или /skip для сброса:",
+        )
+
+    def _cb_acc_budget_menu(self, call=None, *, idx=None, cid=None):
+        """Показать меню бюджетов (acc_budget_<idx> или прямой вызов)."""
+        if call:
+            cid = call.message.chat.id
+            idx = int(call.data.split("_")[-1])
+        elif idx is None or cid is None:
+            return
+        accs = self._accounts()
+        if idx >= len(accs):
+            if call:
+                self._send(cid, "Аккаунт не найден.")
+            return
+        acc = accs[idx]
+        lines = [
+            f"💰 Бюджеты — {acc['name']}",
+            "",
+            f"📋 Листинги/день: {acc.get('daily_budget_listings') or 'глобальный'}",
+            f"✉️ Сообщения/день: {acc.get('daily_budget_messages') or 'глобальный'}",
+            f"📞 Телефон/день: {acc.get('daily_budget_phone') or 'глобальный'}",
+            f"📤 Аутбаунд/день: {acc.get('daily_budget_outbound') or 'глобальный'}",
+            "",
+            "Нажми на параметр чтобы изменить:",
+        ]
+        text = "\n".join(lines)
+        if call:
+            self._edit_or_send(cid, call.message.message_id, text, kb_budget(idx))
+        else:
+            self._send(cid, text, kb_budget(idx))
+
+    def _cb_acc_budget_listings(self, call):
+        idx = int(call.data.split("_")[-1])
+        self._set_dialog(
+            call.message.chat.id, "acc_budget_listings", {"idx": idx, "action": "listings"}
+        )
+        self._send(call.message.chat.id, "Введи лимит листингов в день. 0 = сброс на глобальный:")
+
+    def _cb_acc_budget_messages(self, call):
+        idx = int(call.data.split("_")[-1])
+        self._set_dialog(
+            call.message.chat.id, "acc_budget_messages", {"idx": idx, "action": "messages"}
+        )
+        self._send(call.message.chat.id, "Введи лимит сообщений в день. 0 = сброс на глобальный:")
+
+    def _cb_acc_budget_phone(self, call):
+        idx = int(call.data.split("_")[-1])
+        self._set_dialog(call.message.chat.id, "acc_budget_phone", {"idx": idx, "action": "phone"})
+        self._send(
+            call.message.chat.id, "Введи лимит кликов телефона в день. 0 = сброс на глобальный:"
+        )
+
+    def _cb_acc_budget_outbound(self, call):
+        idx = int(call.data.split("_")[-1])
+        self._set_dialog(
+            call.message.chat.id, "acc_budget_outbound", {"idx": idx, "action": "outbound"}
+        )
+        self._send(
+            call.message.chat.id, "Введи лимит аутбаунд-сообщений в день. 0 = сброс на глобальный:"
+        )
+
+    def _cb_acc_fingerprint(self, call):
+        """Показать меню fingerprint (acc_fingerprint_<idx>)."""
+        cid = call.message.chat.id
+        idx = int(call.data.split("_")[-1])
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        acc = accs[idx]
+        text = (
+            f"🖐 Отпечаток — {acc['name']}\n\n"
+            "Fingerprint настройки отключены (AdsPower удалён).\n"
+            "Используй ChromeLauncher — fingerprint управляется через профиль Chrome."
+        )
+        self._edit_or_send(cid, call.message.message_id, text, kb_account_detail(idx))
+
     # ── T12: Большой прогрев аккаунта ────────────────────────────────────
 
     def _run_big_warmup(self, account: dict):
         """T12: фоновая задача — крутит run_big_warmup_for_account и шлёт notify."""
         name = account["name"]
         try:
-            # Ленивый импорт: bot.py тащит много (Selenium, AdsPower) и при
+            # Ленивый импорт: bot.py тащит много (Selenium, Chrome) и при
             # старте контроллера может быть ещё не готов.
-            from bot import AdsPowerAPI, run_big_warmup_for_account
+            from bot import run_big_warmup_for_account
+            from chrome_launcher import ChromeLauncher
 
             cfg = self._cfg()
-            adspower_url = cfg.get("adspower_api_url", "")
-            if not adspower_url:
-                raise RuntimeError("adspower_api_url не задан в конфиге")
-            adspower = AdsPowerAPI(adspower_url, cfg.get("adspower_api_key"))
-            result = run_big_warmup_for_account(account, cfg, adspower)
+            repo_dir = self.BASE.parent if hasattr(self.BASE, "parent") else Path(".")
+            chrome_launcher = ChromeLauncher(repo_dir=repo_dir)
+            result = run_big_warmup_for_account(account, cfg, chrome_launcher)
             if result.get("ok"):
                 stats = result.get("stats") or {}
                 visited = int(stats.get("sites_visited", 0))
@@ -1664,6 +1847,13 @@ class TelegramController:
             ("acc_persona_", self._cb_acc_persona),
             ("acc_captcha_cd_", self._cb_acc_captcha_cd),
             ("acc_toggle_", self._cb_acc_toggle),
+            ("acc_proxy_", self._cb_acc_proxy),
+            ("acc_budget_listings_", self._cb_acc_budget_listings),
+            ("acc_budget_messages_", self._cb_acc_budget_messages),
+            ("acc_budget_phone_", self._cb_acc_budget_phone),
+            ("acc_budget_outbound_", self._cb_acc_budget_outbound),
+            ("acc_budget_", self._cb_acc_budget_menu),
+            ("acc_fingerprint_", self._cb_acc_fingerprint),
         )
         for prefix, handler in prefix_handlers:
             if d.startswith(prefix):

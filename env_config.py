@@ -2,7 +2,7 @@
 H3: загрузка секретов из .env / переменных окружения.
 
 Зачем:
-- Раньше OPENAI_API_KEY, TELEGRAM_BOT_TOKEN, ADSPOWER_API_KEY и логин/пароль
+- Раньше OPENAI_API_KEY, TELEGRAM_BOT_TOKEN и логин/пароль
   аккаунтов лежали в config.json в открытом виде. Если файл попадает в git
   или шарится — это утечка.
 - Теперь: переменные с высоким приоритетом читаются из .env (или из
@@ -35,8 +35,6 @@ ENV_TO_CFG = {
     "OPENAI_MODEL": "openai_model",
     "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
     "TELEGRAM_ADMIN_ID": "telegram_admin_id",
-    "ADSPOWER_API_URL": "adspower_api_url",
-    "ADSPOWER_API_KEY": "adspower_api_key",
 }
 
 
