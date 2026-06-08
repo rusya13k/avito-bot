@@ -449,13 +449,9 @@ class ChromeLauncher:
         # --disable-gpu для headless-серверов без видеокарты
         cmd.append("--disable-gpu")
 
-        # Headless-режим на Linux-серверах без X-сервера.
-        # Включается если:
-        #   1. Явно задан CHROME_HEADLESS=1 (env)
-        #   2. Или Linux + нет DISPLAY (нет X-сервера)
-        if os.environ.get("CHROME_HEADLESS") == "1" or (
-            platform.system() == "Linux" and not os.environ.get("DISPLAY")
-        ):
+        # Headless-режим — только по явному CHROME_HEADLESS=1.
+        # По умолчанию используется Xvfb (виртуальный дисплей).
+        if os.environ.get("CHROME_HEADLESS") == "1":
             cmd.append("--headless=new")
 
         # Дополнительные флаги
