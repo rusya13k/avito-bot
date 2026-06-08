@@ -78,3 +78,4 @@ html.txt
 *.png
 *.jpg
 *.jpeg
+.venv/

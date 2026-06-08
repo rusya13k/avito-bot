@@ -446,7 +446,7 @@ class TelegramController:
             self._cfg_cache = None
             self._cfg_cache_mtime = 0.0
 
-    def _set_dialog(self, chat_id: int, state: str, data: dict = None):
+    def _set_dialog(self, chat_id: int, state: str, data: dict | None = None):
         self._state[chat_id] = {"state": state, "data": dict(data) if data else {}}
 
     def _clear_dialog(self, chat_id: int):
@@ -1688,8 +1688,7 @@ class TelegramController:
         acc = accs[idx]
         text = (
             f"🖐 Отпечаток — {acc['name']}\n\n"
-            "Fingerprint настройки отключены (AdsPower удалён).\n"
-            "Используй ChromeLauncher — fingerprint управляется через профиль Chrome."
+            "Fingerprint настройки отключены — управляется через профиль Chrome."
         )
         self._edit_or_send(cid, call.message.message_id, text, kb_account_detail(idx))
 
