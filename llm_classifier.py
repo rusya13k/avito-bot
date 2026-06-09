@@ -42,8 +42,8 @@ class LLMClassifier:
     Авто-детект: если model содержит "claude" → Anthropic формат, иначе OpenAI.
     """
 
-    DEFAULT_MODEL = "deepseek-v4-flash"
-    DEFAULT_API_BASE = "https://api.deepseek.com/v1"
+    DEFAULT_MODEL = "gpt-5.5"
+    DEFAULT_API_BASE = "https://api.coda.ink/v1"
     REQUEST_TIMEOUT = 30.0
 
     def __init__(

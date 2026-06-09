@@ -442,6 +442,18 @@ class ChromeLauncher:
             if proxy_arg:
                 cmd.append(f"--proxy-server={proxy_arg}")
 
+        # Весь DNS резолв — через SOCKS5 прокси, не через систему.
+        # Без этих флагов Chrome делает системные DNS-запросы (на которые
+        # WARP может ответить неверно) и создаёт параллельные соединения,
+        # которые перегружают простой форвардер.
+        cmd.append("--disable-dns-prefetch")
+        cmd.append("--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1")
+
+        # Запрещаем утечку реального IP сервера через WebRTC (актуально для
+        # headed-режима под Xvfb — антифрод-системы активно проверяют это).
+        cmd.append("--disable-features=WebRtcHideLocalIpsWithMdns")
+        cmd.append("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+
         # --no-sandbox нужен если запускаем под root (Linux сервер)
         if platform.system() != "Windows" and os.getuid() == 0:
             cmd.append("--no-sandbox")
@@ -453,6 +465,13 @@ class ChromeLauncher:
         # По умолчанию используется Xvfb (виртуальный дисплей).
         if os.environ.get("CHROME_HEADLESS") == "1":
             cmd.append("--headless=new")
+
+        # Язык и локаль — принудительно русский (иначе en-US на Linux
+        # сервере, что с российским IP выглядит подозрительно).
+        cmd.append("--lang=ru-RU")
+
+        # Убираем флаг автоматизации из Blink (ещё один слой детекта).
+        cmd.append("--disable-blink-features=AutomationControlled")
 
         # Дополнительные флаги
         if extra_flags:

@@ -81,8 +81,8 @@ def check_env_file(r: Result):
 
 def check_openai(r: Result):
     key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    base = (os.getenv("OPENAI_API_BASE") or "https://api.openai.com/v1").strip()
-    model = (os.getenv("OPENAI_MODEL") or "gpt-3.5-turbo").strip()
+    base = (os.getenv("OPENAI_API_BASE") or "https://api.coda.ink/v1").strip()
+    model = (os.getenv("OPENAI_MODEL") or "gpt-5.5").strip()
 
     if not key:
         r.fail(

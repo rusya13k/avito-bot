@@ -26,21 +26,13 @@ COMMERCIAL_SEARCH_FILTERS = {
     "sale": {
         "min_price": 10000000,
         "paths": [
-            "/nedvizhimost/kommercheskaya_nedvizhimost/ofisy/prodam-ASgBAgICAUSwCMpB",
-            "/nedvizhimost/kommercheskaya_nedvizhimost/torgovie_pomescheniya/prodam-ASgBAgICAUSwCMpB",
-            "/nedvizhimost/kommercheskaya_nedvizhimost/skladi/prodam-ASgBAgICAUSwCMpB",
-            "/nedvizhimost/kommercheskaya_nedvizhimost/proizvodstvennie_pomescheniya/prodam-ASgBAgICAUSwCMpB",
-            "/nedvizhimost/kommercheskaya_nedvizhimost/svobodnogo_naznacheniya/prodam-ASgBAgICAUSwCMpB",
+            "/kommercheskaya_nedvizhimost/prodam-ASgBAgICAUSwCNRW",
         ],
     },
     "rent": {
         "min_price": 200000,
         "paths": [
-            "/nedvizhimost/kommercheskaya_nedvizhimost/ofisy/sdam-ASgBAgICAUSwCMpB",
-            "/nedvizhimost/kommercheskaya_nedvizhimost/torgovie_pomescheniya/sdam-ASgBAgICAUSwCMpB",
-            "/nedvizhimost/kommercheskaya_nedvizhimost/skladi/sdam-ASgBAgICAUSwCMpB",
-            "/nedvizhimost/kommercheskaya_nedvizhimost/proizvodstvennie_pomescheniya/sdam-ASgBAgICAUSwCMpB",
-            "/nedvizhimost/kommercheskaya_nedvizhimost/svobodnogo_naznacheniya/sdam-ASgBAgICAUSwCMpB",
+            "/kommercheskaya_nedvizhimost/sdam-ASgBAgICAUSwCNRW",
         ],
     },
 }
@@ -55,9 +47,5 @@ COMMERCIAL_REAL_ESTATE_CATEGORIES = [
 ]
 
 AVITO_COMMERCIAL_CATEGORIES = [
-    "/nedvizhimost/kommercheskaya_nedvizhimost/ofisy",
-    "/nedvizhimost/kommercheskaya_nedvizhimost/torgovie_pomescheniya",
-    "/nedvizhimost/kommercheskaya_nedvizhimost/skladi",
-    "/nedvizhimost/kommercheskaya_nedvizhimost/proizvodstvennie_pomescheniya",
-    "/nedvizhimost/kommercheskaya_nedvizhimost/svobodnogo_naznacheniya",
+    "/kommercheskaya_nedvizhimost",
 ]

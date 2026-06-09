@@ -7,8 +7,8 @@
   "telegram_admin_ids": [1951766747, 411399016],
   "telegram_admin_id": 1951766747,
   "openai_api_key": "",
-  "openai_model": "deepseek-v4-flash",
-  "openai_api_base": "https://api.deepseek.com/v1",
+  "openai_model": "gpt-5.5",
+  "openai_api_base": "https://api.coda.ink/v1",
   "captcha_cooldown_minutes": 30,
   "daily_budget_listings": 80,
   "daily_budget_messages": 30,
@@ -22,5 +22,5 @@
   "long_break_min_min": 120,
   "long_break_max_min": 300,
   "activity_pattern": "default",
-  "cycle_distribution": {"full": 0.60, "messenger_only": 0.10, "browse_only": 0.15, "profile_check": 0.05, "outbound_only": 0.10}
+  "cycle_distribution": {"full": 1.0, "messenger_only": 0.0, "browse_only": 0.0, "profile_check": 0.0, "outbound_only": 0.0}
 }

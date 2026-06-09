@@ -221,6 +221,21 @@ def load_cookies(driver: webdriver.Chrome, cookies_path: str, domain: str):
         pass
 
 
+
+def save_cookies(driver, cookies_path):
+    """Save current browser cookies to JSON file."""
+    import json
+    from pathlib import Path
+    path = Path(cookies_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cookies = driver.get_cookies()
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(cookies, f, indent=2)
+        return True
+    except Exception:
+        return False
+
 # ── Behavioral primitives ──────────────────────────────────────────────────
 
 # B2: human-like delays — нормальное распределение вместо плоского uniform,
@@ -1420,14 +1435,18 @@ def _do_profile_check(driver, account_name: str) -> None:
 # вариантов на случай smooth-rollouts разметки (Yandex иногда раскатывает
 # A/B по разным регионам/устройствам). Достаточно совпадения ОДНОГО из них.
 _YANDEX_RESULT_SELECTORS = [
-    "li.serp-item",  # классический контейнер органики
-    "[data-fast-name='organic']",  # новый data-атрибут для блоков выдачи
-    "[data-fast-tag*='organic']",
-    ".OrganicTitle",  # титлы органических результатов
-    ".OrganicTitle-LinkText",
-    ".organic__url-text",  # домены под заголовком
-    "ul.serp-list > li",
+    "li.serp-item",       # классический контейнер органики
+    "li.serp-item_card",  # обновлённая карточная структура (редизайн)
+    "div.serp-item",      # div-версия контейнера
+    "h2.organic__title",  # стандартная обёртка заголовка
+    "a.organic__url",     # основная ссылка результата
+    "a[class*='organic__url']",  # гибкий селектор ссылки
+    ".organic__url-text", # домены под заголовком
+    "ul.serp-list > li",  # родительский контейнер списка
+    "div.organic__content-wrapper",  # блок с описанием результата
     "[role='main'] [role='listitem']",
+    "article",            # article-контейнер (версия для мобильных/планшетов)
+    "li[data-cid]",       # data-cid контейнер
 ]
 
 _YANDEX_REGION_MOSCOW = 213
@@ -1660,7 +1679,7 @@ def browse_commercial_categories(
         )
         _deal_type = random.choice(_deal_types_list)
         _deal_suffix = (
-            "/sdam-ASgBAgICAUSwCMpB" if _deal_type == "rent" else "/prodam-ASgBAgICAUSwCMpB"
+            "/sdam-ASgBAgICAUSwCNRW" if _deal_type == "rent" else "/prodam-ASgBAgICAUSwCNRW"
         )
         # Минимальная цена из конфига search_filters или COMMERCIAL_SEARCH_FILTERS.
         _pmin = _sf.get("price_min")
@@ -1672,10 +1691,14 @@ def browse_commercial_categories(
 
     for cat in chosen:
         url = f"https://www.avito.ru{_city_prefix}{cat}{_deal_suffix}"
-        if _pmin:
-            url += f"?pmin={_pmin}"
-            if _pmax:
-                url += f"&pmax={_pmax}"
+        params = []
+        if _pmin is not None:
+            params.append(f"pmin={_pmin}")
+        if _pmax is not None:
+            params.append(f"pmax={_pmax}")
+        query_str = "&".join(params)
+        if query_str:
+            url += f"?{query_str}"
         log(account_name, f"  Category: {cat} (deal={_deal_type}, pmin={_pmin})")
         if not safe_get(driver, url, account_name):
             continue
@@ -1818,9 +1841,16 @@ def find_and_view_commercial_listings(
     min_price = _sf.get("price_min") if _sf.get("price_min") is not None else config["min_price"]
     max_price = _sf.get("price_max")
 
-    url = f"https://www.avito.ru/{city}{category_path}?pmin={min_price}"
+    # pmin/pmax — стабильные параметры Авито, работают во всех категориях.
+    params = []
+    if min_price is not None:
+        params.append(f"pmin={min_price}")
     if max_price is not None:
-        url += f"&pmax={max_price}"
+        params.append(f"pmax={max_price}")
+    query_str = "&".join(params)
+    url = f"https://www.avito.ru/{city}{category_path}"
+    if query_str:
+        url += f"?{query_str}"
 
     log(account_name, f"  Searching in {city} for {deal_type} (min {min_price} RUB)")
     log(account_name, f"  URL: {url}")
@@ -1831,6 +1861,8 @@ def find_and_view_commercial_listings(
     human_scroll(driver, "down", iters=random.randint(3, 6))
 
     links = driver.find_elements(By.XPATH, "//a[@data-marker='item-title']")
+    if not links:
+        links = driver.find_elements(By.CSS_SELECTOR, "a[class*='iva-item-title-'], a.snippet-link")
     if not links:
         log(account_name, f"  No listings found in {city} for this category.")
         return 0, 0, 0
@@ -2745,8 +2777,8 @@ def _build_avito_client(driver, wait, account: dict, cfg: dict, db_manager: Data
 
     llm_config = {
         "api_key": cfg.get("openai_api_key", ""),
-        "model": cfg.get("openai_model", "gpt-3.5-turbo"),
-        "api_base": cfg.get("openai_api_base", "https://api.openai.com/v1"),
+        "model": cfg.get("openai_model", "gpt-5.5"),
+        "api_base": cfg.get("openai_api_base", "https://api.coda.ink/v1"),
     }
     llm = LLMClassifier(llm_config, db_manager=db_manager)
 
@@ -2898,7 +2930,7 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
         # Совместимость с B2: если active_hours_start/end заданы, ВНЕ
         # окна prob=0 — поведение строго бинарное, как раньше.
         prob = _active_probability(account, cfg)
-        if random.random() > prob:
+        if prob > 0 and random.random() > prob:
             pause_sec, _ = pick_cycle_pause(
                 account, cfg, account_state=account_state, account_name=account_name
             )

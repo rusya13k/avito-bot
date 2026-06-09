@@ -13,25 +13,25 @@ import pytest
 # ── LLM defaults ──────────────────────────────────────────────────────────
 
 
-def test_llm_default_model_is_deepseek():
+def test_llm_default_model_is_gpt5():
     from llm_classifier import LLMClassifier
 
-    assert LLMClassifier.DEFAULT_MODEL == "deepseek-v4-flash"
+    assert LLMClassifier.DEFAULT_MODEL == "gpt-5.5"
 
 
-def test_llm_default_api_base_is_deepseek():
+def test_llm_default_api_base_is_coda():
     from llm_classifier import LLMClassifier
 
-    assert LLMClassifier.DEFAULT_API_BASE == "https://api.deepseek.com/v1"
+    assert LLMClassifier.DEFAULT_API_BASE == "https://api.coda.ink/v1"
 
 
-def test_llm_classifier_uses_deepseek_config():
-    """LLMClassifier с пустым конфигом берёт DeepSeek дефолты."""
+def test_llm_classifier_uses_coda_defaults():
+    """LLMClassifier с пустым конфигом берёт Coda.ink дефолты."""
     from llm_classifier import LLMClassifier
 
     clf = LLMClassifier({})
-    assert clf.model == "deepseek-v4-flash"
-    assert clf.api_base == "https://api.deepseek.com/v1"
+    assert clf.model == "gpt-5.5"
+    assert clf.api_base == "https://api.coda.ink/v1"
 
 
 # ── env_config: DEEPSEEK_API_KEY ──────────────────────────────────────────
