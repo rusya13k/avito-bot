@@ -3,8 +3,11 @@
   "target_url": "https://www.avito.ru",
   "keywords_file": "keywords.txt",
   "telegram_bot_token": "",
-  "telegram_proxy": "socks5://127.0.0.1:40000",
-  "telegram_admin_ids": [1951766747, 411399016],
+  "telegram_proxy": "",
+  "telegram_admin_ids": [
+    1951766747,
+    411399016
+  ],
   "telegram_admin_id": 1951766747,
   "openai_api_key": "",
   "openai_model": "gpt-5.5",
@@ -14,13 +17,22 @@
   "daily_budget_messages": 30,
   "daily_budget_phone": 25,
   "daily_budget_outbound": 15,
-  "session_pause_min": 30,
-  "session_pause_max": 90,
+  "session_pause_min": 15,
+  "session_pause_max": 45,
   "active_hours_start": 9,
   "active_hours_end": 18,
   "long_breaks_per_day": 2,
   "long_break_min_min": 120,
   "long_break_max_min": 300,
   "activity_pattern": "default",
-  "cycle_distribution": {"full": 1.0, "messenger_only": 0.0, "browse_only": 0.0, "profile_check": 0.0, "outbound_only": 0.0}
+  "cycle_distribution": {
+    "full": 1.0,
+    "messenger_only": 0.0,
+    "browse_only": 0.0,
+    "profile_check": 0.0,
+    "outbound_only": 0.0
+  },
+  "max_listings_per_search": 20,
+  "max_listings_per_browse": 10,
+  "view_listing_message_rate": 0.9
 }
