@@ -29,25 +29,25 @@ import random
 import time
 
 from selenium.common.exceptions import (
-    StaleElementReferenceException,
     TimeoutException,
     WebDriverException,
 )
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 import tg_bot as _tg
 from account_state import account_state as _astate
 from captcha_detect import detect_phone_captcha
 from human_delay import human_delay as _human_delay
-from human_mouse import human_click as _human_click
-from human_typing import persona_speed_multiplier
-from human_typing import type_human as _type_human
 from llm_sanitizer import sanitize_llm_reply
 
 logger = logging.getLogger(__name__)
+
+
+def _escape_format(text: object) -> str:
+    """Экранирует фигурные скобки в пользовательских данных перед .format()."""
+    s = str(text)
+    return s.replace("{", "{{").replace("}", "}}")
 
 
 def _stopping(account_name: str) -> bool:
@@ -186,12 +186,12 @@ def _generate_first_message(llm_classifier, listing: dict, persona_id: str) -> s
 
             system_message = _load_prompt(system_prompt_name)
             user_prompt = _load_prompt(user_prompt_name).format(
-                title=listing.get("title", "—"),
-                category=listing.get("category", "коммерческая недвижимость"),
-                location=listing.get("location", "—"),
-                area=listing.get("area", "—"),
-                price=listing.get("price", "не указана"),
-                description=(listing.get("description") or "")[:600],
+                title=_escape_format(listing.get("title", "—")),
+                category=_escape_format(listing.get("category", "коммерческая недвижимость")),
+                location=_escape_format(listing.get("location", "—")),
+                area=_escape_format(listing.get("area", "—")),
+                price=_escape_format(listing.get("price", "не указана")),
+                description=_escape_format((listing.get("description") or "")[:600]),
                 persona_description=persona_description,
                 formality=formality,
                 length=length,
@@ -464,188 +464,24 @@ class OutboundMessenger:
         return True
 
     def _open_chat_overlay(self, log_func) -> bool:
-        """Клик «Написать сообщение» на странице листинга. Avito имеет
-        несколько селекторов в зависимости от верстки. Пробуем по очереди.
-        """
-        # Актуальные селекторы Avito (2025-2026):
-        candidates = [
-            "//a[@data-marker='messenger-button/link']",
-            "//*[@data-marker='messenger-button/link']",
-            "//a[@id='bx_contact_button_messenger']",
-            "//button[@data-marker='item-contact-bar/message-button']",
-            "//a[@data-marker='item-contact-bar/message-button']",
-            "//*[@data-marker='item-contact-bar/message-button']",
-            "//a[contains(., 'Написать сообщение')]",
-            "//button[contains(., 'Написать сообщение')]",
-            "//a[contains(., 'Написать')]",
-            "//button[contains(., 'Написать')]",
-        ]
-        for xpath in candidates:
-            try:
-                btn = WebDriverWait(self.driver, 3).until(
-                    EC.element_to_be_clickable((By.XPATH, xpath))
-                )
-                _human_delay(0.5, 1.5, stop_event=_tg.get_account_stop_event(self.account_name))
-                # T6: human_click сам делает scrollIntoView + Bezier-движение
-                # курсора + fallback'и (native click → JS click). Это закрывает
-                # старый кейс с ElementClickInterceptedException / sticky-header.
-                _human_click(
-                    self.driver, btn, stop_event=_tg.get_account_stop_event(self.account_name)
-                )
-                _human_delay(2, 4, stop_event=_tg.get_account_stop_event(self.account_name))
-                return True
-            except TimeoutException:
-                continue
-            except Exception as exc:
-                logger.debug("open_chat_overlay candidate %s failed: %s", xpath, exc)
+        """Делегирует в chat_sender."""
+        from chat_sender import open_chat_overlay as _open_overlay
 
-        log_func(self.account_name, "H1: кнопка «Написать» не найдена на листинге.")
-        return False
+        ok = _open_overlay(self.driver, self.account_name)
+        if not ok:
+            log_func(self.account_name, "H1: кнопка «Написать» не найдена на листинге.")
+        return ok
 
     def _type_and_send(self, text: str, log_func) -> bool:
-        """Найти chat-input, ввести текст по-человечески (символы с
-        задержками), нажать Send. Avito может рендерить input разными
-        способами (textarea / contenteditable / overlay), пробуем варианты.
-        """
-        input_xpaths = [
-            # Приоритет 1: icebreakers/textarea — основной видимый input Avito
-            "//textarea[@data-marker='icebreakers/textarea']",
-            # Приоритет 2: reply/input
-            "//textarea[@data-marker='reply/input']",
-            # Приоритет 3: другие
-            "//textarea[@data-marker='message-input']",
-            "//*[@data-marker='message-input']//textarea",
-            "//textarea[contains(@placeholder, 'Сообщение')]",
-            "//textarea[contains(@placeholder, 'сообщение')]",
-            "//div[@contenteditable='true' and (@role='textbox' or contains(@class, 'input'))]",
-            "//textarea",
-        ]
-        input_el = None
-        for xpath in input_xpaths:
-            try:
-                input_el = WebDriverWait(self.driver, 4).until(
-                    EC.visibility_of_element_located((By.XPATH, xpath))
-                )
-                break
-            except TimeoutException:
-                continue
+        """Делегирует в chat_sender."""
+        from chat_sender import type_and_send as _type_send
 
-        if input_el is None:
-            log_func(self.account_name, "H1: chat-input не найден после клика.")
-            return False
-
-        # T6: human-like focus вместо одиночного click без mousemove.
-        _human_click(
-            self.driver, input_el, stop_event=_tg.get_account_stop_event(self.account_name)
-        )
-        _human_delay(0.4, 1.2, stop_event=_tg.get_account_stop_event(self.account_name))
-
-        # Очистка поля: Avito предзаполняет icebreakers/textarea текстом
-        # вроде «Здравствуйте! ». Без очистки сообщение обрезается.
-        try:
-            input_el.send_keys(Keys.CONTROL + "a")
-            input_el.send_keys(Keys.DELETE)
-            _human_delay(0.2, 0.4, stop_event=_tg.get_account_stop_event(self.account_name))
-        except Exception:
-            pass
-
-        # T5: реалистичный typing — бёрсты + опечатки + persona-driven темп.
-        # Раньше: уравномерно 30-90ms/char (антифрод детектил по гистограмме).
-        # Теперь: type_human() с бёрстами 3-5 символов, отдыхом 180-380ms,
-        # 5-8% слов с опечаткой+backspace. Persona-id берётся из аккаунта
-        # (см. self.persona_id) и через persona_speed_multiplier превращается
-        # в множитель задержек (молодой → 0.95, инвестор → 1.20).
-        try:
-            from human_typing import length_speed_multiplier
-
-            speed_mul = persona_speed_multiplier(self.persona_id) * length_speed_multiplier(text)
-            if not _type_human(
-                input_el,
-                text,
-                speed_range=(0.05, 0.20),
-                speed_multiplier=speed_mul,
-                enable_typos=True,
-                stop_event=_tg.get_account_stop_event(self.account_name),
-            ):
-                return False
-        except StaleElementReferenceException:
-            log_func(self.account_name, "H1: input стал stale во время ввода — скип.")
-            return False
-        except Exception as exc:
-            log_func(self.account_name, f"H1: ошибка ввода текста: {exc}")
-            return False
-
-        _human_delay(1.5, 3.5, stop_event=_tg.get_account_stop_event(self.account_name))
-
-        # Avito 2026: кнопка отправки — <svg role="button" data-marker="icebreakers/send-message">.
-        # arguments[0].click() на SVG не работает (React не ловит программный клик).
-        # Надёжный способ: Enter в textarea. Запасной: dispatchEvent на SVG.
-
-        # Способ 1: Enter в textarea
-        try:
-            input_el.send_keys(Keys.ENTER)
-            log_func(self.account_name, "H1: сообщение отправлено (Enter в textarea).")
-        except Exception:
-            log_func(self.account_name, "H1: Enter не удался, пробуем SVG-кнопку...")
-
-            # Способ 2: dispatchEvent на SVG
-            try:
-                clicked = self.driver.execute_script(
-                    """
-                    var svg = document.querySelector(
-                        '[data-marker="icebreakers/send-message"]'
-                    ) || document.querySelector('[data-marker="send-message-button"]');
-                    if (!svg) return false;
-                    svg.dispatchEvent(new MouseEvent('click', {
-                        bubbles: true, cancelable: true, view: window
-                    }));
-                    return true;
-                    """
-                )
-                if clicked:
-                    log_func(self.account_name, "H1: сообщение отправлено (SVG dispatchEvent).")
-                else:
-                    raise RuntimeError("SVG not found")
-            except Exception:
-                # Способ 3: human_click
-                try:
-                    send_el = self.driver.find_element(
-                        By.CSS_SELECTOR, "[data-marker='icebreakers/send-message']"
-                    )
-                    if _human_click(
-                        self.driver,
-                        send_el,
-                        stop_event=_tg.get_account_stop_event(self.account_name),
-                    ):
-                        log_func(
-                            self.account_name, "H1: сообщение отправлено (human_click на SVG)."
-                        )
-                    else:
-                        log_func(self.account_name, "H1: все способы отправки упали.")
-                        return False
-                except Exception:
-                    log_func(self.account_name, "H1: все способы отправки упали.")
-                    return False
-
-        _human_delay(2, 5, stop_event=_tg.get_account_stop_event(self.account_name))
-
-        # Пост-проверка: Enter в Avito-textarea часто даёт перенос строки вместо
-        # отправки. Если сообщение реально не ушло — возвращаем False сейчас,
-        # иначе record_outbound запишет вечный dedup по profile_id.
-        if not self._verify_message_appeared(log_func):
-            log_func(self.account_name, "H1: сообщение не появилось в чате — Enter дал перенос.")
-            return False
-
-        # Post-send capture-check: иногда Avito подсовывает капчу сразу
-        # после первого outbound — это самый детектируемый момент.
-        if detect_phone_captcha(self.driver, log_func=log_func, account_name=self.account_name):
-            log_func(self.account_name, "H1: КАПЧА после Send — записываем как captcha.")
-            # T17: avito_message_send — outbound спровоцировал капчу.
-            # Кроме обычных штрафов, выключит outbound на 24h (см. mark_captcha).
-            _astate.mark_captcha(self.account_name, captcha_type="avito_message_send")
-            return False
-
-        return True
+        ok = _type_send(self.driver, self.account_name, text, self.persona_id)
+        if not ok:
+            log_func(self.account_name, "H1: type_and_send не удался.")
+        else:
+            log_func(self.account_name, f"H1: сообщение отправлено ({len(text)} chars).")
+        return ok
 
     def _verify_message_appeared(self, log_func) -> bool:
         """После отправки проверить что сообщение появилось в DOM чата.

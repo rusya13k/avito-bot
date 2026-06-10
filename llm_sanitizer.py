@@ -29,13 +29,13 @@ API:
 from __future__ import annotations
 
 import re
+import unicodedata
 
 # ── Лимиты длины ──────────────────────────────────────────────────────────
-# Avito принимает сообщения до ~4000 символов, но реалистичный человеческий
-# ответ короче. Слишком длинный ответ от LLM — признак галлюцинации или
-# попытки обойти фильтры через объём.
+# Avito принимает сообщения до ~4000 символов. 1500-2000 — комфортный
+# лимит для русскоязычных B2B-предложений.
 MIN_LEN = 5
-MAX_LEN = 800
+MAX_LEN = 1500
 
 
 # ── Регексы для опасных паттернов ─────────────────────────────────────────
@@ -100,7 +100,12 @@ def sanitize_llm_reply(text: str | None) -> tuple[str | None, str | None]:
     if text is None:
         return None, "empty"
 
-    stripped = text.strip()
+    # NFKC-нормализация: полноширинный ＋ → +, скрытые символы → обычные.
+    stripped = unicodedata.normalize("NFKC", text.strip())
+    # Удаление невидимых символов нулевой ширины.
+    stripped = stripped.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+    stripped = stripped.replace("\ufeff", "")  # BOM
+    stripped = stripped.replace("\u00ad", "")  # soft hyphen
     if not stripped:
         return None, "empty"
     if len(stripped) < MIN_LEN:

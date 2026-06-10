@@ -121,7 +121,9 @@ def _start_chrome(
             stderr_tmp.close()
             _logger.warning(
                 "Chrome start attempt %d failed on port %d. Stderr: %s",
-                attempt + 1, port, stderr_data or "(empty)",
+                attempt + 1,
+                port,
+                stderr_data or "(empty)",
             )
             try:
                 proc.kill()

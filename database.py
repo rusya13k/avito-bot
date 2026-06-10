@@ -165,6 +165,14 @@ class DatabaseManager:
                     score REAL
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS phone_listings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone_normalized TEXT NOT NULL,
+                    listing_id INTEGER NOT NULL,
+                    UNIQUE(phone_normalized, listing_id)
+                )
+            """)
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS dialogs (
@@ -280,6 +288,44 @@ class DatabaseManager:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_messages_dialog_id ON messages(dialog_id)"
             )
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_dialogs_dedup "
+                "ON dialogs(our_account, visitor_id, listing_id)"
+            )
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_dedup "
+                "ON messages(dialog_id, direction, text)"
+            )
+            # Performance indexes (P3.6)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_listings_classification ON listings(classification)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_listings_date_parsed ON listings(date_parsed)"
+            )
+
+            # P4-fix: TTL очистка старых метрик (default 45 дней) и
+            # behavioral_samples (30 дней). Выполняется при каждом старте.
+            self._cleanup_old_metrics(cursor)
+
+    def _cleanup_old_metrics(self, cursor=None):
+        """Удаляет метрики и behavioral_samples старше TTL.
+        Вызывается при init_database, безопасно на каждом старте.
+        """
+        try:
+            cursor.execute(
+                "DELETE FROM metrics WHERE bucket_hour < datetime('now', ?)",
+                ("-45 days",),
+            )
+            cursor.execute(
+                "DELETE FROM behavioral_samples WHERE ts < (strftime('%s', 'now') - ?)",
+                (30 * 86400,),
+            )
+        except Exception:
+            logger.warning("P4: cleanup old metrics failed (non-fatal)", exc_info=True)
 
     def _migrate_database(self):
         """
@@ -338,6 +384,23 @@ class DatabaseManager:
                 "CREATE INDEX IF NOT EXISTS idx_dialogs_account_visitor "
                 "ON dialogs(our_account, visitor_id, listing_id)"
             )
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_dialogs_dedup "
+                "ON dialogs(our_account, visitor_id, listing_id)"
+            )
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_dedup "
+                "ON messages(dialog_id, direction, text)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_listings_classification ON listings(classification)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_listings_date_parsed ON listings(date_parsed)"
+            )
 
             # E2: ускоряет get_metrics по (since, account, metric).
             # На старых БД, где init_database уже был вызван, таблица
@@ -395,6 +458,16 @@ class DatabaseManager:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_outbound_listing ON outbound_contacts(listing_id)"
             )
+
+            # D3-fix: phone_listings — для старых БД
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS phone_listings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone_normalized TEXT NOT NULL,
+                    listing_id INTEGER NOT NULL,
+                    UNIQUE(phone_normalized, listing_id)
+                )
+            """)
 
             # C3: captcha_log — идемпотентно для старых БД
             cursor.execute("""
@@ -1260,7 +1333,7 @@ class DatabaseManager:
                 (profile_id, name, active_listings_count, registration_date, score)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(profile_id) DO UPDATE SET
-                    name=excluded.name,
+                    name=COALESCE(excluded.name, avito_accounts.name),
                     active_listings_count=excluded.active_listings_count,
                     registration_date=excluded.registration_date,
                     score=excluded.score
@@ -1303,22 +1376,49 @@ class DatabaseManager:
     # Phones
     # ──────────────────────────────────────────────────────────────────────
 
-    def upsert_phone(self, phone_normalized, listing_count=1, score=0.0, cursor=None):
+    def upsert_phone(
+        self, phone_normalized, listing_count=1, score=0.0, cursor=None, listing_id=None
+    ):
         """
         Insert or update a phone number in the database.
 
         C4: cursor=... — для участия в общей транзакции с upsert_listing.
         Uses INSERT ... ON CONFLICT for atomic UPSERT (no SELECT-then-INSERT race).
+
+        D3-fix: listing_id — если передан, записывается в phone_listings
+        (UNIQUE phone+listing), и listing_count вычисляется как COUNT(*)
+        уникальных listing_id для этого телефона, а не инкрементом.
+        Это предотвращает бесконечный рост счётчика при репарсингах.
         """
         with self._with_cursor(write=True, cursor=cursor) as cursor:
+            if listing_id is not None:
+                # Гарантируем, что связь phone↔listing записана (идемпотентно).
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO phone_listings (phone_normalized, listing_id)
+                    VALUES (?, ?)
+                    """,
+                    (phone_normalized, listing_id),
+                )
+                # Пересчитываем уникальные listing_id для этого телефона.
+                cursor.execute(
+                    "SELECT COUNT(*) FROM phone_listings WHERE phone_normalized = ?",
+                    (phone_normalized,),
+                )
+                row = cursor.fetchone()
+                actual_count = row[0] if row else 0
+            else:
+                actual_count = listing_count
+
             cursor.execute(
                 """
                 INSERT INTO phones (phone_normalized, listing_count, score)
                 VALUES (?, ?, ?)
                 ON CONFLICT(phone_normalized) DO UPDATE SET
-                    listing_count = listing_count + excluded.listing_count
+                    listing_count = excluded.listing_count,
+                    score = excluded.score
                 """,
-                (phone_normalized, listing_count, score),
+                (phone_normalized, actual_count, score),
             )
 
     def get_phone_count(self, phone_normalized):
@@ -1378,30 +1478,26 @@ class DatabaseManager:
         cursor=None,
     ):
         """
-        Insert or update a dialog.
+        Insert or update a dialog. Атомарный UPSERT через ON CONFLICT —
+        устраняет race condition между SELECT (нет записи) и INSERT
+        (другой поток вставил).
 
         C4: cursor=... — позволяет атомарно объединить обновление статуса
         диалога с записью исходящего сообщения после успешной отправки.
         """
         with self._with_cursor(write=True, cursor=cursor) as cursor:
-            existing = self.get_dialog(our_account, visitor_id, listing_id, cursor=cursor)
-            if existing:
-                cursor.execute(
-                    """
-                    UPDATE dialogs
-                    SET status = ?, last_message_text = ?, last_message_time = ?
-                    WHERE id = ?
-                """,
-                    (status, last_message_text, last_message_time, existing["id"]),
-                )
-                return existing["id"]
-
             cursor.execute(
                 """
                 INSERT INTO dialogs
                 (listing_id, visitor_id, our_account, status, date_started,
                  last_message_text, last_message_time)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(our_account, visitor_id, listing_id)
+                DO UPDATE SET
+                    status = excluded.status,
+                    last_message_text = excluded.last_message_text,
+                    last_message_time = excluded.last_message_time
+                RETURNING id
             """,
                 (
                     listing_id,
@@ -1413,7 +1509,8 @@ class DatabaseManager:
                     last_message_time,
                 ),
             )
-            return cursor.lastrowid
+            row = cursor.fetchone()
+            return row[0] if row else None
 
     def add_message(self, dialog_id, direction, text, timestamp, classification=None, cursor=None):
         """
@@ -1425,22 +1522,16 @@ class DatabaseManager:
 
         C4: cursor=... — для атомарной связки "обновить диалог + добавить
         исходящее сообщение" сразу после _send_message.
+
+        Использует INSERT OR IGNORE с UNIQUE(dialog_id, direction, text, timestamp)
+        для устранения race condition между SELECT (нет записи) и INSERT
+        (другой поток вставил).
         """
         with self._with_cursor(write=True, cursor=cursor) as cursor:
             cursor.execute(
                 """
-                SELECT 1 FROM messages
-                WHERE dialog_id = ? AND direction = ? AND text = ?
-            """,
-                (dialog_id, direction, text),
-            )
-
-            if cursor.fetchone():
-                return
-
-            cursor.execute(
-                """
-                INSERT INTO messages (dialog_id, direction, text, timestamp, classification)
+                INSERT OR IGNORE INTO messages
+                (dialog_id, direction, text, timestamp, classification)
                 VALUES (?, ?, ?, ?, ?)
             """,
                 (dialog_id, direction, text, timestamp, classification),

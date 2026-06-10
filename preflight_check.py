@@ -81,13 +81,17 @@ def check_env_file(r: Result):
 
 def check_openai(r: Result):
     key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    # Поддержка DEEPSEEK_API_KEY как алиаса (env_config.py мапит его на OPENAI_API_KEY).
+    if not key:
+        key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
     base = (os.getenv("OPENAI_API_BASE") or "https://api.coda.ink/v1").strip()
     model = (os.getenv("OPENAI_MODEL") or "gpt-5.5").strip()
 
     if not key:
         r.fail(
-            "OpenAI API key",
-            "отсутствует — outbound и LLM-replies НЕ будут работать",
+            "LLM API key",
+            "ни OPENAI_API_KEY, ни DEEPSEEK_API_KEY не заданы — "
+            "outbound и LLM-replies НЕ будут работать",
         )
         return
 
@@ -118,21 +122,21 @@ def check_openai(r: Result):
             max_tokens=5,
         )
         out = (resp.choices[0].message.content or "").strip()
-        r.ok("OpenAI/LLM API", f"{provider}, model={model}, ping ok: {out[:30]!r}")
+        r.ok("LLM API", f"{provider}, model={model}, ping ok: {out[:30]!r}")
     except Exception as exc:
         msg = str(exc)
         if "401" in msg or "Incorrect" in msg or "Invalid" in msg:
             r.fail(
-                "OpenAI/LLM API",
+                "LLM API",
                 f"401 Auth error — ключ невалиден или истёк (provider={provider}, base={base})",
             )
         elif "404" in msg:
             r.fail(
-                "OpenAI/LLM API",
+                "LLM API",
                 f"404 — model={model!r} не существует у provider={provider}",
             )
         else:
-            r.fail("OpenAI/LLM API", f"{type(exc).__name__}: {msg[:120]}")
+            r.fail("LLM API", f"{type(exc).__name__}: {msg[:120]}")
 
 
 def check_telegram(r: Result):
@@ -168,29 +172,54 @@ def check_telegram(r: Result):
 
 def check_proxies(r: Result):
     p = ROOT / "proxies.txt"
+    accounts_path = ROOT / "accounts.json"
+    per_account_proxies = 0
+    if accounts_path.exists():
+        try:
+            accounts = json.loads(accounts_path.read_text(encoding="utf-8"))
+            if isinstance(accounts, list):
+                per_account_proxies = sum(
+                    1 for a in accounts if a.get("enabled", True) and a.get("proxy")
+                )
+        except (json.JSONDecodeError, OSError):
+            pass
+
     if not p.exists():
-        r.fail("proxies.txt", "отсутствует")
+        if per_account_proxies > 0:
+            r.ok(
+                "proxies.txt",
+                f"отсутствует, но {per_account_proxies} аккаунтов имеют индивидуальный proxy",
+            )
+        else:
+            r.fail(
+                "proxies",
+                "ни proxies.txt, ни per-account proxy не настроены",
+            )
         return
+
     lines = [
         line.strip()
         for line in p.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    if not lines:
+    if not lines and per_account_proxies == 0:
         r.fail(
-            "proxies.txt",
-            "пуст — потоки упадут при попытке выбрать random proxy",
+            "proxies",
+            "proxies.txt пуст и нет per-account proxy",
         )
         return
     # Базовая sanity: должен быть формат ip:port[:user:pass]
     bad = [ln for ln in lines if ln.count(":") not in (1, 3)]
+    detail = f"{len(lines)} прокси в файле"
+    if per_account_proxies:
+        detail += f" + {per_account_proxies} per-account"
     if bad:
         r.warn(
-            "proxies.txt",
-            f"{len(lines)} строк, но {len(bad)} в неверном формате: {bad[0][:30]}...",
+            "proxies",
+            f"{detail}, но {len(bad)} строк в неверном формате: {bad[0][:30]}...",
         )
     else:
-        r.ok("proxies.txt", f"{len(lines)} прокси")
+        r.ok("proxies", detail)
 
 
 def check_accounts(r: Result):
@@ -212,21 +241,34 @@ def check_accounts(r: Result):
     disabled = len(accounts) - len(enabled)
 
     issues = []
+    warnings = []
     for acc in enabled:
         name = acc.get("name", "?")
-        if not acc.get("user_id"):
-            issues.append(f"'{name}': нет user_id")
+        # AdsPower user_id больше не используется — проверяем chrome_profile_dir
+        if not acc.get("chrome_profile_dir"):
+            issues.append(f"'{name}': нет chrome_profile_dir")
+        if not acc.get("user_agent"):
+            warnings.append(f"'{name}': нет user_agent (будет использован дефолтный)")
+        if not acc.get("phone"):
+            warnings.append(f"'{name}': нет phone (B1-login не сработает)")
         cookies = acc.get("cookies_path")
         if cookies and not (ROOT / cookies).exists():
-            issues.append(f"'{name}': cookies файл не найден ({cookies})")
+            warnings.append(f"'{name}': cookies файл не найден ({cookies})")
 
     detail_parts = [f"{len(enabled)} active, {disabled} disabled"]
     if issues:
-        detail_parts.append("проблемы:")
+        detail_parts.append("блокеры:")
         for iss in issues[:3]:
             detail_parts.append(f"      • {iss}")
         if len(issues) > 3:
             detail_parts.append(f"      • ...и ещё {len(issues) - 3}")
+        r.fail("accounts.json", "\n    ".join(detail_parts))
+    elif warnings:
+        detail_parts.append("замечания:")
+        for w in warnings[:3]:
+            detail_parts.append(f"      • {w}")
+        if len(warnings) > 3:
+            detail_parts.append(f"      • ...и ещё {len(warnings) - 3}")
         r.warn("accounts.json", "\n    ".join(detail_parts))
     else:
         r.ok("accounts.json", " | ".join(detail_parts))

@@ -528,9 +528,6 @@ def _extract_coordinates(driver) -> dict:
         return {}
 
 
-
-
-
 def _enrich_phones_from_description(listing_data: dict) -> None:
     """D3: собираем все номера, упомянутые в описании. Продавцы часто
     дублируют контакт прямо в тексте. Объединяем с phone из «Показать
@@ -647,7 +644,9 @@ def _normalize_for_db(listing_data: dict) -> dict:
     }
 
 
-def _save_phones_for_listing(db_manager, cur, listing_data: dict) -> None:
+def _save_phones_for_listing(
+    db_manager, cur, listing_data: dict, listing_id: int | None = None
+) -> None:
     """D3: пишем ВСЕ найденные номера (через «Показать телефон» + из
     описания), не только основной. Критично для phone_frequency_signal
     в HeuristicScorer — если у одного агента 5 объявлений с одним номером
@@ -665,6 +664,7 @@ def _save_phones_for_listing(db_manager, cur, listing_data: dict) -> None:
             listing_count=1,
             score=0.0,
             cursor=cur,
+            listing_id=listing_id,
         )
 
 
@@ -749,7 +749,7 @@ def save_listing_to_db(listing_data, db_manager, log_func, account_name):
                     cursor=cur,
                 )
 
-            _save_phones_for_listing(db_manager, cur, listing_data)
+            _save_phones_for_listing(db_manager, cur, listing_data, listing_id=listing_id)
 
             # Inline heuristic classification — заполняет classification для новых
             # листингов сразу при парсинге (без LLM — только эвристика).

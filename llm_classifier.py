@@ -10,6 +10,15 @@ from heuristic_scorer import HeuristicScorer
 
 logger = logging.getLogger(__name__)
 
+
+def _escape_format(text: object) -> str:
+    """Экранирует фигурные скобки в пользовательских данных перед .format().
+    Предотвращает Prompt Injection через {0}, {__class__} и т.д.
+    """
+    s = str(text)
+    return s.replace("{", "{{").replace("}", "}}")
+
+
 # D5: путь к директории с промптами. Файлы хранятся как обычный текст,
 # чтобы их можно было редактировать без релиза кода и легко A/B-тестить.
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -212,6 +221,9 @@ class LLMClassifier:
             return self._scorer.calculate_score(listing_data)[:3]
 
         try:
+            # Fix: Claude prefill может добавить { перед существующим { → {{...}
+            if content.startswith("{{"):
+                content = content[1:]
             result = json.loads(content)
         except json.JSONDecodeError:
             logger.warning("LLM вернул не-JSON ответ: %r — fallback на эвристику", content[:200])
@@ -242,12 +254,12 @@ class LLMClassifier:
         active_count = listing_data.get("active_listings_count") or 0
         similar_count = listing_data.get("similar_listings_count") or 0
         return _load_prompt("classify_listing.user.txt").format(
-            title=listing_data.get("title", "") or "",
-            description=(listing_data.get("description", "") or "")[:1500],
-            seller_name=listing_data.get("seller_name", "") or "",
-            phone=listing_data.get("phone", "") or "",
-            profile_id=listing_data.get("profile_id", "") or "",
-            params=params_str,
+            title=_escape_format(listing_data.get("title", "") or ""),
+            description=_escape_format((listing_data.get("description", "") or "")[:1500]),
+            seller_name=_escape_format(listing_data.get("seller_name", "") or ""),
+            phone=_escape_format(listing_data.get("phone", "") or ""),
+            profile_id=_escape_format(listing_data.get("profile_id", "") or ""),
+            params=_escape_format(params_str),
             views=views,
             active_listings_count=active_count,
             similar_listings_count=similar_count,
@@ -286,10 +298,10 @@ class LLMClassifier:
 
             system_message = _load_prompt("generate_response.system.txt")
             prompt = _load_prompt("generate_response.user.txt").format(
-                title=context.get("title", "Недвижимость"),
-                price=context.get("price", "Не указана"),
-                description=(context.get("description") or "")[:500],
-                history_str=history_str,
+                title=_escape_format(context.get("title", "Недвижимость")),
+                price=_escape_format(context.get("price", "Не указана")),
+                description=_escape_format((context.get("description") or "")[:500]),
+                history_str=_escape_format(history_str),
             )
 
             logger.debug("generate_response prompt: %s", prompt[:500])

@@ -8,6 +8,7 @@ TTL: 10 минут.
 
 import hashlib
 import logging
+import threading
 import time
 from collections import OrderedDict
 
@@ -19,28 +20,31 @@ class LLMResponseCache:
         self._cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
         self.maxsize = maxsize
         self.ttl = ttl_sec
+        self._lock = threading.Lock()
 
     def _key(self, dialog_id: str | int, last_in_msg: str, persona: str | None) -> str:
         h = hashlib.sha256(f"{last_in_msg}:{persona or ''}".encode()).hexdigest()[:24]
         return f"{dialog_id}:{h}"
 
     def get(self, dialog_id, last_in_msg: str, persona: str | None) -> str | None:
-        key = self._key(dialog_id, last_in_msg, persona)
-        entry = self._cache.get(key)
-        if entry is None:
-            return None
-        text, ts = entry
-        if time.time() - ts > self.ttl:
-            self._cache.pop(key, None)
-            return None
-        # LRU: move to end
-        self._cache.move_to_end(key)
-        logger.debug("LLM cache HIT %s", key)
-        return text
+        with self._lock:
+            key = self._key(dialog_id, last_in_msg, persona)
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+            text, ts = entry
+            if time.time() - ts > self.ttl:
+                self._cache.pop(key, None)
+                return None
+            # LRU: move to end
+            self._cache.move_to_end(key)
+            logger.debug("LLM cache HIT %s", key)
+            return text
 
     def set(self, dialog_id, last_in_msg: str, persona: str | None, text: str) -> None:
-        key = self._key(dialog_id, last_in_msg, persona)
-        if len(self._cache) >= self.maxsize:
-            self._cache.popitem(last=False)
-        self._cache[key] = (text, time.time())
-        logger.debug("LLM cache SET %s", key)
+        with self._lock:
+            key = self._key(dialog_id, last_in_msg, persona)
+            if len(self._cache) >= self.maxsize:
+                self._cache.popitem(last=False)
+            self._cache[key] = (text, time.time())
+            logger.debug("LLM cache SET %s", key)

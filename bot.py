@@ -221,20 +221,21 @@ def load_cookies(driver: webdriver.Chrome, cookies_path: str, domain: str):
         pass
 
 
-
 def save_cookies(driver, cookies_path):
     """Save current browser cookies to JSON file."""
     import json
     from pathlib import Path
+
     path = Path(cookies_path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         cookies = driver.get_cookies()
-        with open(path, 'w', encoding='utf-8') as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(cookies, f, indent=2)
         return True
     except Exception:
         return False
+
 
 # ── Behavioral primitives ──────────────────────────────────────────────────
 
@@ -563,340 +564,101 @@ def _try_write_to_owner(
 
     log(account_name, "  Пишем собственнику...")
 
-    # 1. Клик «Написать» — селекторы Avito 2025-2026.
-    # Важно: используем presence_of_element_located (не element_to_be_clickable),
-    # потому что Avito часто рендерит кнопку за sticky-header или за overlay —
-    # Selenium считает её «not clickable», но JS-click работает.
-    # После нахождения — scrollIntoView + JS click.
-    chat_btn_selectors = [
-        (By.XPATH, "//a[@data-marker='messenger-button/link']"),
-        (By.CSS_SELECTOR, "a[data-marker='messenger-button/link']"),
-        (By.ID, "bx_contact-button_messenger"),
-        (By.XPATH, "//a[@id='bx_contact-button_messenger']"),
-        (By.XPATH, "//button[@data-marker='item-contact-bar/message-button']"),
-        (By.XPATH, "//a[@data-marker='item-contact-bar/message-button']"),
-        (By.XPATH, "//*[@data-marker='item-contact-bar/message-button']"),
-        (By.XPATH, "//a[contains(., 'Написать сообщение')]"),
-        (By.XPATH, "//button[contains(., 'Написать сообщение')]"),
-        (By.XPATH, "//a[contains(., 'Написать')]"),
-        (By.XPATH, "//button[contains(., 'Написать')]"),
-    ]
-    chat_btn = None
-    for by, selector in chat_btn_selectors:
-        try:
-            chat_btn = WebDriverWait(driver, 2).until(
-                EC.presence_of_element_located((by, selector))
-            )
-            break
-        except Exception:
-            continue
+    # 1. Открыть чат-оверлей — через chat_sensor (единая логика).
+    from chat_sender import open_chat_overlay, type_and_send
 
-    # Fallback: JS-поиск по data-marker или тексту.
-    if chat_btn is None:
-        try:
-            chat_btn = driver.execute_script(
-                """
-                var el = document.querySelector('a[data-marker="messenger-button/link"]');
-                if (el) return el;
-                var btns = document.querySelectorAll('a, button');
-                for (var i = 0; i < btns.length; i++) {
-                    var t = btns[i].textContent.trim();
-                    if (t.indexOf('Написать') === 0) return btns[i];
-                }
-                return null;
-            """
-            )
-            if chat_btn is not None:
-                log(account_name, "  Кнопка «Написать» найдена через JS-fallback.")
-        except Exception:
-            pass
-
-    if chat_btn is None:
-        # Debug: какие data-marker есть на странице.
-        try:
-            markers = driver.execute_script(
-                """
-                var result = [];
-                document.querySelectorAll('[data-marker]').forEach(function(el) {
-                    var m = el.getAttribute('data-marker');
-                    if (m.indexOf('message') !== -1 || m.indexOf('messenger') !== -1
-                        || m.indexOf('contact') !== -1) {
-                        result.push(m + '|' + el.tagName);
-                    }
-                });
-                return result.join('; ') || '(none)';
-            """
-            )
-            log(
-                account_name,
-                f"  Кнопка «Написать» не найдена. data-markers: {markers}",
-            )
-        except Exception:
-            log(account_name, "  Кнопка «Написать» не найдена (debug failed).")
+    if not open_chat_overlay(driver, account_name):
+        log(account_name, "  Не удалось открыть чат (кнопка «Написать» не найдена).")
         return
 
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", chat_btn)
-        hp(1.0, 2.5)
-        # JS click — надёжнее чем Selenium click, обходит
-        # ElementClickInterceptedException от sticky-header/overlay.
-        driver.execute_script("arguments[0].click();", chat_btn)
-        log(account_name, "  Кнопка «Написать» нажата (JS click).")
-        hp(2, 4)
-    except Exception:
-        # Fallback: попробовать move_click если JS click не сработал.
+    # 2. Текст сообщения — AI-генерация с fallback на статичные шаблоны.
+    # Приоритет: LLM генерирует персонализированное сообщение под листинг
+    # (persona, заголовок, локация, описание), затем санитайзер
+    # отфильтровывает контакты/запрещёнку.
+    # Если LLM недоступна или вернула пустое — fallback на шаблоны.
+    text = None
+    if llm_classifier is not None:
         try:
-            move_click(driver, chat_btn)
-            log(account_name, "  Кнопка «Написать» нажата (move_click).")
-            hp(2, 4)
-        except Exception:
-            log(account_name, "  Не удалось кликнуть «Написать».")
-            return
+            text = _generate_view_listing_message(driver, llm_classifier, account_name, account)
+            if text:
+                log(account_name, f"  AI-генерация: OK ({len(text)} chars)")
+        except Exception as exc:
+            log(account_name, f"  AI-генерация не удалась ({exc}), fallback на шаблон.")
+            text = None
 
-    # 2. Текст сообщения — вариации от заказчика.
-    # Один смысл, разные формулировки — чтобы Avito не детектил спам
-    # и не давал теневой бан за идентичные сообщения.
-    text = random.choice(
-        [
-            # Вариант 1 — исходный
-            (
-                "Здравствуйте. Занимаюсь строительством и сдачей небольших торговых "
-                "центров, есть уже 15 готовых арендных бизнесов по Татарстану и сейчас "
-                "нахожусь в поиске финансовых партнеров для строительства новых объектов. "
-                "Средняя окупаемость объекта для инвестора от 6 до 8 лет.\n"
-                "Интересно обсудить?"
-            ),
-            # Вариант 2 — другой порядок предложений
-            (
-                "Добрый день! Строю и сдаю небольшие торговые центры — на данный "
-                "момент 15 арендных бизнесов работают по Татарстану. Сейчас ищу "
-                "финансовых партнёров для новых объектов. Окупаемость для инвестора "
-                "6-8 лет. Было бы интересно поговорить?"
-            ),
-            # Вариант 3 — короче, разговорнее
-            (
-                "Здравствуйте! У меня 15 действующих арендных бизнесов в Татарстане "
-                "(торговые центры). Сейчас запускаю новые объекты и ищу инвесторов-"
-                "партнёров. Срок окупаемости 6-8 лет. Подскажите, вам было бы "
-                "интересно рассмотреть?"
-            ),
-            # Вариант 4 — с вопроса
-            (
-                "Здравствуйте, подскажите, рассматриваете варианты инвестиций в "
-                "коммерческую недвижимость? Я занимаюсь строительством торговых "
-                "центров — 15 объектов уже работают по Татарстану. Сейчас набираю "
-                "партнёров на новые проекты, окупаемость 6-8 лет."
-            ),
-            # Вариант 5 — от первого лица, другой акцент
-            (
-                "Приветствую! Строю торговые центры и сдаю в аренду — 15 объектов "
-                "по Татарстану уже приносят доход. Расширяюсь и ищу финансового "
-                "партнёра на новые площадки. Инвестор выходит в плюс за 6-8 лет. "
-                "Готов обсудить детали, если интересно."
-            ),
-            # Вариант 6 — более деловой
-            (
-                "Здравствуйте. Мы строим и управляем небольшими торговыми центрами "
-                "в Татарстане — в портфолио 15 работающих арендных бизнесов. На "
-                "данный момент привлекаем соинвесторов на новые проекты. Средний "
-                "срок возврата инвестиций — от 6 до 8 лет. Есть ли интерес обсудить?"
-            ),
-            # Вариант 7 — короткий и прямой
-            (
-                "Добрый день! 15 арендных бизнесов в Татарстане (ТЦ) — мои. Ищу "
-                "инвесторов на новые объекты. Окупаемость 6-8 лет. Интересно?"
-            ),
-            # Вариант 8 — с упоминанием региона гибко
-            (
-                "Здравствуйте! Занимаюсь коммерческой недвижимостью — 15 торговых "
-                "центров уже сданы в аренду в Республике Татарстан. Сейчас ищу "
-                "партнёров-инвесторов для строительства следующих объектов. "
-                "Окупаемость порядка 6-8 лет. Хотелось бы обсудить, если актуально."
-            ),
-            # Вариант 9 — мягкий заход
-            (
-                "Здравствуйте! Увидел ваше объявление — интересно. Сам занимаюсь "
-                "торговыми центрами, 15 объектов по Татарстану уже работают. Ищу "
-                "финансовых партнёров для новых строек, окупаемость 6-8 лет. "
-                "Может быть рассмотрим варианты?"
-            ),
-            # Вариант 10 — акцент на цифрах
-            (
-                "Добрый день! 15 арендных бизнесов, 6-8 лет окупаемость, Татарстан — "
-                "это мои текущие объекты. Расширяюсь и ищу инвесторов-партнёров на "
-                "новые торговые центры. Рассмотрите предложение?"
-            ),
-        ]
-    )
+    if text is None:
+        # Fallback: статичные шаблоны для случаев без LLM.
+        text = random.choice(
+            [
+                (
+                    "Здравствуйте. Занимаюсь строительством и сдачей небольших торговых "
+                    "центров, есть уже 15 готовых арендных бизнесов по Татарстану и сейчас "
+                    "нахожусь в поиске финансовых партнеров для строительства новых объектов. "
+                    "Средняя окупаемость объекта для инвестора от 6 до 8 лет.\n"
+                    "Интересно обсудить?"
+                ),
+                (
+                    "Добрый день! Строю и сдаю небольшие торговые центры — на данный "
+                    "момент 15 арендных бизнесов работают по Татарстану. Сейчас ищу "
+                    "финансовых партнёров для новых объектов. Окупаемость для инвестора "
+                    "6-8 лет. Было бы интересно поговорить?"
+                ),
+                (
+                    "Здравствуйте! У меня 15 действующих арендных бизнесов в Татарстане "
+                    "(торговые центры). Сейчас запускаю новые объекты и ищу инвесторов-"
+                    "партнёров. Срок окупаемости 6-8 лет. Подскажите, вам было бы "
+                    "интересно рассмотреть?"
+                ),
+                (
+                    "Здравствуйте, подскажите, рассматриваете варианты инвестиций в "
+                    "коммерческую недвижимость? Я занимаюсь строительством торговых "
+                    "центров — 15 объектов уже работают по Татарстану. Сейчас набираю "
+                    "партнёров на новые проекты, окупаемость 6-8 лет."
+                ),
+                (
+                    "Приветствую! Строю торговые центры и сдаю в аренду — 15 объектов "
+                    "по Татарстану уже приносят доход. Расширяюсь и ищу финансового "
+                    "партнёра на новые площадки. Инвестор выходит в плюс за 6-8 лет. "
+                    "Готов обсудить детали, если интересно."
+                ),
+                (
+                    "Здравствуйте. Мы строим и управляем небольшими торговыми центрами "
+                    "в Татарстане — в портфолио 15 работающих арендных бизнесов. На "
+                    "данный момент привлекаем соинвесторов на новые проекты. Средний "
+                    "срок возврата инвестиций — от 6 до 8 лет. Есть ли интерес обсудить?"
+                ),
+                (
+                    "Добрый день! 15 арендных бизнесов в Татарстане (ТЦ) — мои. Ищу "
+                    "инвесторов на новые объекты. Окупаемость 6-8 лет. Интересно?"
+                ),
+                (
+                    "Здравствуйте! Занимаюсь коммерческой недвижимостью — 15 торговых "
+                    "центров уже сданы в аренду в Республике Татарстан. Сейчас ищу "
+                    "партнёров-инвесторов для строительства следующих объектов. "
+                    "Окупаемость порядка 6-8 лет. Хотелось бы обсудить, если актуально."
+                ),
+                (
+                    "Здравствуйте! Увидел ваше объявление — интересно. Сам занимаюсь "
+                    "торговыми центрами, 15 объектов по Татарстану уже работают. Ищу "
+                    "финансовых партнёров для новых строек, окупаемость 6-8 лет. "
+                    "Может быть рассмотрим варианты?"
+                ),
+                (
+                    "Добрый день! 15 арендных бизнесов, 6-8 лет окупаемость, Татарстан — "
+                    "это мои текущие объекты. Расширяюсь и ищу инвесторов-партнёров на "
+                    "новые торговые центры. Рассмотрите предложение?"
+                ),
+            ]
+        )
 
-    # 3. Найти chat-input и ввести текст.
-    # Avito mini-messenger popup имеет ДВА textarea:
-    #   icebreakers/textarea — предзаполнен «Здравствуйте! », основной видимый
-    #   reply/input          — пустой, маленький, внизу (НЕ основной)
-    # Пишем в icebreakers/textarea (предпочтительный) или reply/input,
-    # но ВСЕГДА сначала очищаем Ctrl+A → Delete, иначе текст смешивается
-    # с предзаполненным айсбрейкером и сообщение уходит обрезанным.
-    input_selectors = [
-        # Приоритет 1: icebreakers/textarea — основной видимый input Avito
-        (By.CSS_SELECTOR, "textarea[data-marker='icebreakers/textarea']"),
-        (By.XPATH, "//textarea[@data-marker='icebreakers/textarea']"),
-        # Приоритет 2: reply/input — запасной
-        (By.CSS_SELECTOR, "textarea[data-marker='reply/input']"),
-        (By.XPATH, "//textarea[@data-marker='reply/input']"),
-        # Приоритет 3: другие
-        (By.XPATH, "//textarea[@data-marker='message-input']"),
-        (By.CSS_SELECTOR, "textarea[data-marker='message-input']"),
-        (By.XPATH, "//textarea[contains(@placeholder, 'Сообщ')]"),
-        (By.XPATH, "//textarea[contains(@placeholder, 'сообщ')]"),
-        (By.CSS_SELECTOR, "div[contenteditable='true'][role='textbox']"),
-        (By.XPATH, "//textarea"),
-    ]
-    input_el = None
-    for by, selector in input_selectors:
-        try:
-            # visibility_of — ждём что элемент реально видимый, не display:none
-            input_el = WebDriverWait(driver, 3).until(
-                EC.visibility_of_element_located((by, selector))
-            )
-            break
-        except Exception:
-            continue
-
-    # JS-fallback: найти ВИДИМЫЙ input через JS если Selenium не видит.
-    if input_el is None:
-        try:
-            input_el = driver.execute_script(
-                """
-                // Приоритет: icebreakers/textarea > reply/input > любой textarea
-                var candidates = [
-                    'textarea[data-marker="icebreakers/textarea"]',
-                    'textarea[data-marker="reply/input"]',
-                    'textarea[data-marker="message-input"]'
-                ];
-                for (var i = 0; i < candidates.length; i++) {
-                    var el = document.querySelector(candidates[i]);
-                    if (el && el.offsetParent !== null) return el;
-                }
-                var ce = document.querySelector('div[contenteditable="true"][role="textbox"]');
-                if (ce && ce.offsetParent !== null) return ce;
-                var tas = document.querySelectorAll('textarea');
-                for (var i = 0; i < tas.length; i++) {
-                    if (tas[i].offsetParent !== null) return tas[i];
-                }
-                return null;
-                """
-            )
-            if input_el is not None:
-                log(account_name, "  Chat-input найден через JS-fallback (visibility).")
-        except Exception:
-            pass
-
-    if input_el is None:
-        log(account_name, "  Chat-input не найден после клика «Написать».")
+    # 3. Ввести текст и отправить — через chat_sender (единая логика).
+    persona_id = (account or {}).get("persona")
+    if not type_and_send(driver, account_name, text, persona_id):
+        log(account_name, "  type_and_send не удался.")
         return
+    log(account_name, f"  ✉ Сообщение отправлено собственнику: {text[:80]}...")
 
-    # Debug: показать tag + data-marker найденного элемента.
-    try:
-        tag = input_el.tag_name
-        marker = input_el.get_attribute("data-marker") or ""
-        log(account_name, f"  Chat-input найден: <{tag}> marker={marker}")
-    except Exception:
-        pass
-
-    try:
-        move_click(driver, input_el)
-        hp(0.4, 1.2)
-        # Очистка поля: Avito предзаполняет icebreakers/textarea текстом
-        # вроде «Здравствуйте! ». Если не очистить — наше сообщение
-        # смешивается с айсбрейкером и уходит обрезанным.
-        try:
-            input_el.send_keys(Keys.CONTROL + "a")
-            input_el.send_keys(Keys.DELETE)
-            hp(0.2, 0.4)
-        except Exception:
-            pass
-        # Реалистичный typing через human_typing.
-        from human_typing import length_speed_multiplier, persona_speed_multiplier, type_human
-
-        persona_id = (account or {}).get("persona")
-        speed_mul = persona_speed_multiplier(persona_id) * length_speed_multiplier(text)
-        if not type_human(
-            input_el,
-            text,
-            speed_range=(0.05, 0.20),
-            speed_multiplier=speed_mul,
-            enable_typos=True,
-            stop_event=_tg.get_account_stop_event(account_name),
-        ):
-            log(account_name, "  Ввод прерван (stop_event).")
-            return
-    except Exception as exc:
-        log(account_name, f"  Ошибка ввода текста: {exc}")
-        return
-
-    hp(1.5, 3.5)
-
-    # 4. Нажать Send.
-    # Avito 2026: кнопка отправки — <svg role="button" data-marker="icebreakers/send-message">.
-    # arguments[0].click() на SVG не работает (React не ловит программный клик).
-    # Надёжный способ: Enter в textarea (нативный для web-чатов).
-    # Запасной: dispatchEvent(MouseEvent) на SVG-элемент.
-    from selenium.webdriver.common.keys import Keys
-
-    # Способ 1: Enter в textarea — самый надёжный для Avito
-    try:
-        input_el.send_keys(Keys.ENTER)
-        log(account_name, "  Сообщение отправлено (Enter в textarea).")
-    except Exception:
-        log(account_name, "  Enter в textarea не удался, пробуем SVG-кнопку...")
-
-        # Способ 2: dispatchEvent на SVG[role="button"]
-        try:
-            clicked = driver.execute_script(
-                """
-                var svg = document.querySelector(
-                    '[data-marker="icebreakers/send-message"]'
-                ) || document.querySelector('[data-marker="send-message-button"]');
-                if (!svg) return false;
-                svg.dispatchEvent(new MouseEvent('click', {
-                    bubbles: true, cancelable: true, view: window
-                }));
-                return true;
-                """
-            )
-            if clicked:
-                log(account_name, "  Сообщение отправлено (SVG dispatchEvent).")
-            else:
-                raise RuntimeError("SVG not found")
-        except Exception:
-            # Способ 3: move_click на найденный элемент
-            try:
-                send_el = driver.find_element(
-                    By.CSS_SELECTOR, "[data-marker='icebreakers/send-message']"
-                )
-                if move_click(driver, send_el):
-                    log(account_name, "  Сообщение отправлено (move_click на SVG).")
-                else:
-                    log(account_name, "  Все способы отправки упали.")
-                    return
-            except Exception:
-                log(account_name, "  Все способы отправки упали.")
-                return
-
-    hp(2, 5)
-
-    # 5. Закрываем чат-оверлей — после отправки Avito может оставить overlay
-    # открытым, что ломает driver.back() в browse/find_and_view.
-    try:
-        # Пробуем нажать Escape (закрывает большинство overlay-окон Avito).
-        from selenium.webdriver.common.keys import Keys
-
-        driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-        hp(1, 2)
-    except Exception:
-        pass
-
-    # 6. Post-send: детект капчи + запись в БД.
+    # 4. Post-send: детект капчи + запись в БД.
     from captcha_detect import detect_phone_captcha
 
     if detect_phone_captcha(driver, log_func=log, account_name=account_name):
@@ -935,6 +697,11 @@ def _try_write_to_owner(
             db_manager.incr_metric(account_name, "messages_sent")
         except Exception:
             pass
+
+
+def _escape_format(text: object) -> str:
+    s = str(text)
+    return s.replace("{", "{{").replace("}", "}}")
 
 
 def _generate_view_listing_message(
@@ -1015,12 +782,12 @@ def _generate_view_listing_message(
 
         system_message = _load_prompt(system_prompt_name)
         user_prompt = _load_prompt(user_prompt_name).format(
-            title=listing_info.get("title", "—"),
-            category=listing_info.get("category", "коммерческая недвижимость"),
-            location=listing_info.get("location", "—"),
-            area=listing_info.get("area", "—"),
-            price=listing_info.get("price", "не указана"),
-            description=listing_info.get("description", "")[:600],
+            title=_escape_format(listing_info.get("title", "—")),
+            category=_escape_format(listing_info.get("category", "коммерческая недвижимость")),
+            location=_escape_format(listing_info.get("location", "—")),
+            area=_escape_format(listing_info.get("area", "—")),
+            price=_escape_format(listing_info.get("price", "не указана")),
+            description=_escape_format(listing_info.get("description", "")[:600]),
             persona_description=persona_description,
             formality=formality,
             length=length,
@@ -1435,18 +1202,18 @@ def _do_profile_check(driver, account_name: str) -> None:
 # вариантов на случай smooth-rollouts разметки (Yandex иногда раскатывает
 # A/B по разным регионам/устройствам). Достаточно совпадения ОДНОГО из них.
 _YANDEX_RESULT_SELECTORS = [
-    "li.serp-item",       # классический контейнер органики
+    "li.serp-item",  # классический контейнер органики
     "li.serp-item_card",  # обновлённая карточная структура (редизайн)
-    "div.serp-item",      # div-версия контейнера
+    "div.serp-item",  # div-версия контейнера
     "h2.organic__title",  # стандартная обёртка заголовка
-    "a.organic__url",     # основная ссылка результата
+    "a.organic__url",  # основная ссылка результата
     "a[class*='organic__url']",  # гибкий селектор ссылки
-    ".organic__url-text", # домены под заголовком
+    ".organic__url-text",  # домены под заголовком
     "ul.serp-list > li",  # родительский контейнер списка
     "div.organic__content-wrapper",  # блок с описанием результата
     "[role='main'] [role='listitem']",
-    "article",            # article-контейнер (версия для мобильных/планшетов)
-    "li[data-cid]",       # data-cid контейнер
+    "article",  # article-контейнер (версия для мобильных/планшетов)
+    "li[data-cid]",  # data-cid контейнер
 ]
 
 _YANDEX_REGION_MOSCOW = 213
@@ -1671,6 +1438,7 @@ def browse_commercial_categories(
     _deal_suffix = ""
     _deal_type = "rent"
     _pmin = None
+    _pmax = None
     if _cities:
         _city_prefix = "/" + random.choice(_cities)
         # Поддержка deal_types (список) и deal_type (строка).

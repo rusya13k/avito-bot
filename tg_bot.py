@@ -108,10 +108,13 @@ def _send_message(text: str) -> None:
     H9-fix: rate limiting — не чаще 1 сообщения в _ALERT_MIN_INTERVAL секунд.
     """
     global _last_alert_time
+    now = time.time()
     with _last_alert_lock:
-        now = time.time()
         if now - _last_alert_time < _ALERT_MIN_INTERVAL:
             return
+        # TOCTOU-fix: обновляем timestamp ДО отправки, в том же lock'е.
+        # Другой поток, проверяющий в этот момент, увидит актуальное время.
+        _last_alert_time = now
     ctrl = _tg_controller
     targets = (
         ctrl.admin_ids
@@ -119,16 +122,11 @@ def _send_message(text: str) -> None:
         else ({ctrl.admin_id} if ctrl and ctrl.admin_id else set())
     )
     if targets:
-        sent = False
         for aid in targets:
             try:
                 ctrl.bot.send_message(aid, text)
-                sent = True
             except Exception:
                 pass
-        if sent:
-            with _last_alert_lock:
-                _last_alert_time = now
 
 
 def send_user_action_request(account_name: str, request_id: str, prompt: str) -> bool:

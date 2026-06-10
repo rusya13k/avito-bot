@@ -63,10 +63,21 @@ class ListingClassifier:
                 llm_classification,
                 llm_confidence,
             )
-            classification = llm_classification
-            confidence = llm_confidence
-            reason = llm_reason
-            source = "llm"
+            # D3-fix: ансамбль — доверяем LLM только если она увереннее
+            # эвристики И не вернула "uncertain".
+            llm_confident = llm_classification != "uncertain" and llm_confidence > confidence
+            if llm_confident:
+                classification = llm_classification
+                confidence = llm_confidence
+                reason = llm_reason
+                source = "llm"
+                logger.info(
+                    "Ensemble: LLM перебил эвристику (%s,%.2f vs %s,%.2f)",
+                    llm_classification,
+                    llm_confidence,
+                    classification,
+                    confidence,
+                )
 
         return {
             "classification": classification,

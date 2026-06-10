@@ -132,7 +132,9 @@ def _avito_time_to_iso(time_text: str) -> str | None:
         hour, minute = int(m.group(4)), int(m.group(5))
         if month:
             try:
-                return datetime.datetime(year, month, day, hour, minute, 0).strftime("%Y-%m-%d %H:%M:%S")
+                return datetime.datetime(year, month, day, hour, minute, 0).strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
             except ValueError:
                 pass
 
@@ -501,50 +503,47 @@ class AvitoMessenger:
             )
             chat_history = []
 
-            # Save dialog to DB
-            dialog_id = self.db.upsert_dialog(
-                our_account=self.account_name,
-                visitor_id=visitor_id,
-                listing_id=listing_id,
-                status="active",
-                last_message_text="",
-                last_message_time=time.strftime("%Y-%m-%d %H:%M:%S"),
-            )
+            # Атомарная запись диалога + сообщений в одной транзакции.
+            with self.db.transaction() as cur:
+                dialog_id = self.db.upsert_dialog(
+                    our_account=self.account_name,
+                    visitor_id=visitor_id,
+                    listing_id=listing_id,
+                    status="active",
+                    last_message_text="",
+                    last_message_time=time.strftime("%Y-%m-%d %H:%M:%S"),
+                    cursor=cur,
+                )
 
-            for msg_el in messages_elements:
-                try:
-                    # Determine direction (in/out)
-                    marker = msg_el.get_attribute("data-marker")
-                    is_out = "out" in marker if marker else False
-                    direction = "out" if is_out else "in"
-                    text = msg_el.find_element(
-                        By.XPATH, ".//*[@data-marker='messenger/message/text']"
-                    ).text
-                    # Парсим реальный timestamp из DOM (Avito показывает время
-                    # рядом с сообщением). Fallback на server time если не найден.
-                    timestamp = _parse_message_timestamp(msg_el) or time.strftime(
-                        "%Y-%m-%d %H:%M:%S"
+                for msg_el in messages_elements:
+                    try:
+                        marker = msg_el.get_attribute("data-marker")
+                        is_out = "out" in marker if marker else False
+                        direction = "out" if is_out else "in"
+                        text = msg_el.find_element(
+                            By.XPATH, ".//*[@data-marker='messenger/message/text']"
+                        ).text
+                        timestamp = _parse_message_timestamp(msg_el) or time.strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        chat_history.append({"direction": direction, "text": text})
+                        self.db.add_message(dialog_id, direction, text, timestamp, cursor=cur)
+                    except Exception:
+                        continue
+
+                if chat_history:
+                    self.db.upsert_dialog(
+                        our_account=self.account_name,
+                        visitor_id=visitor_id,
+                        listing_id=listing_id,
+                        status="active",
+                        last_message_text=chat_history[-1]["text"],
+                        last_message_time=time.strftime("%Y-%m-%d %H:%M:%S"),
+                        cursor=cur,
                     )
-
-                    chat_history.append({"direction": direction, "text": text})
-
-                    # Save message to DB
-                    self.db.add_message(dialog_id, direction, text, timestamp)
-                except Exception:
-                    continue
 
             if not chat_history:
                 return
-
-            # Update dialog with last message info
-            self.db.upsert_dialog(
-                our_account=self.account_name,
-                visitor_id=visitor_id,
-                listing_id=listing_id,
-                status="active",
-                last_message_text=chat_history[-1]["text"],
-                last_message_time=time.strftime("%Y-%m-%d %H:%M:%S"),
-            )
 
             # Re-check stop before any outgoing action.
             if _stopping(self.account_name):

@@ -177,14 +177,14 @@ def test_browse_no_city_filter_no_prefix():
     """Без search_filters URL начинается сразу с /nedvizhimost."""
     urls = _run_browse()
     assert urls, "safe_get не был вызван"
-    assert urls[0].startswith("https://www.avito.ru/nedvizhimost")
+    assert urls[0].startswith("https://www.avito.ru/kommercheskaya_nedvizhimost")
 
 
 def test_browse_city_prefix_added():
     """cities=['volgograd'] → /volgograd/ перед путём категории."""
     urls = _run_browse(search_filters={"cities": ["volgograd"]})
     assert urls, "safe_get не был вызван"
-    assert urls[0].startswith("https://www.avito.ru/volgograd/nedvizhimost")
+    assert urls[0].startswith("https://www.avito.ru/volgograd/kommercheskaya_nedvizhimost")
 
 
 def test_browse_multiple_categories_same_city():
