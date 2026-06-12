@@ -2341,17 +2341,13 @@ def _active_probability(account: dict, cfg: dict, hour: int | None = None) -> fl
         if not (int(start) <= hour < int(end)):
             return 0.0
 
-    pattern = (
-        account.get("activity_pattern")
-        if account.get("activity_pattern") is not None
-        else cfg.get("activity_pattern")
-        if cfg.get("activity_pattern") is not None
-        else _ACTIVITY_BY_HOUR
-    )
+    pattern = account.get("activity_pattern")
+    if not isinstance(pattern, dict):
+        pattern = cfg.get("activity_pattern")
+    if not isinstance(pattern, dict):
+        pattern = _ACTIVITY_BY_HOUR
     # Ключи в JSON всегда строки — нормализуем оба варианта.
-    if isinstance(pattern, dict):
-        return float(pattern.get(hour, pattern.get(str(hour), 0.5)))
-    return 0.5
+    return float(pattern.get(hour, pattern.get(str(hour), 0.5)))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
