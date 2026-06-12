@@ -138,34 +138,49 @@ def connect_to_sphere(debug_port: int, webdriver_path: str | None = None) -> web
     """Connect Selenium to already running Chrome profile.
 
     При подключении через AdsPower передаётся webdriver_path от API.
+    Сначала убиваем старые chromedriver процессы, чтобы избежать конфликта портов.
     """
     _bot_logger.info("Waiting for Chrome to be ready on port %d...", debug_port)
     browser_version = _wait_chrome_ready(debug_port)
     if browser_version:
         _bot_logger.info("Chrome version: %s (ready)", browser_version)
 
+    # Убиваем старые chromedriver'ы — они висят с прошлых restart-циклов
+    try:
+        subprocess.run(["pkill", "-f", "chromedriver.*chrome-logs"], capture_output=True, timeout=5)
+    except Exception:
+        pass
+    time.sleep(0.5)
+
     options = webdriver.ChromeOptions()
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{debug_port}")
 
+    # Попытка 1: через service из webdriver_path (AdsPower)
     if webdriver_path:
-        from selenium.webdriver.chrome.service import Service as ChromeService
-
-        service = ChromeService(webdriver_path)
-        driver = webdriver.Chrome(service=service, options=options)
-    else:
-        # Фолбэк: chromedriver из PATH или ChromeDriverManager
         try:
-            driver = webdriver.Chrome(options=options)
-        except Exception:
-            try:
-                if browser_version:
-                    service = Service(ChromeDriverManager(driver_version=browser_version).install())
-                else:
-                    service = Service(ChromeDriverManager().install())
-                driver = webdriver.Chrome(service=service, options=options)
-            except Exception as e2:
-                _bot_logger.warning("ChromeDriverManager failed: %s", e2)
-                driver = webdriver.Chrome(options=options)
+            return webdriver.Chrome(service=Service(webdriver_path), options=options)
+        except Exception as exc:
+            _bot_logger.warning("connect_to_sphere: AdsPower chromedriver failed (%s), falling back...", exc)
+
+    # Попытка 2: chromedriver из PATH (системный)
+    try:
+        return webdriver.Chrome(options=options)
+    except Exception as exc:
+        _bot_logger.warning("connect_to_sphere: system chromedriver failed (%s), trying ChromeDriverManager...", exc)
+
+    # Попытка 3: ChromeDriverManager
+    try:
+        if browser_version:
+            return webdriver.Chrome(service=Service(ChromeDriverManager(driver_version=browser_version).install()), options=options)
+    except Exception:
+        pass
+
+    # Попытка 4: ChromeDriverManager без версии
+    try:
+        return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    except Exception as exc:
+        _bot_logger.error("All chromedriver attempts failed: %s", exc)
+        raise
 
     # Stealth (AdsPower не нужен, но на всякий случай не убираем)
     if not _apply_stealth(driver):
