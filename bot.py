@@ -2057,11 +2057,10 @@ def perform_login(driver, wait, account_name, phone, password):
 def get_random_proxy():
     """Reads proxies.txt and returns a list of proxy strings."""
     try:
-        # Сначала ищем рядом с bot.py (работает при запуске из любого каталога).
-        path = Path(__file__).resolve().parent / "proxies.txt"
+        # CWD first (тесты monkeypatch.chdir в tmp), fallback — рядом с bot.py
+        path = Path("proxies.txt")
         if not path.exists():
-            # Fallback: CWD (для тестов и legacy-запуска).
-            path = Path("proxies.txt")
+            path = Path(__file__).resolve().parent / "proxies.txt"
 
         if not path.exists():
             return None
@@ -2081,10 +2080,10 @@ def _load_proxies_pool() -> list[str]:
     `get_random_proxy` (backward-compat для legacy-пути / тестов).
     """
     try:
-        path = Path(__file__).resolve().parent / "proxies.txt"
+        # CWD first (тесты monkeypatch.chdir в tmp), fallback — рядом с bot.py
+        path = Path("proxies.txt")
         if not path.exists():
-            # Fallback: CWD (для тестов и legacy-запуска).
-            path = Path("proxies.txt")
+            path = Path(__file__).resolve().parent / "proxies.txt"
         if not path.exists():
             return []
         with open(path, encoding="utf-8") as f:
