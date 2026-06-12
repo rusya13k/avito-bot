@@ -58,6 +58,9 @@ class AdsPowerLauncher:
             time.sleep(1)
 
         logger.info("AdsPower runtime не отвечает — запускаю...")
+        env = os.environ.copy()
+        if "DISPLAY" not in env:
+            env["DISPLAY"] = ":99"
         for attempt in range(3):
             try:
                 subprocess.run(
@@ -65,6 +68,7 @@ class AdsPowerLauncher:
                     capture_output=True,
                     text=True,
                     timeout=20,
+                    env=env,
                 )
                 for _ in range(10):
                     time.sleep(1.5)
