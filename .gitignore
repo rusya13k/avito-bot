@@ -80,3 +80,6 @@ html.txt
 *.jpg
 *.jpeg
 .venv/
+
+# Отладочные временные login-скрипты (хардкод путей /opt/avito-bot, user_id)
+tmp_*.py

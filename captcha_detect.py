@@ -242,3 +242,82 @@ def _matches_sms_text(driver) -> str | None:
         if pattern in src:
             return f"text:{pattern}"
     return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# B1.5: Экран «сработала защита профиля» — Avito блокирует логин,
+#       предлагает получить код по СМС. Нужно детектить и кликать кнопку.
+# ──────────────────────────────────────────────────────────────────────────────
+
+_PROTECTION_TEXT_PATTERNS: tuple[str, ...] = (
+    "сработала защита профиля",
+    "защита профиля",
+    "Получить код по СМС",
+    "получить код по смс",
+    "получить код в СМС",
+    "получить код в смс",
+)
+
+_GET_SMS_BUTTON_XPATHS: tuple[str, ...] = (
+    "//button[contains(text(), 'Получить код')]",
+    "//button[contains(text(), 'получить код')]",
+    "//button[contains(., 'код по СМС')]",
+    "//button[contains(., 'код по смс')]",
+    "//button[contains(., 'код в СМС')]",
+    "//button[contains(., 'код в смс')]",
+    "//button[@data-marker='login-form/request-sms']",
+    "//button[@data-marker='login-form/get-sms-code']",
+    "//button[@data-marker='login-form/get-code']",
+    "//button[@data-marker='login-form/request-code']",
+)
+
+
+def detect_profile_protection(driver, log_func=None, account_name: str = "") -> bool:
+    """
+    True, если Avito показывает экран «сработала защита профиля»
+    с предложением получить код по СМС.
+    """
+    try:
+        src = driver.execute_script("return document.body.innerText;") or ""
+    except WebDriverException:
+        return False
+    for pattern in _PROTECTION_TEXT_PATTERNS:
+        if pattern in src:
+            if log_func is not None:
+                try:
+                    log_func(
+                        account_name,
+                        f"!!! PROFILE PROTECTION DETECTED (text: {pattern}) !!!",
+                    )
+                except Exception:
+                    pass
+            return True
+    return False
+
+
+def click_get_sms_button(driver, log_func=None, account_name: str = "") -> bool:
+    """
+    Кликает кнопку «получить код по смс» на экране защиты профиля.
+    Возвращает True, если кнопка найдена и кликнута.
+    """
+    for sel in _GET_SMS_BUTTON_XPATHS:
+        try:
+            elements = driver.find_elements(By.XPATH, sel)
+            for el in elements:
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        el.click()
+                        if log_func is not None:
+                            try:
+                                log_func(
+                                    account_name,
+                                    "  Clicked 'получить код по смс' button",
+                                )
+                            except Exception:
+                                pass
+                        return True
+                except (StaleElementReferenceException, WebDriverException):
+                    continue
+        except WebDriverException:
+            continue
+    return False

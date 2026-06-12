@@ -8,6 +8,8 @@ import os
 import random
 import re
 import signal
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -158,9 +160,36 @@ def connect_to_sphere(debug_port: int, webdriver_path: str | None = None) -> web
     # Попытка 1: через service из webdriver_path (AdsPower)
     if webdriver_path:
         try:
-            return webdriver.Chrome(service=Service(webdriver_path), options=options)
+            cd_path = Path(webdriver_path)
+            if cd_path.is_file():
+                _bot_logger.info("connect_to_sphere: AdsPower chromedriver OK (%s), port=0", webdriver_path)
+                return webdriver.Chrome(service=Service(webdriver_path, port=0), options=options)
+            _bot_logger.warning("connect_to_sphere: AdsPower chromedriver NOT a file: %s", webdriver_path)
         except Exception as exc:
             _bot_logger.warning("connect_to_sphere: AdsPower chromedriver failed (%s), falling back...", exc)
+
+    # Попытка 1b: прямой запуск chromedriver через subprocess (обходит Selenium Manager)
+    if webdriver_path:
+        try:
+            cd_path = Path(webdriver_path)
+            if cd_path.is_file():
+                with socket.socket() as s:
+                    s.bind(("", 0))
+                    free_port = s.getsockname()[1]
+                _bot_logger.info("connect_to_sphere: starting chromedriver on port %d", free_port)
+                proc = subprocess.Popen(
+                    [webdriver_path, f"--port={free_port}", "--verbose"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                time.sleep(1)
+                if proc.poll() is None:
+                    return webdriver.Chrome(
+                        service=Service(webdriver_path, port=free_port),
+                        options=options,
+                    )
+                _bot_logger.warning("connect_to_sphere: subprocess chromedriver exited with code %s", proc.returncode)
+        except Exception as exc:
+            _bot_logger.warning("connect_to_sphere: subprocess chromedriver failed (%s), falling back...", exc)
 
     # Попытка 2: chromedriver из PATH (системный)
     try:
@@ -168,7 +197,7 @@ def connect_to_sphere(debug_port: int, webdriver_path: str | None = None) -> web
     except Exception as exc:
         _bot_logger.warning("connect_to_sphere: system chromedriver failed (%s), trying ChromeDriverManager...", exc)
 
-    # Попытка 3: ChromeDriverManager
+    # Попытка 3: ChromeDriverManager с версией браузера
     try:
         if browser_version:
             return webdriver.Chrome(service=Service(ChromeDriverManager(driver_version=browser_version).install()), options=options)
@@ -1914,7 +1943,7 @@ def perform_login(driver, wait, account_name, phone, password):
     """
     # Импорты лежат внутри функции, чтобы избежать циклической загрузки
     # (captcha_detect не должен импортироваться в module-load time bot.py).
-    from captcha_detect import detect_captcha, detect_sms_form
+    from captcha_detect import detect_captcha, detect_profile_protection, detect_sms_form, click_get_sms_button
 
     log(
         account_name,
@@ -2009,9 +2038,13 @@ def perform_login(driver, wait, account_name, phone, password):
         human_type(password_input, password, speed_range=(0.10, 0.35), enable_typos=False)
         hp(1.5, 2.5)
 
-        # 4. Final submit — Enter вместо click (React может не ловить click)
-        password_input.send_keys(Keys.ENTER)
-        log(account_name, "  Login form submitted (ENTER). Waiting for results up to 45s...")
+        # 4. Final submit — кликаем "Войти" (ENTER не триггерит React-форму)
+        try:
+            final_submit = driver.find_element(By.XPATH, "//button[@data-marker='login-form/submit']")
+            move_click(driver, final_submit)
+        except Exception:
+            password_input.send_keys(Keys.ENTER)
+        log(account_name, "  Login form submitted (click Войти). Waiting for results up to 45s...")
 
         # B1: циклический опрос 45 секунд — проверяем login, SMS, капчу.
         poll_deadline = time.time() + 45
@@ -2036,6 +2069,22 @@ def perform_login(driver, wait, account_name, phone, password):
                     account_name,
                     "login_sms",
                     "Avito прислал SMS-код. Введи код, submit и нажми «Продолжить».",
+                )
+                if resp != "continue":
+                    return False
+                if _is_logged_in_url(driver):
+                    return True
+                continue
+
+            if detect_profile_protection(driver, log_func=log, account_name=account_name):
+                log(account_name, "  Clicking 'получить код по смс'...")
+                if click_get_sms_button(driver, log_func=log, account_name=account_name):
+                    log(account_name, "  SMS code requested. Waiting for code entry...")
+                    hp(3, 5)
+                resp = _wait_user_resume_for_login(
+                    account_name,
+                    "login_sms",
+                    "Сработала защита профиля. Нажми 'получить код по смс' (уже нажато), введи код и нажми «Продолжить».",
                 )
                 if resp != "continue":
                     return False
