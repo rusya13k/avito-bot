@@ -430,12 +430,22 @@ class ChromeLauncher:
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-breakpad",
             "--disable-sync",
             "--disable-translate",
             "--disable-features=TranslateUI",
             "--metrics-recording-only",
             "--disable-default-apps",
             "--disable-popup-blocking",
+            "--disable-client-side-phishing-detection",
+            "--disable-component-update",
+            "--disable-domain-reliability",
+            "--disable-hang-monitor",
+            "--disable-ipc-flooding-protection",
+            "--disable-prompt-on-repost",
+            "--disable-renderer-backgrounding",
         ]
 
         # Прокси (только если задан и без credentials)
@@ -444,12 +454,14 @@ class ChromeLauncher:
             if proxy_arg:
                 cmd.append(f"--proxy-server={proxy_arg}")
 
-        # Весь DNS резолв — через SOCKS5 прокси, не через систему.
-        # Без этих флагов Chrome делает системные DNS-запросы (на которые
-        # WARP может ответить неверно) и создаёт параллельные соединения,
-        # которые перегружают простой форвардер.
+        # DNS оставляем системе — SOCKS5 форвардер сам резолвит через удалённый прокси.
+        # --host-resolver-rules=MAP * ~NOTFOUND ломает DNS в новых Chrome,
+        # а SOCKS5-native remote DNS работает корректно.
         cmd.append("--disable-dns-prefetch")
-        cmd.append("--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1")
+
+        # Полностью отключаем WebRTC — он не нужен боту, но даёт утечку IP
+        # через ICE/STUN даже с disable_non_proxied_udp.
+        cmd.append("--disable-webrtc")
 
         # Запрещаем утечку реального IP сервера через WebRTC (актуально для
         # headed-режима под Xvfb — антифрод-системы активно проверяют это).
@@ -462,6 +474,7 @@ class ChromeLauncher:
 
         # --disable-gpu для headless-серверов без видеокарты
         cmd.append("--disable-gpu")
+        cmd.append("--disable-reading-from-canvas")
 
         # Headless-режим — только по явному CHROME_HEADLESS=1.
         # По умолчанию используется Xvfb (виртуальный дисплей).

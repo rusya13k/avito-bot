@@ -542,6 +542,10 @@ class AvitoMessenger:
                         cursor=cur,
                     )
 
+            if dialog_id is None:
+                log_func(self.account_name, "upsert_dialog вернул None — пропускаем диалог")
+                return
+
             if not chat_history:
                 return
 

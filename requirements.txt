@@ -7,4 +7,5 @@ webdriver-manager==4.0.2
 # через socks5h:// (AdsPower использует SOCKS5).
 requests[socks]==2.33.1
 pyTelegramBotAPI==4.32.0
+pydantic==2.11.1
 openai==2.33.0

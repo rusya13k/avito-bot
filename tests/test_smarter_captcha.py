@@ -224,8 +224,8 @@ def test_pick_cycle_kind_outbound_present_when_enabled():
         kind = _pick_cycle_kind({}, {}, is_warmup=False, outbound_disabled=False)
         if kind == "outbound_only":
             counts["outbound_only"] += 1
-    # При weight 0.30 в 500 итераций ожидаем ~150 выпадений.
-    assert counts["outbound_only"] > 50
+    # При weight 0.10 в 500 итераций ожидаем ~50 выпадений.
+    assert counts["outbound_only"] > 25
 
 
 def test_pick_cycle_kind_warmup_already_zero_outbound():

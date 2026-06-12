@@ -8,6 +8,7 @@
 
 # Куки и логин-данные аккаунтов
 cookies.json
+cookies_avito.json
 accounts/
 # G2: per-account конфиг (содержит phone/password/adspower_id —
 # по факту секрет, не должен уезжать в git)

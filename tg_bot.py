@@ -1369,13 +1369,11 @@ class TelegramController:
         ).start()
 
     def _cleanup_chrome(self):
-        """Остановить Chrome-процессы всех аккаунтов через ChromeLauncher."""
+        """Остановить все профили AdsPower."""
         try:
-            from chrome_launcher import ChromeLauncher
+            from adspower_launcher import AdsPowerLauncher
 
-            repo_dir = self.BASE.parent if hasattr(self.BASE, "parent") else Path(".")
-            launcher = ChromeLauncher(repo_dir=repo_dir)
-            launcher.stop_all()
+            AdsPowerLauncher().kill_orphaned_browsers()
         except Exception:
             pass
 
@@ -1698,13 +1696,11 @@ class TelegramController:
         try:
             # Ленивый импорт: bot.py тащит много (Selenium, Chrome) и при
             # старте контроллера может быть ещё не готов.
+            from adspower_launcher import AdsPowerLauncher
             from bot import run_big_warmup_for_account
-            from chrome_launcher import ChromeLauncher
 
             cfg = self._cfg()
-            repo_dir = self.BASE.parent if hasattr(self.BASE, "parent") else Path(".")
-            chrome_launcher = ChromeLauncher(repo_dir=repo_dir)
-            result = run_big_warmup_for_account(account, cfg, chrome_launcher)
+            result = run_big_warmup_for_account(account, cfg, AdsPowerLauncher())
             if result.get("ok"):
                 stats = result.get("stats") or {}
                 visited = int(stats.get("sites_visited", 0))

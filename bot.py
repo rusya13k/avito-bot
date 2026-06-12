@@ -26,7 +26,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 import tg_bot as _tg
 from account_state import account_state
-from chrome_launcher import ChromeLauncher
+from adspower_launcher import AdsPowerLauncher
 
 # G1: AvitoMessenger больше не импортируется напрямую — она инкапсулирована
 # в AvitoClient.process_messages.
@@ -134,11 +134,10 @@ def _wait_chrome_ready(debug_port: int, timeout: float = 30.0) -> str | None:
     return None
 
 
-def connect_to_sphere(debug_port: int) -> webdriver.Chrome:
+def connect_to_sphere(debug_port: int, webdriver_path: str | None = None) -> webdriver.Chrome:
     """Connect Selenium to already running Chrome profile.
 
-    Ждём готовности Chrome и спрашиваем у него версию, чтобы
-    ChromeDriverManager мог скачать правильный chromedriver.
+    При подключении через AdsPower передаётся webdriver_path от API.
     """
     _bot_logger.info("Waiting for Chrome to be ready on port %d...", debug_port)
     browser_version = _wait_chrome_ready(debug_port)
@@ -148,26 +147,27 @@ def connect_to_sphere(debug_port: int) -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{debug_port}")
 
-    # Пробуем сначала chromedriver из PATH (наш симлинк). Если не сработало —
-    # качаем через ChromeDriverManager под версию Chrome.
-    try:
-        driver = webdriver.Chrome(options=options)
-        _bot_logger.info("connect_to_sphere: OK (chromedriver from PATH)")
-    except Exception as e:
-        _bot_logger.warning("PATH chromedriver failed: %s. Trying ChromeDriverManager...", e)
-        try:
-            if browser_version:
-                service = Service(ChromeDriverManager(driver_version=browser_version).install())
-            else:
-                service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=options)
-        except Exception as e2:
-            _bot_logger.warning("ChromeDriverManager also failed: %s. Last resort...", e2)
-            driver = webdriver.Chrome(options=options)
+    if webdriver_path:
+        from selenium.webdriver.chrome.service import Service as ChromeService
 
-    # T7 + T8: stealth-скрипт через CDP — маскируем navigator.webdriver и
-    # чистим cdc_* глобалы. Регистрируется ДО первой driver.get(), чтобы
-    # сработал на всех будущих страницах.
+        service = ChromeService(webdriver_path)
+        driver = webdriver.Chrome(service=service, options=options)
+    else:
+        # Фолбэк: chromedriver из PATH или ChromeDriverManager
+        try:
+            driver = webdriver.Chrome(options=options)
+        except Exception:
+            try:
+                if browser_version:
+                    service = Service(ChromeDriverManager(driver_version=browser_version).install())
+                else:
+                    service = Service(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=options)
+            except Exception as e2:
+                _bot_logger.warning("ChromeDriverManager failed: %s", e2)
+                driver = webdriver.Chrome(options=options)
+
+    # Stealth (AdsPower не нужен, но на всякий случай не убираем)
     if not _apply_stealth(driver):
         _bot_logger.warning("T7/T8: stealth-инъекция не применилась (CDP недоступен?)")
 
@@ -749,30 +749,30 @@ def _generate_view_listing_message(
 
     # Выбираем персону.
     persona_id = (account or {}).get("persona") or ""
-    from outbound_messenger import (
-        _APPROACH_HINTS,
-        _FORMALITY_LEVELS,
-        _LENGTH_HINTS,
-        _PITCH_APPROACH_HINTS,
-        _PITCH_FORMALITY_LEVELS,
-        _PITCH_LENGTH_HINTS,
+    from personas import (
+        APPROACH_HINTS,
+        FORMALITY_LEVELS,
+        LENGTH_HINTS,
         PERSONAS,
-        _is_pitch_persona,
+        PITCH_APPROACH_HINTS,
+        PITCH_FORMALITY_LEVELS,
+        PITCH_LENGTH_HINTS,
+        is_pitch_persona,
     )
 
     persona_description = PERSONAS.get(persona_id, "")
-    is_pitch = _is_pitch_persona(persona_id)
+    is_pitch = is_pitch_persona(persona_id)
 
     if is_pitch:
-        formality = random.choice(_PITCH_FORMALITY_LEVELS)
-        length = random.choice(_PITCH_LENGTH_HINTS)
-        approach = random.choice(_PITCH_APPROACH_HINTS)
+        formality = random.choice(PITCH_FORMALITY_LEVELS)
+        length = random.choice(PITCH_LENGTH_HINTS)
+        approach = random.choice(PITCH_APPROACH_HINTS)
         system_prompt_name = "outbound_first_message_pitch.system.txt"
         user_prompt_name = "outbound_first_message_pitch.user.txt"
     else:
-        formality = random.choice(_FORMALITY_LEVELS)
-        length = random.choice(_LENGTH_HINTS)
-        approach = random.choice(_APPROACH_HINTS)
+        formality = random.choice(FORMALITY_LEVELS)
+        length = random.choice(LENGTH_HINTS)
+        approach = random.choice(APPROACH_HINTS)
         system_prompt_name = "outbound_first_message.system.txt"
         user_prompt_name = "outbound_first_message.user.txt"
 
@@ -1864,6 +1864,31 @@ def _wait_user_resume_for_login(
     return response
 
 
+def warm_up_gost_tunnel(proxy_url: str, account_name: str, max_attempts: int = 5) -> bool:
+    """Прогрев холодного GOST туннеля перед запуском Chrome.
+
+    Мобильные прокси засыпают при отсутствии активности. После старта Chrome
+    пытается открыть 20+ фоновых соединений, мобильный прокси не вывозит —
+    ERR_SOCKS_CONNECTION_. Прогреваем лёгким запросом ДО запуска браузера.
+    """
+    proxies = {"http": proxy_url, "https": proxy_url}
+    log(account_name, f"  Прогрев туннеля {proxy_url}...")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            r = requests.get("https://ifconfig.me", proxies=proxies, timeout=10)
+            if r.status_code == 200:
+                log(
+                    account_name,
+                    f"  Туннель прогрет (попытка {attempt}, IP: {r.text.strip()[:20]})",
+                )
+                return True
+        except Exception:
+            if attempt < max_attempts:
+                time.sleep(3)
+    log(account_name, "  WARN: туннель не прогрет — продолжаю")
+    return False
+
+
 def perform_login(driver, wait, account_name, phone, password):
     """
     Performs manual login on Avito using phone and password.
@@ -1888,7 +1913,9 @@ def perform_login(driver, wait, account_name, phone, password):
         # 1. Enter phone
         log(account_name, "  Entering phone number (slow mode)...")
         phone_input = wait.until(
-            EC.presence_of_element_located((By.XPATH, "//input[@name='login']"))
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "input[data-marker='login-form/login/input']")
+            )
         )
         # T6: human-like focus вместо «click без mousemove».
         _human_click(driver, phone_input, stop_event=_tg.get_account_stop_event(account_name))
@@ -1945,7 +1972,9 @@ def perform_login(driver, wait, account_name, phone, password):
         # 3. Enter password (если поле появилось)
         try:
             password_input = wait.until(
-                EC.presence_of_element_located((By.XPATH, "//input[@name='password']"))
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "input[data-marker='login-form/password/input']")
+                )
             )
         except TimeoutException:
             # Иногда после успешного SMS пароль не запрашивают вовсе.
@@ -1965,39 +1994,49 @@ def perform_login(driver, wait, account_name, phone, password):
         human_type(password_input, password, speed_range=(0.10, 0.35), enable_typos=False)
         hp(1.5, 2.5)
 
-        # 4. Final submit
-        submit_btn = wait.until(
-            EC.element_to_be_clickable((By.XPATH, "//button[@data-marker='login-form/submit']"))
-        )
-        move_click(driver, submit_btn)
-        log(account_name, "  Login form submitted. Waiting for results...")
-        hp(8, 12)
+        # 4. Final submit — Enter вместо click (React может не ловить click)
+        password_input.send_keys(Keys.ENTER)
+        log(account_name, "  Login form submitted (ENTER). Waiting for results up to 45s...")
 
-        # B1: post-submit — проверяем SMS/captcha повторно.
-        if detect_captcha(driver, log_func=log, account_name=account_name):
-            resp = _wait_user_resume_for_login(
-                account_name,
-                "login_captcha",
-                "Avito показал капчу после ввода пароля. Реши её и нажми «Продолжить».",
-            )
-            if resp != "continue":
-                return False
-            hp(2, 4)
+        # B1: циклический опрос 45 секунд — проверяем login, SMS, капчу.
+        poll_deadline = time.time() + 45
+        while time.time() < poll_deadline:
+            if _is_logged_in_url(driver):
+                log(account_name, "  Successfully bypassed login page.")
+                return True
 
-        if detect_sms_form(driver, log_func=log, account_name=account_name):
-            resp = _wait_user_resume_for_login(
-                account_name,
-                "login_sms",
-                "Avito прислал SMS-код после ввода пароля. Введи код, submit и нажми «Продолжить».",
-            )
-            if resp != "continue":
-                return False
-            hp(2, 4)
+            if detect_captcha(driver, log_func=log, account_name=account_name):
+                resp = _wait_user_resume_for_login(
+                    account_name,
+                    "login_captcha",
+                    "Avito показал капчу после отправки формы. Реши её и нажми «Продолжить».",
+                )
+                if resp != "continue":
+                    return False
+                # После капчи — опрос снова
+                continue
 
-        # Финальная проверка login.
-        if _is_logged_in_url(driver):
-            log(account_name, "  Successfully bypassed login page.")
-            return True
+            if detect_sms_form(driver, log_func=log, account_name=account_name):
+                resp = _wait_user_resume_for_login(
+                    account_name,
+                    "login_sms",
+                    "Avito прислал SMS-код. Введи код, submit и нажми «Продолжить».",
+                )
+                if resp != "continue":
+                    return False
+                if _is_logged_in_url(driver):
+                    return True
+                continue
+
+            hp(1, 2)
+
+        # Таймаут — скриншот чтобы понять что пошло не так.
+        try:
+            sp = str(Path("logs") / f"login_failed_{account_name}.png")
+            driver.save_screenshot(sp)
+            log(account_name, f"  Скриншот сохранён: {sp}")
+        except Exception as exc:
+            log(account_name, f"  Не удалось сохранить скриншот: {exc}")
         log(account_name, "  Still on login page after flow — login failed.")
         return False
 
@@ -2062,6 +2101,9 @@ def _apply_account_proxy(
     """
     A1 + T18: Выбирает и валидирует прокси для Chrome --proxy-server.
 
+    Если в аккаунте указан adspower_id — AdsPower сам управляет прокси
+    (из настроек профиля), прокси не нужен — сразу __no_proxy__.
+
     Порядок:
       1. Поле "proxy" из accounts.json (per-account, приоритет).
       2. Случайный прокси из proxies.txt (глобальный fallback).
@@ -2073,9 +2115,13 @@ def _apply_account_proxy(
     auto-rotation — мёртвые/чужие прокси отбрасываются и пробуем следующий.
 
     Возвращает прокси-строку (оригинальный формат из accounts.json /
-    proxies.txt), "__no_proxy__" если админ разрешил без прокси, или None.
-    Вызывающий код (ChromeLauncher) сам конвертирует через build_proxy_arg().
+    proxies.txt), "__no_proxy__" если админ разрешил или AdsPower, или None.
     """
+    # AdsPower сам управляет прокси — не надо ничего выбирать
+    if account.get("adspower_id"):
+        log(account_name, "A1: AdsPower профиль — прокси управляется AdsPower")
+        return "__no_proxy__"
+
     # cfg=None — legacy-путь для back-compat.
     if cfg is not None and bool(cfg.get("proxy_probe_enabled", True)):
         result = _apply_account_proxy_with_probe(account, account_name, cfg)
@@ -2450,80 +2496,69 @@ def _pick_rotation_proxy(cfg: dict | None, exclude: set[str] | None = None) -> s
     return get_random_proxy()
 
 
-def _connect_with_retry(
-    chrome_launcher: ChromeLauncher,
+def _connect_with_adspower(
+    adspower: AdsPowerLauncher,
     account: dict,
     account_name: str,
     cfg: dict | None = None,
 ) -> tuple | None:
-    """Запуск Chrome + WebDriver-подключение с попытками.
+    """Запуск профиля AdsPower + WebDriver-подключение с ретраем.
 
-    На каждом провале — ротируем прокси из общего пула proxies.txt и
-    останавливаем Chrome перед следующей попыткой. T18: при включённом
-    probe (default через `cfg`) ротация выбирает заведомо живой прокси
-    через `pick_healthy_proxy`, а не случайный мёртвый из pool.
-
-    Возвращает (driver, wait) при успехе, либо None если все попытки
-    исчерпаны (вызывающий должен сделать early return).
+    AdsPower сам управляет прокси (из настроек профиля), fingerprint'ом
+    и всеми стелс-механизмами. Никаких прогрева туннелей, ротации прокси
+    и стелс-флагов не нужно.
     """
-    max_retries = 2
-    tried_proxies: set[str] = set()
-    user_data_dir = account.get("chrome_profile_dir") or None
-    user_agent = account.get("user_agent")
-    proxy = account.get("proxy")  # начальный прокси
+    max_retries = 1
+    profile_id = account.get("adspower_id") or account.get("user_id") or ""
+
+    if not profile_id:
+        log(account_name, "adspower_id не указан в accounts.json")
+        return None
 
     for attempt in range(max_retries + 1):
         if _tg.is_stop_requested(account_name):
             return None
-        try:
-            log(account_name, f"Starting Chrome (Attempt {attempt + 1})...")
-            debug_port = chrome_launcher.start(
-                account_name,
-                user_data_dir=user_data_dir,
-                proxy=proxy,
-                user_agent=user_agent,
-            )
-        except RuntimeError as e:
-            log(account_name, f"Chrome start RuntimeError: {e}")
+
+        # Если AdsPower сказал «лимит исчерпан» — не дёргаем
+        if adspower.daily_limit_exceeded:
+            log(account_name, "AdsPower дневной лимит исчерпан — жду 21ч.")
+            return None
+
+        # kill_orphaned_browsers() уже закрыл все профили при старте,
+        # так что start_browser открывает свежую сессию.
+        log(account_name, f"Запуск профиля AdsPower (Attempt {attempt + 1})...")
+        result = adspower.start_browser(profile_id)
+
+        if not result:
+            if adspower.daily_limit_exceeded:
+                log(account_name, "AdsPower дневной лимит исчерпан — жду 21ч.")
+                return None
+            log(account_name, "AdsPower: не удалось запустить профиль")
             if attempt < max_retries:
-                time.sleep(3)
-                continue
-            return None
-        except FileNotFoundError as e:
-            log(account_name, f"Chrome binary not found: {e}")
-            return None
-        except Exception as e:
-            log(account_name, f"Chrome start failed: {e}")
-            if attempt < max_retries:
-                time.sleep(3)
-                continue
-            return None
+                hp(3, 5)
+            continue
+
+        debug_port = result["debug_port"]
+        webdriver_path = result.get("webdriver")
+        log(account_name, f"Профиль запущен, debug_port={debug_port}")
 
         driver = None
         try:
-            driver = connect_to_sphere(debug_port)
+            driver = connect_to_sphere(debug_port, webdriver_path=webdriver_path)
             wait = WebDriverWait(driver, 15)
 
-            # Test connection
             if safe_get(driver, "https://ya.ru", account_name, retries=1):
                 return driver, wait
+
             raise Exception("Connection failed")
         except Exception as e:
-            log(account_name, f"Connection fail: {e}. Rotating proxy...")
+            log(account_name, f"Connection fail: {e}")
             if driver:
                 try:
                     driver.quit()
                 except Exception:
                     pass
-            new_proxy = _pick_rotation_proxy(cfg, exclude=tried_proxies)
-            if new_proxy:
-                tried_proxies.add(new_proxy)
-                proxy = new_proxy  # используем в следующей попытке
-                _proxy_display = _mask_proxy(new_proxy)
-                log(account_name, f"Proxy rotated to {_proxy_display}")
-            elif new_proxy is None and cfg is not None:
-                log(account_name, "Rotation: probe не нашёл живого прокси.")
-            chrome_launcher.stop(account_name)
+            adspower.stop_browser(profile_id)
             if attempt == max_retries:
                 return None
             hp(5, 10)
@@ -2654,8 +2689,6 @@ def _sleep_until_tomorrow(account: dict, cfg: dict, account_name: str) -> None:
             hour=start_hour, minute=0, second=0, microsecond=0
         )
     except ValueError:
-        # DST transition: несуществующий час (например 2:00 при переходе вперёд)
-        # Сдвигаем на час вперёд
         tomorrow = (now + _dt.timedelta(days=1)).replace(
             hour=start_hour + 1, minute=0, second=0, microsecond=0
         )
@@ -2824,9 +2857,7 @@ def _run_main_loop(client, driver, account: dict, cfg: dict, account_name: str) 
         )
 
 
-def run_thread(
-    account: dict, cfg: dict, chrome_launcher: ChromeLauncher, db_manager: DatabaseManager
-):
+def run_thread(account: dict, cfg: dict, adspower: AdsPowerLauncher, db_manager: DatabaseManager):
     """Точка входа потока-аккаунта. Оркестрирует setup → connect →
     login → main-loop → cleanup. Каждая стадия вынесена в свой helper
     выше — это упрощает чтение, тестирование и дальнейшие правки.
@@ -2858,13 +2889,9 @@ def run_thread(
     if proxy_result == "__no_proxy__":
         log(account_name, "A1: Запуск БЕЗ прокси (админ разрешил).")
 
-    # E8: Pre-launch cleanup — убить зависший Chrome от предыдущего запуска
-    udd = account.get("chrome_profile_dir")
-    chrome_launcher.kill_orphaned_chrome(account_name, user_data_dir=Path(udd) if udd else None)
-
     try:
-        # ── Connect (с retry + T18 probe-driven ротацией прокси) ────────
-        connect_result = _connect_with_retry(chrome_launcher, account, account_name, cfg)
+        # ── Connect через AdsPower (без ротации прокси — AdsPower сам управляет) ──
+        connect_result = _connect_with_adspower(adspower, account, account_name, cfg)
         if connect_result is None:
             return
         driver, wait = connect_result
@@ -2922,52 +2949,34 @@ def run_thread(
                 # отвалившемся debug-port. Любые другие исключения тут —
                 # настоящие баги, не глотаем.
                 pass
-        chrome_launcher.stop(account_name)
+        pid = account.get("adspower_id") or account.get("user_id") or account_name
+        adspower.stop_browser(pid)
 
 
 def run_big_warmup_for_account(
     account: dict,
     cfg: dict,
-    chrome_launcher: ChromeLauncher,
+    adspower: AdsPowerLauncher | None = None,
     *,
     num_sites: int | None = None,
     with_yandex_search: bool = True,
 ) -> dict:
-    """T12: standalone big_warmup для одного аккаунта (без парсинга/messenger).
+    """T12: standalone big_warmup для одного аккаунта через AdsPower.
 
     Делается lifecycle:
-        1. apply proxy (как в run_thread) — если прокси не выдан, ВЫХОДИМ
-           с error (T12 без proxy — стрельба в ногу).
-        2. ChromeLauncher.start → connect_to_sphere → apply_stealth.
-        3. big_warmup(driver, num_sites=10, with_yandex_search=True).
-           Это ~15-30 минут (3-5 сайтов × 30-90s + Yandex queries).
-        4. driver.quit + ChromeLauncher.stop.
-
-    Args:
-        account: dict из accounts.json.
-        cfg: глобальный config.json (для legacy proxy fallback).
-        chrome_launcher: ChromeLauncher инстанс.
-        num_sites: сколько сайтов посетить (default ~10 для большого прогрева).
-        with_yandex_search: True → ещё и Yandex queries.
-
-    Returns:
-        Stats dict: {"ok": bool, "stats": {...big_warmup stats...},
-                     "error": str | None}
+        1. AdsPower.start_browser → connect_to_sphere
+        2. big_warmup(driver, ...)
+        3. driver.quit + AdsPower.stop_browser
     """
     from warmup import big_warmup
 
     account_name = account["name"]
     driver = None
+    launcher = adspower or AdsPowerLauncher()
     result = {"ok": False, "stats": None, "error": None}
 
-    # ── A1 + T18: proxy setup with health probe ────────────────────────
-    if _apply_account_proxy(account, account_name, cfg) is None:
-        result["error"] = "no proxy"
-        return result
-
     try:
-        # ── Connect (с T18 probe-driven ротацией) ───────────────────────
-        connect_result = _connect_with_retry(chrome_launcher, account, account_name, cfg)
+        connect_result = _connect_with_adspower(launcher, account, account_name, cfg)
         if connect_result is None:
             result["error"] = "connect failed"
             return result
@@ -3000,7 +3009,8 @@ def run_big_warmup_for_account(
                 driver.quit()
             except WebDriverException:
                 pass
-        chrome_launcher.stop(account_name)
+        pid = account.get("adspower_id") or account.get("user_id") or account_name
+        launcher.stop_browser(pid)
 
     return result
 
@@ -3085,24 +3095,20 @@ def _launch_commercial_bot_threads(cfg=None):
         _tg.add_log("Нет включённых аккаунтов для запуска (G2: проверь accounts.json).")
         return
 
-    # Создаём ChromeLauncher
-    repo_dir = Path(__file__).resolve().parent
-    chrome_launcher = ChromeLauncher(repo_dir=repo_dir)
+    # Создаём AdsPowerLauncher
     db_manager = DatabaseManager()
+    adspower = AdsPowerLauncher()
 
-    # Pre-launch cleanup: убиваем зависшие Chrome-процессы для всех аккаунтов
-    _bot_logger.info("Performing pre-launch cleanup of Chrome processes...")
-    for acc in accounts:
-        acc_name = acc["name"]
-        udd = acc.get("chrome_profile_dir")
-        chrome_launcher.kill_orphaned_chrome(acc_name, user_data_dir=Path(udd) if udd else None)
+    # Пре-лонч: убиваем все открытые профили AdsPower
+    _bot_logger.info("AdsPower: закрываю все запущенные профили...")
+    adspower.kill_orphaned_browsers()
 
     threads = []
 
     for acc in accounts:
         t = threading.Thread(
             target=run_thread,
-            args=(acc, cfg, chrome_launcher, db_manager),
+            args=(acc, cfg, adspower, db_manager),
             name="acc-" + acc["name"],
         )
         threads.append(t)
@@ -3143,8 +3149,9 @@ def _launch_commercial_bot_threads(cfg=None):
                 if t in _tg.active_threads:
                     _tg.active_threads.remove(t)
 
-            # Убеждаемся что Chrome остановлен (cleanup)
-            chrome_launcher.stop(acc_name)
+            # Убеждаемся что профиль AdsPower остановлен
+            pid = acc.get("adspower_id") or acc.get("user_id") or acc["name"]
+            adspower.stop_browser(pid)
 
             # Если админ нажал Stop (persistent флаг) — не перезапускаем
             if _tg._stop_requested.is_set():
@@ -3183,7 +3190,7 @@ def _launch_commercial_bot_threads(cfg=None):
 
             new_t = threading.Thread(
                 target=run_thread,
-                args=(acc, cfg, chrome_launcher, db_manager),
+                args=(acc, cfg, adspower, db_manager),
                 name="acc-" + acc_name,
             )
             thread_account_map[new_t] = acc
@@ -3196,22 +3203,18 @@ def _launch_commercial_bot_threads(cfg=None):
             # Все потоки мертвы и ни один не перезапущен
             break
 
-        # Watchdog: каждые 5 мин чистим orphaned Chrome processes.
+        # Watchdog: каждые 5 мин чистим orphaned AdsPower профили.
         if time.time() - _last_watchdog > _WATCHDOG_INTERVAL:
             _last_watchdog = time.time()
             for _acc in accounts:
                 _acc_name = _acc["name"]
-                # Если аккаунт не имеет живого потока — убедимся что Chrome остановлен
                 has_alive_thread = any(
                     _t.is_alive() and thread_account_map.get(_t, {}).get("name") == _acc_name
                     for _t in thread_account_map
                 )
-                if not has_alive_thread and chrome_launcher.is_running(_acc_name):
-                    _bot_logger.warning(
-                        "Watchdog: orphaned Chrome for %s (no alive thread) — stopping",
-                        _acc_name,
-                    )
-                    chrome_launcher.stop(_acc_name)
+                if not has_alive_thread:
+                    pid = _acc.get("adspower_id") or _acc.get("user_id") or _acc_name
+                    adspower.stop_browser(pid)
 
         # Проверяем каждые 10 секунд
         _tg.stop_event.wait(timeout=10)
@@ -3263,6 +3266,11 @@ def main():
     from env_config import load_dotenv_if_present
 
     load_dotenv_if_present(Path(__file__).parent / ".env")
+
+    if "--preflight" in sys.argv or "--check" in sys.argv:
+        from preflight_check import main as preflight_main
+
+        sys.exit(preflight_main())
 
     # ── Lockfile: защита от двойного запуска ─────────────────────────────
     # На Windows 3+ процесса bot.py запускают各自的 TG-контроллер и

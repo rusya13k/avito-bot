@@ -345,7 +345,7 @@ def _visit_seller_profile(driver, listing_data: dict, log_func, account_name: st
         for _ in range(6):
             diff = set(driver.window_handles) - handles_before
             if diff:
-                new_handle = diff.pop()
+                new_handle = min(diff, key=lambda h: driver.window_handles.index(h))
                 break
             time.sleep(0.5)
         if not new_handle:

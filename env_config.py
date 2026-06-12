@@ -35,6 +35,8 @@ ENV_TO_CFG = {
     "OPENAI_MODEL": "openai_model",
     "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
     "TELEGRAM_ADMIN_ID": "telegram_admin_id",
+    "ADSPOWER_API_KEY": "adspower_api_key",
+    "ADSPOWER_API_URL": "adspower_api_url",
 }
 
 

@@ -1,24 +1,22 @@
 """
-T7 + T8: Stealth-инъекции через Chrome DevTools Protocol.
+T7 + T8 + T9 + T10: Stealth-инъекции через Chrome DevTools Protocol.
 
-Когда Selenium управляет Chrome'ом, в DOM остаются 2 классических «tell»:
+Скрываем 4 вектора детекта автоматизации:
 
-1. ``navigator.webdriver === true``
-   — Стандартный WebDriver-флаг, по нему детектят все антифроды первой
-   линии (Cloudflare, Datadome, Avito SmartCaptcha).
+1. T7 — ``navigator.webdriver``: маскируем через defineProperty на прототипе.
 
-2. Глобалы ``window.cdc_adoQpoasnfa76pfcZLmcfl_Array`` и компания
-   — chromedriver инжектит их для своих нужд. Имя начинается с ``cdc_``
-   и легко находится через ``Object.keys(window).filter(k=>k.startsWith('cdc_'))``.
+2. T8 — ``cdc_*`` глобалы: chromedriver инжектит их при старте. Чистим
+   сразу + через setTimeout(0/50/200) — ловим инжект до и после.
 
-AdsPower теоретически маскирует первое (он заявляет полный antidetect),
-но на практике это лотерея — версия AdsPower может отстать, профиль
-может быть кривым, etc. Поэтому мы сами:
+3. T9 — WebGL renderer: на VDS нет физической видеокарты, возвращается
+   SwiftShader/Mesa, что мгновенный триггер для Avito. Подменяем
+   UNMASKED_RENDERER_WEBGL (0x9246) на Intel Iris Xe.
 
-- Через ``Page.addScriptToEvaluateOnNewDocument`` добавляем скрипт,
-  который выполняется на КАЖДОЙ странице ДО любого её JS — это
-  единственный способ перехватить чтение свойств ``navigator.*``
-  до того, как страница его прочитала.
+4. T10 — window.chrome: при --remote-debugging-port объект chrome.runtime
+   пустой/битый. Эмулируем нормальную структуру.
+
+Все скрипты регистрируются через Page.addScriptToEvaluateOnNewDocument —
+выполняются до любого JS загружаемой страницы.
 
 Public API:
 
@@ -93,6 +91,33 @@ _STEALTH_JS = r"""
     setTimeout(wipeCdc, 0);
     setTimeout(wipeCdc, 50);
     setTimeout(wipeCdc, 200);
+  } catch (_) {}
+
+  // ── T9: маскировка WebGL (скрываем программный рендерер VDS) ────────
+  try {
+    const origGetParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+      if (parameter === 37446) return 'Intel(R) Iris(R) Xe Graphics';
+      if (parameter === 37445) return 'Intel Open Source Technology Center';
+      return origGetParam.apply(this, arguments);
+    };
+  } catch (_) {}
+
+  // ── T10: эмуляция window.chrome (remote-debugging-port маскировка) ──
+  try {
+    if (!window.chrome) {
+      window.chrome = {
+        app: {
+          isInstalled: false,
+          InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+          RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' }
+        },
+        runtime: {
+          OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+          OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+        },
+      };
+    }
   } catch (_) {}
 })();
 """

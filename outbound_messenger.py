@@ -28,18 +28,25 @@ import logging
 import random
 import time
 
-from selenium.common.exceptions import (
-    TimeoutException,
-    WebDriverException,
-)
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.common.exceptions import WebDriverException
 
 import tg_bot as _tg
 from account_state import account_state as _astate
 from captcha_detect import detect_phone_captcha
 from human_delay import human_delay as _human_delay
 from llm_sanitizer import sanitize_llm_reply
+from personas import (
+    APPROACH_HINTS,
+    FORMALITY_LEVELS,
+    LENGTH_HINTS,
+    PERSONAS,
+    PITCH_APPROACH_HINTS,
+    PITCH_FORMALITY_LEVELS,
+    PITCH_LENGTH_HINTS,
+    PITCH_PERSONAS,
+    is_pitch_persona,
+    pick_persona_for_account,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,100 +61,16 @@ def _stopping(account_name: str) -> bool:
     return _tg.is_stop_requested(account_name)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Personas — кто бот «изображает», когда пишет первый раз собственнику.
-# Конкретное значение — описание для LLM-промпта (поле persona_description).
-# Каждый аккаунт получает СВОЮ персону через accounts.json["persona"], либо
-# выбирается случайно из пула (один и тот же persona по аккаунту всю сессию,
-# чтобы стиль не «прыгал»).
-# ─────────────────────────────────────────────────────────────────────────────
-
-PERSONAS: dict[str, str] = {
-    "tatarstan_developer": (
-        "девелопер из Татарстана, занимаюсь строительством и сдачей небольших торговых центров. "
-        "Уже есть 15 готовых арендных бизнесов. Ищу финансовых партнеров для строительства новых объектов. "
-        "Средняя окупаемость 6-8 лет. Интересует партнерство, не аренда конкретного объекта."
-    ),
-}
-
-# Стилистические вариации — добавляются в промпт чтобы LLM каждый раз
-# писал по-другому. Иначе один аккаунт даёт одинаковый паттерн всем
-# собственникам — это палево.
-_FORMALITY_LEVELS = [
-    "очень неформальный (как с приятелем, можно «привет», без вежливых форм)",
-    "нейтральный (без формальностей, но и без панибратства)",
-    "вежливо-деловой (полное «здравствуйте», но без канцеляризмов)",
-]
-
-_LENGTH_HINTS = [
-    "очень коротко (1 предложение, прямой вопрос)",
-    "среднее (2-3 предложения, контекст + вопрос)",
-]
-
-_APPROACH_HINTS = [
-    "сразу к делу (один открытый вопрос про объект)",
-    "сначала упомянуть деталь объявления, потом вопрос",
-    "представиться чем интересуюсь, что важно — короткой строкой",
-]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Pitch-mode: персоны, которые НЕ откликаются на конкретный объект, а делают
-# B2B-питч собственнику (партнёрство, инвестиции). Отдельные prompts +
-# отдельные стилистические подсказки (длиннее, формальнее, без привязки к
-# деталям объявления). Добавляешь персону сюда → используется pitch-prompt.
-# ─────────────────────────────────────────────────────────────────────────────
-
-_PITCH_PERSONAS: frozenset[str] = frozenset(
-    {
-        "tatarstan_developer",
-    }
-)
-
-_PITCH_FORMALITY_LEVELS = [
-    "вежливо-деловой (полное «Здравствуйте», без канцеляризмов и без «уважаемые»)",
-    "нейтрально-уверенный (как опытный предприниматель — ёмко и по делу)",
-]
-
-_PITCH_LENGTH_HINTS = [
-    "стандарт (3-4 предложения: представление + предложение + вопрос)",
-    "развёрнутый (4-5 предложений с одной дополнительной деталью)",
-]
-
-_PITCH_APPROACH_HINTS = [
-    "сразу к питчу: представился — изложил предложение — задал вопрос",
-    "сначала вежливое «Здравствуйте.», затем что делаешь и что ищешь, в конце — открытый вопрос",
-    "представление как ёмкая характеристика того, чем занимаешься, и сразу — поиск партнёров",
-]
-
-
-def _is_pitch_persona(persona_id: str) -> bool:
-    """H1: вернёт True, если для этой персоны нужно использовать pitch-mode
-    promptы (B2B-предложение партнёрства), а не обычный rent-mode (отклик
-    арендатора на объявление). См. _PITCH_PERSONAS.
-    """
-    return persona_id in _PITCH_PERSONAS
-
-
-def _pick_persona_for_account(account: dict) -> str:
-    """H1: выбор персоны. Per-account фиксация (через accounts.json)
-    предпочтительна: стиль не «прыгает». Если не задана — берём
-    случайную из PERSONAS, но с учётом: один и тот же random.seed по
-    account_name, чтобы между запусками персона была стабильна.
-
-    Возвращает persona_id (ключ в PERSONAS).
-    """
-    explicit = account.get("persona")
-    if explicit and explicit in PERSONAS:
-        return explicit
-
-    # Стабильный выбор: hash(account_name) → индекс. Так каждый аккаунт
-    # получит свою персону детерминировано, без явной настройки в JSON.
-    account_name = account.get("name", "")
-    if not account_name:
-        return random.choice(list(PERSONAS.keys()))
-    seeded = random.Random(account_name)
-    return seeded.choice(list(PERSONAS.keys()))
+# Aliases for backward compatibility (_-префикс используется в bot.py и тестах)
+_is_pitch_persona = is_pitch_persona
+_pick_persona_for_account = pick_persona_for_account
+_FORMALITY_LEVELS = FORMALITY_LEVELS
+_LENGTH_HINTS = LENGTH_HINTS
+_APPROACH_HINTS = APPROACH_HINTS
+_PITCH_PERSONAS = PITCH_PERSONAS
+_PITCH_FORMALITY_LEVELS = PITCH_FORMALITY_LEVELS
+_PITCH_LENGTH_HINTS = PITCH_LENGTH_HINTS
+_PITCH_APPROACH_HINTS = PITCH_APPROACH_HINTS
 
 
 def _generate_first_message(llm_classifier, listing: dict, persona_id: str) -> str | None:
@@ -482,19 +405,3 @@ class OutboundMessenger:
         else:
             log_func(self.account_name, f"H1: сообщение отправлено ({len(text)} chars).")
         return ok
-
-    def _verify_message_appeared(self, log_func) -> bool:
-        """После отправки проверить что сообщение появилось в DOM чата.
-        Считаем количество элементов messenger/message до и после отправки."""
-        xpath = "//*[@data-marker='messenger/message']"
-        try:
-            before = len(self.driver.find_elements(By.XPATH, xpath))
-            # Ждём до 3 секунд появления нового сообщения
-            WebDriverWait(self.driver, 3).until(
-                lambda d: len(d.find_elements(By.XPATH, xpath)) > before
-            )
-            return True
-        except TimeoutException:
-            return False
-        except Exception:
-            return False
