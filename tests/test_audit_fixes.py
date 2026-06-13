@@ -134,3 +134,43 @@ def test_big_warmup_skips_yandex_when_disabled(monkeypatch):
     monkeypatch.setattr(warmup, "_pick_warmup_sites", lambda n: [])
     stats = warmup.big_warmup(MagicMock(), "acc", num_sites=0, with_yandex_search=False)
     assert stats["yandex_ok"] is None  # None == yandex не запускался
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _driver_path_usable — отбраковка недоступного /root-драйвера AdsPower
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_driver_path_usable_none_and_empty():
+    import bot
+
+    assert bot._driver_path_usable(None) is False
+    assert bot._driver_path_usable("") is False
+
+
+def test_driver_path_usable_true_for_real_executable(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot.os.path, "isfile", lambda p: True)
+    monkeypatch.setattr(bot.os, "access", lambda p, m: True)
+    assert bot._driver_path_usable("/some/chromedriver") is True
+
+
+def test_driver_path_usable_false_when_not_executable(monkeypatch):
+    import bot
+
+    monkeypatch.setattr(bot.os.path, "isfile", lambda p: True)
+    monkeypatch.setattr(bot.os, "access", lambda p, m: False)
+    assert bot._driver_path_usable("/some/chromedriver") is False
+
+
+def test_driver_path_usable_swallows_permission_error(monkeypatch):
+    # Регрессия: на Python 3.10 проверка файла в /root кидала PermissionError
+    # и роняла подключение. Должна тихо вернуть False.
+    import bot
+
+    def boom(_p):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(bot.os.path, "isfile", boom)
+    assert bot._driver_path_usable("/root/.adspowerCli/chrome_148/chromedriver") is False

@@ -150,6 +150,22 @@ _PROXY_NOT_READY_MARKERS = (
 )
 
 
+def _driver_path_usable(path: str | None) -> bool:
+    """Доступен ли chromedriver по пути `path` текущему пользователю.
+
+    ВАЖНО: pathlib.Path.is_file() на Python 3.10 ПРОБРАСЫВАЕТ PermissionError
+    для файлов внутри недоступного /root (на 3.12 — подавляет). AdsPower как раз
+    отдаёт webdriver_path в /root/.adspowerCli/..., а бот работает под avito —
+    поэтому используем os.path.isfile (подавляет EACCES на всех версиях) +
+    явный try/except, чтобы недоступный драйвер тихо отбраковывался, а не ронял
+    подключение.
+    """
+    try:
+        return bool(path) and os.path.isfile(path) and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
 def _wait_network_ready(driver, account_name: str, attempts: int = 6) -> bool:
     """Ждёт готовности прокси в свежезапущенном профиле AdsPower.
 
@@ -202,11 +218,7 @@ def connect_to_sphere(debug_port: int, webdriver_path: str | None = None) -> web
     # недоступный пользователю avito (Permission denied). Если файла нет или
     # он не исполняемый для текущего пользователя — не пытаемся (и не спамим
     # warning'ами), а сразу идём на PATH-драйвер (Попытка 2).
-    adspower_driver_usable = bool(
-        webdriver_path
-        and Path(webdriver_path).is_file()
-        and os.access(webdriver_path, os.X_OK)
-    )
+    adspower_driver_usable = _driver_path_usable(webdriver_path)
     if webdriver_path and not adspower_driver_usable:
         _bot_logger.info(
             "connect_to_sphere: AdsPower chromedriver недоступен (%s) — использую PATH-драйвер",
