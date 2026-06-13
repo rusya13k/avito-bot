@@ -272,26 +272,77 @@ _GET_SMS_BUTTON_XPATHS: tuple[str, ...] = (
 )
 
 
+# JS: собирает текст страницы ВКЛЮЧАЯ shadow-DOM. Avito рендерит часть модалок
+# (в т.ч. «защита профиля») в web-components с shadowRoot, поэтому обычный
+# document.body.innerText их НЕ видит — из-за этого detect промахивался.
+_DEEP_TEXT_JS = """
+return (function () {
+  var txt = document.body ? document.body.innerText : '';
+  try {
+    var all = document.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].shadowRoot) { txt += ' ' + (all[i].shadowRoot.textContent || ''); }
+    }
+  } catch (e) {}
+  return txt;
+})();
+"""
+
+
+def _deep_page_text(driver) -> str:
+    """Текст страницы с учётом shadow-DOM. Пустая строка при ошибке."""
+    try:
+        return driver.execute_script(_DEEP_TEXT_JS) or ""
+    except WebDriverException:
+        try:
+            return driver.execute_script("return document.body.innerText;") or ""
+        except WebDriverException:
+            return ""
+
+
+def _has_get_sms_button(driver) -> bool:
+    """True, если на странице есть видимая кнопка «получить код по СМС»."""
+    for sel in _GET_SMS_BUTTON_XPATHS:
+        try:
+            for el in driver.find_elements(By.XPATH, sel):
+                try:
+                    if el.is_displayed():
+                        return True
+                except (StaleElementReferenceException, WebDriverException):
+                    continue
+        except WebDriverException:
+            continue
+    return False
+
+
 def detect_profile_protection(driver, log_func=None, account_name: str = "") -> bool:
     """
     True, если Avito показывает экран «сработала защита профиля»
     с предложением получить код по СМС.
+
+    Детект двухуровневый (Avito рендерит модалку в shadow-DOM, поэтому одного
+    innerText мало): (1) текст страницы с обходом shadow-DOM по паттернам,
+    (2) наличие видимой кнопки «получить код по СМС».
     """
-    try:
-        src = driver.execute_script("return document.body.innerText;") or ""
-    except WebDriverException:
-        return False
+    src = _deep_page_text(driver)
+    matched: str | None = None
     for pattern in _PROTECTION_TEXT_PATTERNS:
         if pattern in src:
-            if log_func is not None:
-                try:
-                    log_func(
-                        account_name,
-                        f"!!! PROFILE PROTECTION DETECTED (text: {pattern}) !!!",
-                    )
-                except Exception:
-                    pass
-            return True
+            matched = f"text:{pattern}"
+            break
+    if matched is None and _has_get_sms_button(driver):
+        matched = "button:get-sms"
+
+    if matched is not None:
+        if log_func is not None:
+            try:
+                log_func(
+                    account_name,
+                    f"!!! PROFILE PROTECTION DETECTED ({matched}) !!!",
+                )
+            except Exception:
+                pass
+        return True
     return False
 
 

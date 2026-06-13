@@ -56,7 +56,6 @@ from logging_setup import (
     install_tg_buffer_handler,
     setup_logging,
 )
-from stealth import apply_stealth as _apply_stealth
 from tab_switch import new_tab_for_listing as _new_tab_for_listing
 
 # Random queries for Yandex warmup
@@ -136,6 +135,48 @@ def _wait_chrome_ready(debug_port: int, timeout: float = 30.0) -> str | None:
     return None
 
 
+# Сетевые ошибки Chrome, означающие «прокси/туннель в свежем профиле ещё не
+# поднялся» — это гонка на старте (gost/upstream поднимается дольше, чем бот
+# успевает дойти до первой навигации). На них надо подождать и повторить, а НЕ
+# падать. Любой ответ страницы (даже Яндекс-капча) означает, что сеть жива.
+_PROXY_NOT_READY_MARKERS = (
+    "ERR_SOCKS_CONNECTION_FAILED",
+    "ERR_PROXY_CONNECTION_FAILED",
+    "ERR_TUNNEL_CONNECTION_FAILED",
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED",
+    "ERR_EMPTY_RESPONSE",
+    "ERR_CONNECTION_REFUSED",
+)
+
+
+def _wait_network_ready(driver, account_name: str, attempts: int = 6) -> bool:
+    """Ждёт готовности прокси в свежезапущенном профиле AdsPower.
+
+    Делает лёгкую навигацию с ретраями: если ловим прокси-ошибку
+    (ERR_SOCKS_* и т.п.) — туннель ещё поднимается, ждём и повторяем.
+    Если страница ответила (пусть даже капчей) — сеть/прокси готовы → True.
+    Возвращает False, только если за `attempts` попыток прокси так и не встал.
+    """
+    for i in range(attempts):
+        try:
+            driver.get("https://ya.ru")
+            return True  # ответ получен — сеть жива (капча тоже считается)
+        except WebDriverException as exc:
+            msg = str(exc)
+            if any(m in msg for m in _PROXY_NOT_READY_MARKERS):
+                log(
+                    account_name,
+                    f"  Прокси ещё поднимается ({i + 1}/{attempts}): {msg.split(chr(10))[0][:60]}",
+                )
+                hp(2, 4)
+                continue
+            # Не прокси-ошибка (напр. сломанная сессия драйвера) — пробрасываем.
+            raise
+    log(account_name, "  Прокси так и не поднялся за отведённое время.")
+    return False
+
+
 def connect_to_sphere(debug_port: int, webdriver_path: str | None = None) -> webdriver.Chrome:
     """Connect Selenium to already running Chrome profile.
 
@@ -157,19 +198,31 @@ def connect_to_sphere(debug_port: int, webdriver_path: str | None = None) -> web
     options = webdriver.ChromeOptions()
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{debug_port}")
 
+    # AdsPower часто отдаёт webdriver_path внутри /root/.adspowerCli/...,
+    # недоступный пользователю avito (Permission denied). Если файла нет или
+    # он не исполняемый для текущего пользователя — не пытаемся (и не спамим
+    # warning'ами), а сразу идём на PATH-драйвер (Попытка 2).
+    adspower_driver_usable = bool(
+        webdriver_path
+        and Path(webdriver_path).is_file()
+        and os.access(webdriver_path, os.X_OK)
+    )
+    if webdriver_path and not adspower_driver_usable:
+        _bot_logger.info(
+            "connect_to_sphere: AdsPower chromedriver недоступен (%s) — использую PATH-драйвер",
+            webdriver_path,
+        )
+
     # Попытка 1: через service из webdriver_path (AdsPower)
-    if webdriver_path:
+    if adspower_driver_usable:
         try:
-            cd_path = Path(webdriver_path)
-            if cd_path.is_file():
-                _bot_logger.info("connect_to_sphere: AdsPower chromedriver OK (%s), port=0", webdriver_path)
-                return webdriver.Chrome(service=Service(webdriver_path, port=0), options=options)
-            _bot_logger.warning("connect_to_sphere: AdsPower chromedriver NOT a file: %s", webdriver_path)
+            _bot_logger.info("connect_to_sphere: AdsPower chromedriver OK (%s), port=0", webdriver_path)
+            return webdriver.Chrome(service=Service(webdriver_path, port=0), options=options)
         except Exception as exc:
             _bot_logger.warning("connect_to_sphere: AdsPower chromedriver failed (%s), falling back...", exc)
 
     # Попытка 1b: прямой запуск chromedriver через subprocess (обходит Selenium Manager)
-    if webdriver_path:
+    if adspower_driver_usable:
         try:
             cd_path = Path(webdriver_path)
             if cd_path.is_file():
@@ -210,12 +263,6 @@ def connect_to_sphere(debug_port: int, webdriver_path: str | None = None) -> web
     except Exception as exc:
         _bot_logger.error("All chromedriver attempts failed: %s", exc)
         raise
-
-    # Stealth (AdsPower не нужен, но на всякий случай не убираем)
-    if not _apply_stealth(driver):
-        _bot_logger.warning("T7/T8: stealth-инъекция не применилась (CDP недоступен?)")
-
-    return driver
 
 
 def load_cookies(driver: webdriver.Chrome, cookies_path: str, domain: str):
@@ -1943,7 +1990,12 @@ def perform_login(driver, wait, account_name, phone, password):
     """
     # Импорты лежат внутри функции, чтобы избежать циклической загрузки
     # (captcha_detect не должен импортироваться в module-load time bot.py).
-    from captcha_detect import detect_captcha, detect_profile_protection, detect_sms_form, click_get_sms_button
+    from captcha_detect import (
+        click_get_sms_button,
+        detect_captcha,
+        detect_profile_protection,
+        detect_sms_form,
+    )
 
     log(
         account_name,
@@ -2606,10 +2658,10 @@ def _connect_with_adspower(
             driver = connect_to_sphere(debug_port, webdriver_path=webdriver_path)
             wait = WebDriverWait(driver, 15)
 
-            if safe_get(driver, "https://ya.ru", account_name, retries=1):
+            if _wait_network_ready(driver, account_name):
                 return driver, wait
 
-            raise Exception("Connection failed")
+            raise Exception("Connection failed (proxy/network not ready)")
         except Exception as e:
             log(account_name, f"Connection fail: {e}")
             if driver:
@@ -2966,8 +3018,17 @@ def run_thread(account: dict, cfg: dict, adspower: AdsPowerLauncher, db_manager:
         from warmup import big_warmup
 
         warmup_sites = account.get("warmup_sites", cfg.get("warmup_sites", 3))
+        # Yandex direct-search в прогреве палит автоматизацию (Яндекс кидает
+        # checkbox-captcha на любой прокси) и создаёт ложные "IP BLOCK" в логах.
+        # По умолчанию выключен; мульти-сайтовый прогрев работает и без него.
+        warmup_yandex = bool(
+            account.get("warmup_yandex_enabled", cfg.get("warmup_yandex_enabled", False))
+        )
         warmup_stats = big_warmup(
-            driver, account_name=account_name, num_sites=warmup_sites, with_yandex_search=True
+            driver,
+            account_name=account_name,
+            num_sites=warmup_sites,
+            with_yandex_search=warmup_yandex,
         )
 
         if not warmup_stats or not warmup_stats.get("ok"):
