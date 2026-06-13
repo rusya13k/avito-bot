@@ -21,6 +21,8 @@ from cycle_pause import (  # noqa: E402
     DEFAULT_LONG_BREAK_MAX_MIN,
     DEFAULT_LONG_BREAK_MIN_MIN,
     DEFAULT_LONG_BREAKS_PER_DAY,
+    DEFAULT_LUNCH_BREAK_MAX_MIN,
+    DEFAULT_LUNCH_BREAK_MIN_MIN,
     DINNER_WINDOW,
     LUNCH_WINDOW,
     _is_meal_window,
@@ -216,7 +218,38 @@ def test_pick_regular_uses_lognormal_seconds_range():
 
 
 def test_pick_returns_long_break_in_window_with_chance_1():
-    """chance_in_window=1.0 + lunch window → всегда long_break."""
+    """chance_in_window=1.0 + dinner window → длинный long_break (2-5ч).
+
+    Берём ужин (19:00): в обеденном окне теперь короткий перерыв (см.
+    test_pick_lunch_break_is_short), а длинный перерыв проверяем на ужине.
+    """
+    state = _StubAccountState(taken_today=0)
+    rng = random.Random(0)
+    secs, label = pick_cycle_pause(
+        {
+            "long_break_chance_in_window": 1.0,
+            "long_break_chance_out_window": 0.0,
+            "long_breaks_per_day": 2,
+        },
+        {},
+        account_state=state,
+        account_name="acc1",
+        now=dt.datetime(2025, 1, 1, 19, 0),  # dinner window
+        rng=rng,
+    )
+    assert label == "long_break"
+    # Long break длительность по дефолту [120, 300] минут.
+    assert DEFAULT_LONG_BREAK_MIN_MIN * 60 <= secs <= DEFAULT_LONG_BREAK_MAX_MIN * 60
+    # Side effect: счётчик инкрементирован.
+    assert state.record_calls == ["acc1"]
+
+
+def test_pick_lunch_break_is_short():
+    """В обеденном окне (12-14) перерыв короткий 25-40 мин, не 2-5ч.
+
+    Человек обедает ~полчаса, а не пропадает на полдня. Label остаётся
+    long_break (учитывается в дневном лимите и статистике перерывов).
+    """
     state = _StubAccountState(taken_today=0)
     rng = random.Random(0)
     secs, label = pick_cycle_pause(
@@ -232,9 +265,9 @@ def test_pick_returns_long_break_in_window_with_chance_1():
         rng=rng,
     )
     assert label == "long_break"
-    # Long break длительность по дефолту [120, 300] минут.
-    assert DEFAULT_LONG_BREAK_MIN_MIN * 60 <= secs <= DEFAULT_LONG_BREAK_MAX_MIN * 60
-    # Side effect: счётчик инкрементирован.
+    # Обеденный перерыв в [25, 40] минут — НЕ длинный 2-5ч.
+    assert DEFAULT_LUNCH_BREAK_MIN_MIN * 60 <= secs <= DEFAULT_LUNCH_BREAK_MAX_MIN * 60
+    assert secs < DEFAULT_LONG_BREAK_MIN_MIN * 60  # точно короче ужина
     assert state.record_calls == ["acc1"]
 
 
@@ -328,7 +361,7 @@ def test_pick_long_break_respects_dinner_window():
 
 
 def test_pick_uses_account_overrides_for_long_break_duration():
-    """account override long_break_min_min/max_min используется."""
+    """account override long_break_min_min/max_min используется (ужин)."""
     state = _StubAccountState(taken_today=0)
     rng = random.Random(0)
     secs, label = pick_cycle_pause(
@@ -341,7 +374,7 @@ def test_pick_uses_account_overrides_for_long_break_duration():
         {},
         account_state=state,
         account_name="acc1",
-        now=dt.datetime(2025, 1, 1, 13, 0),
+        now=dt.datetime(2025, 1, 1, 19, 0),  # dinner — длинный перерыв, не обед
         rng=rng,
     )
     assert label == "long_break"
@@ -349,7 +382,7 @@ def test_pick_uses_account_overrides_for_long_break_duration():
 
 
 def test_pick_cfg_fallback():
-    """Если account=None, берёт значения из cfg."""
+    """Если account=None, берёт значения из cfg (ужин — длинный перерыв)."""
     state = _StubAccountState(taken_today=0)
     rng = random.Random(0)
     secs, label = pick_cycle_pause(
@@ -362,7 +395,7 @@ def test_pick_cfg_fallback():
         },
         account_state=state,
         account_name="acc1",
-        now=dt.datetime(2025, 1, 1, 13, 0),
+        now=dt.datetime(2025, 1, 1, 19, 0),  # dinner — проверяем long_break override
         rng=rng,
     )
     assert label == "long_break"
