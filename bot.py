@@ -244,20 +244,32 @@ def connect_to_sphere(debug_port: int, webdriver_path: str | None = None) -> web
         except Exception as exc:
             _bot_logger.warning("connect_to_sphere: subprocess chromedriver failed (%s), falling back...", exc)
 
-    # Попытка 2: chromedriver из PATH (системный)
+    # Попытка 2: ChromeDriverManager под ТОЧНУЮ версию браузера.
+    # Это надёжнее PATH-драйвера: AdsPower обновляет ядро (138→148→149...),
+    # и фиксированный chromedriver в PATH быстро становится несовместимым
+    # ("session not created: only supports NNN"). Подбираем драйвер под
+    # реально запущенное ядро (browser_version из /json/version).
+    if browser_version:
+        try:
+            _bot_logger.info("connect_to_sphere: ChromeDriverManager под версию %s", browser_version)
+            return webdriver.Chrome(
+                service=Service(ChromeDriverManager(driver_version=browser_version).install()),
+                options=options,
+            )
+        except Exception as exc:
+            _bot_logger.warning(
+                "connect_to_sphere: ChromeDriverManager(%s) failed (%s), пробую PATH...",
+                browser_version, exc,
+            )
+
+    # Попытка 3: chromedriver из PATH (системный) — fallback, если CDM недоступен
+    # (нет сети) или не нашёл точную версию.
     try:
         return webdriver.Chrome(options=options)
     except Exception as exc:
-        _bot_logger.warning("connect_to_sphere: system chromedriver failed (%s), trying ChromeDriverManager...", exc)
+        _bot_logger.warning("connect_to_sphere: system chromedriver failed (%s), trying latest...", exc)
 
-    # Попытка 3: ChromeDriverManager с версией браузера
-    try:
-        if browser_version:
-            return webdriver.Chrome(service=Service(ChromeDriverManager(driver_version=browser_version).install()), options=options)
-    except Exception:
-        pass
-
-    # Попытка 4: ChromeDriverManager без версии
+    # Попытка 4: ChromeDriverManager latest — последняя надежда
     try:
         return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     except Exception as exc:
