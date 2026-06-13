@@ -187,10 +187,15 @@ def kb_main() -> InlineKeyboardMarkup:
     m.add(
         InlineKeyboardButton("▶️ Запустить", callback_data="run"),
         InlineKeyboardButton("⏹ Остановить", callback_data="stop"),
+        # Статистика — прямые кнопки (раньше только slash-команды /budget,
+        # /health, /lastcaptcha). «➕ Добавить аккаунт» убран из главного —
+        # он дублировался, кнопка есть внутри «👤 Аккаунты».
         InlineKeyboardButton("📊 Отчёт", callback_data="report"),
+        InlineKeyboardButton("💰 Бюджеты", callback_data="budget"),
+        InlineKeyboardButton("❤️ Health", callback_data="health"),
+        InlineKeyboardButton("🧊 Капчи", callback_data="lastcaptcha"),
         InlineKeyboardButton("📋 Логи", callback_data="logs"),
         InlineKeyboardButton("👤 Аккаунты", callback_data="accounts_menu"),
-        InlineKeyboardButton("➕ Добавить аккаунт", callback_data="acc_add"),
         InlineKeyboardButton("⚙️ Настройки", callback_data="settings_menu"),
     )
     return m
@@ -225,6 +230,11 @@ def kb_account_detail(idx: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🌐 Прокси", callback_data=f"acc_proxy_{idx}"),
         InlineKeyboardButton("💰 Бюджеты", callback_data=f"acc_budget_{idx}"),
         InlineKeyboardButton("🖐 Отпечаток (FP)", callback_data=f"acc_fingerprint_{idx}"),
+        # Per-account прогрев/выходной — раньше только slash (/warmup, /bigwarmup,
+        # /skipday <имя>). Теперь кнопками прямо из карточки.
+        InlineKeyboardButton("🔥 Прогрев +3д", callback_data=f"acc_warmup_{idx}"),
+        InlineKeyboardButton("🚀 Большой прогрев", callback_data=f"acc_bigwarmup_{idx}"),
+        InlineKeyboardButton("🌙 Пропустить день", callback_data=f"acc_skipday_{idx}"),
         InlineKeyboardButton("💤 Отключить/Включить", callback_data=f"acc_toggle_{idx}"),
         InlineKeyboardButton("🗑 Удалить", callback_data=f"acc_del_{idx}"),
         InlineKeyboardButton("◀️ Назад", callback_data="accounts_menu"),
@@ -235,7 +245,6 @@ def kb_account_detail(idx: int) -> InlineKeyboardMarkup:
 def kb_settings() -> InlineKeyboardMarkup:
     m = InlineKeyboardMarkup(row_width=1)
     m.add(
-        InlineKeyboardButton("🔗 Ссылка на объявление", callback_data="set_url"),
         InlineKeyboardButton("🤖 DeepSeek API Key", callback_data="set_openai_key"),
         InlineKeyboardButton("🧠 LLM Model", callback_data="set_openai_model"),
         InlineKeyboardButton("◀️ Назад", callback_data="menu_main"),
@@ -548,7 +557,6 @@ class TelegramController:
         cfg = self._cfg()
         text = (
             f"⚙️ Настройки\n\n"
-            f"🔗 URL: {cfg.get('target_url', '—')[:60]}...\n"
             f"🤖 LLM Key: {'✅ задан' if cfg.get('openai_api_key', '') else '❌ не задан'}\n"
             f"🧠 LLM Model: {cfg.get('openai_model', 'deepseek-v4-flash')}\n"
         )
@@ -619,53 +627,93 @@ class TelegramController:
             logger.exception("cmd_report failed")
             self.bot.reply_to(message, f"Ошибка отчёта: {exc}")
 
+    def _build_budget_text(self) -> str:
+        """C2: текст статуса дневных бюджетов всех аккаунтов (цветные индикаторы).
+
+        Выделено из _cmd_budget, чтобы переиспользовать и из slash-команды
+        (/budget), и из кнопки «💰 Бюджеты» (_cb_budget). Может бросить —
+        caller оборачивает в try/except.
+        """
+        from account_state import account_state as _astate
+        from accounts import load_accounts
+
+        cfg = self._cfg()
+        accounts_list = load_accounts(self.BASE, cfg)
+        db = self._get_db()
+        today = time.strftime("%Y-%m-%d 00:00:00")
+        lines = ["💰 Бюджет аккаунтов на сегодня", ""]
+        if not accounts_list:
+            lines.append("Нет активных аккаунтов.")
+        # E2-opt: один запрос вместо N+1 — забираем все метрики за сегодня
+        all_metrics_rows = db.get_metrics(since=today, group_by="metric")
+        # Строим lookup: (account_name, metric) → value
+        metrics_lookup: dict[tuple[str, str], int] = {}
+        for r in all_metrics_rows:
+            key = (r.get("account_name", ""), r.get("metric", ""))
+            metrics_lookup[key] = int(r.get("value", 0))
+        for acc in accounts_list:
+            name = acc["name"]
+            lines.append(f"▪ {name}:")
+            for action, metric in [
+                ("listings", "listings_parsed"),
+                ("messages", "messages_sent"),
+                ("phone", "phone_clicks"),
+            ]:
+                if action == "phone":
+                    used = _astate.phone_clicks_today(name)
+                else:
+                    used = metrics_lookup.get((name, metric), 0)
+                limit = _astate.get_effective_limit(name, action)
+                pct = used * 100 // limit if limit > 0 else 0
+                icon = "🔴" if pct >= 100 else "🟡" if pct >= 80 else "🟢"
+                lines.append(f"  {icon} {action}: {used}/{limit} ({pct}%)")
+            warmup = "⏳ warmup" if _astate.is_in_warmup(name) else ""
+            if warmup:
+                lines.append(f"  {warmup}")
+            lines.append("")
+        return "\n".join(lines)
+
     def _cmd_budget(self, message):
         """C2: статус дневных бюджетов по всем аккаунтам с цветными индикаторами."""
         if not self._allowed(message.from_user.id):
             self.bot.reply_to(message, "Нет доступа.")
             return
         try:
-            from account_state import account_state as _astate
-            from accounts import load_accounts
-
-            cfg = self._cfg()
-            accounts_list = load_accounts(self.BASE, cfg)
-            db = self._get_db()
-            today = time.strftime("%Y-%m-%d 00:00:00")
-            lines = ["💰 Бюджет аккаунтов на сегодня", ""]
-            if not accounts_list:
-                lines.append("Нет активных аккаунтов.")
-            # E2-opt: один запрос вместо N+1 — забираем все метрики за сегодня
-            all_metrics_rows = db.get_metrics(since=today, group_by="metric")
-            # Строим lookup: (account_name, metric) → value
-            metrics_lookup: dict[tuple[str, str], int] = {}
-            for r in all_metrics_rows:
-                key = (r.get("account_name", ""), r.get("metric", ""))
-                metrics_lookup[key] = int(r.get("value", 0))
-            for acc in accounts_list:
-                name = acc["name"]
-                lines.append(f"▪ {name}:")
-                for action, metric in [
-                    ("listings", "listings_parsed"),
-                    ("messages", "messages_sent"),
-                    ("phone", "phone_clicks"),
-                ]:
-                    if action == "phone":
-                        used = _astate.phone_clicks_today(name)
-                    else:
-                        used = metrics_lookup.get((name, metric), 0)
-                    limit = _astate.get_effective_limit(name, action)
-                    pct = used * 100 // limit if limit > 0 else 0
-                    icon = "🔴" if pct >= 100 else "🟡" if pct >= 80 else "🟢"
-                    lines.append(f"  {icon} {action}: {used}/{limit} ({pct}%)")
-                warmup = "⏳ warmup" if _astate.is_in_warmup(name) else ""
-                if warmup:
-                    lines.append(f"  {warmup}")
-                lines.append("")
-            self.bot.reply_to(message, "\n".join(lines))
+            self.bot.reply_to(message, self._build_budget_text())
         except Exception as exc:
             logger.exception("cmd_budget failed")
             self.bot.reply_to(message, f"Ошибка: {exc}")
+
+    def _build_lastcaptcha_all_text(self, per_account_limit: int = 3) -> str:
+        """C3: сводка последних капч по ВСЕМ аккаунтам (для кнопки «🧊 Капчи»).
+
+        Slash-команда /lastcaptcha <name> показывает один аккаунт; кнопка
+        в главном меню — агрегат по всем (по per_account_limit последних
+        капч на аккаунт). Может бросить — caller оборачивает в try/except.
+        """
+        from accounts import load_accounts
+
+        cfg = self._cfg()
+        accounts_list = load_accounts(self.BASE, cfg) or []
+        db = self._get_db()
+        if not accounts_list:
+            return "Нет аккаунтов."
+        lines = ["🧊 Последние капчи по аккаунтам", ""]
+        for acc in accounts_list:
+            name = acc["name"]
+            rows = db.get_captcha_log(name, limit=per_account_limit)
+            if not rows:
+                lines.append(f"✅ {name}: чисто")
+                lines.append("")
+                continue
+            lines.append(f"🚨 {name}:")
+            for r in rows:
+                lines.append(
+                    f"  {r['ts']}  {r['action']}  {r['captcha_type']}\n"
+                    f"  {r['page_url'] or '—'}"
+                )
+            lines.append("")
+        return "\n".join(lines)
 
     def _cmd_lastcaptcha(self, message):
         """C3: последние капча-инциденты по аккаунту.
@@ -737,6 +785,51 @@ class TelegramController:
             return ""
         return "📊 Pattern (7д):\n" + "\n".join(out)
 
+    def _build_health_text(self, name: str | None = None) -> str:
+        """C1: текст health score за 7 дней. name=None → все аккаунты.
+
+        Выделено из _cmd_health для переиспользования кнопкой «❤️ Health»
+        (_cb_health, по всем аккаунтам). T20: pattern-блок с гистограммами
+        добавляется только когда таргет — один аккаунт (иначе сообщение
+        переполняется при N>3). Может бросить — caller ловит.
+        """
+        from account_state import account_state as _astate
+        from account_state import compute_account_health
+        from accounts import load_accounts
+
+        cfg = self._cfg()
+        db = self._get_db()
+
+        if name:
+            target_accounts = [{"name": name}]
+        else:
+            target_accounts = load_accounts(self.BASE, cfg) or []
+
+        if not target_accounts:
+            return "Нет аккаунтов."
+
+        lines = ["🏥 Health score аккаунтов (7 дней)", ""]
+        mode_icon = {"healthy": "✅", "warning": "⚠️", "degraded": "🔴", "critical": "💀"}
+        single_account = len(target_accounts) == 1
+        for acc in target_accounts:
+            acc_name = acc["name"]
+            h = compute_account_health(acc_name, db)
+            icon = mode_icon.get(h["mode"], "❓")
+            warmup = " ⏳warmup" if _astate.is_in_warmup(acc_name) else ""
+            lines.append(
+                f"{icon} {acc_name}{warmup}\n"
+                f"  режим: {h['mode']}  score: {h['score']:.3f}\n"
+                f"  листингов: {h['listings_7d']}  капч: {h['captchas_7d']}\n"
+                f"  (с {h['since']})"
+            )
+            # T20: behavioral pattern (только при одном аккаунте).
+            if single_account:
+                pattern_block = self._format_behavior_pattern(db, acc_name)
+                if pattern_block:
+                    lines.append(pattern_block)
+            lines.append("")
+        return "\n".join(lines)
+
     def _cmd_health(self, message):
         """C1: health score аккаунта (или всех аккаунтов) за 7 дней.
         /health [name] — если name не указан, выводит для всех.
@@ -747,45 +840,9 @@ class TelegramController:
             self.bot.reply_to(message, "Нет доступа.")
             return
         try:
-            from account_state import account_state as _astate
-            from account_state import compute_account_health
-            from accounts import load_accounts
-
             parts = (message.text or "").split()
-            cfg = self._cfg()
-            db = self._get_db()
-
-            if len(parts) > 1:
-                target_accounts = [{"name": parts[1]}]
-            else:
-                target_accounts = load_accounts(self.BASE, cfg) or []
-
-            if not target_accounts:
-                self.bot.reply_to(message, "Нет аккаунтов.")
-                return
-
-            lines = ["🏥 Health score аккаунтов (7 дней)", ""]
-            mode_icon = {"healthy": "✅", "warning": "⚠️", "degraded": "🔴", "critical": "💀"}
-            single_account = len(target_accounts) == 1
-            for acc in target_accounts:
-                name = acc["name"]
-                h = compute_account_health(name, db)
-                icon = mode_icon.get(h["mode"], "❓")
-                warmup = " ⏳warmup" if _astate.is_in_warmup(name) else ""
-                lines.append(
-                    f"{icon} {name}{warmup}\n"
-                    f"  режим: {h['mode']}  score: {h['score']:.3f}\n"
-                    f"  листингов: {h['listings_7d']}  капч: {h['captchas_7d']}\n"
-                    f"  (с {h['since']})"
-                )
-                # T20: behavioral pattern (только при /health <name>) — иначе
-                # сообщение переполнится при N>3 аккаунтов.
-                if single_account:
-                    pattern_block = self._format_behavior_pattern(db, name)
-                    if pattern_block:
-                        lines.append(pattern_block)
-                lines.append("")
-            self.bot.reply_to(message, "\n".join(lines))
+            name = parts[1] if len(parts) > 1 else None
+            self.bot.reply_to(message, self._build_health_text(name))
         except Exception as exc:
             logger.exception("cmd_health failed")
             self.bot.reply_to(message, f"Ошибка: {exc}")
@@ -956,32 +1013,22 @@ class TelegramController:
         )
         self._show_accounts(cid)
 
-    def _save_cfg_text_field(
-        self, message, cfg_key: str, success_text: str, *, require_url: bool = False
-    ):
-        """Helper для set_url/set_sphere_key/set_openai_*:
-        читает message.text, валидирует (URL prefix если require_url),
-        сохраняет в cfg[cfg_key], показывает settings-меню.
+    def _save_cfg_text_field(self, message, cfg_key: str, success_text: str):
+        """Helper для set_openai_key/set_openai_*:
+        читает message.text, проверяет на непустоту, сохраняет в
+        cfg[cfg_key], показывает settings-меню.
         """
         cid = message.chat.id
         text = (message.text or "").strip()
-        if require_url:
-            if not text.startswith("http"):
-                self.bot.reply_to(message, "Не похоже на URL.")
-                return
-        else:
-            if not text:
-                self.bot.reply_to(message, "Значение не может быть пустым.")
-                return
+        if not text:
+            self.bot.reply_to(message, "Значение не может быть пустым.")
+            return
         cfg = self._cfg()
         cfg[cfg_key] = text
         self._save_cfg(cfg)
         self._clear_dialog(cid)
         self.bot.reply_to(message, success_text)
         self._show_settings(cid)
-
-    def _dialog_set_url(self, message, data):
-        self._save_cfg_text_field(message, "target_url", "✅ URL обновлён.", require_url=True)
 
     def _dialog_set_openai_key(self, message, data):
         self._save_cfg_text_field(message, "openai_api_key", "✅ DeepSeek API Key обновлён.")
@@ -1218,7 +1265,6 @@ class TelegramController:
             "acc_budget_messages": self._dialog_acc_budget,
             "acc_budget_phone": self._dialog_acc_budget,
             "acc_budget_outbound": self._dialog_acc_budget,
-            "set_url": self._dialog_set_url,
             "set_openai_key": self._dialog_set_openai_key,
             "set_openai_model": self._dialog_set_openai_model,
         }
@@ -1439,6 +1485,36 @@ class TelegramController:
             logger.exception("cb_report failed")
             self._send(cid, f"Ошибка отчёта: {exc}", kb_back())
 
+    def _cb_budget(self, call):
+        """💰 Бюджеты — кнопка-обёртка над _build_budget_text (/budget)."""
+        cid = call.message.chat.id
+        try:
+            text = self._build_budget_text()
+        except Exception as exc:
+            logger.exception("cb_budget failed")
+            text = f"Ошибка: {exc}"
+        self._edit_or_send(cid, call.message.message_id, text, kb_back())
+
+    def _cb_health(self, call):
+        """❤️ Health — кнопка-обёртка над _build_health_text (все аккаунты)."""
+        cid = call.message.chat.id
+        try:
+            text = self._build_health_text()
+        except Exception as exc:
+            logger.exception("cb_health failed")
+            text = f"Ошибка: {exc}"
+        self._edit_or_send(cid, call.message.message_id, text, kb_back())
+
+    def _cb_lastcaptcha(self, call):
+        """🧊 Капчи — кнопка-обёртка над _build_lastcaptcha_all_text (все аккаунты)."""
+        cid = call.message.chat.id
+        try:
+            text = self._build_lastcaptcha_all_text()
+        except Exception as exc:
+            logger.exception("cb_lastcaptcha failed")
+            text = f"Ошибка: {exc}"
+        self._edit_or_send(cid, call.message.message_id, text, kb_back())
+
     def _cb_logs(self, call):
         recent = list(log_buffer)[-30:]
         text = "\n".join(recent) if recent else "Лог пуст."
@@ -1554,6 +1630,54 @@ class TelegramController:
         status = "включён ✅" if new_state else "отключён 💤"
         self.bot.answer_callback_query(call.id, f"Аккаунт {status}")
         # Обновляем карточку — вызываем напрямую вместо мутации call.data
+        self._cb_acc_detail(call, force_idx=idx)
+
+    def _cb_acc_warmup(self, call):
+        """🔥 Прогрев +3д — продлить warmup аккаунта (acc_warmup_<idx>).
+
+        Кнопочный эквивалент /warmup <name> (фиксированно +3 дня от now).
+        """
+        cid = call.message.chat.id
+        idx = int(call.data.split("_")[-1])
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        name = accs[idx]["name"]
+        from account_state import account_state as _astate
+
+        new_until = time.time() + 3 * 86400
+        _astate.set_warmup_until(name, new_until)
+        until_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(new_until))
+        self.bot.answer_callback_query(call.id, f"⏳ Warmup +3 дня (до {until_str})")
+        self._cb_acc_detail(call, force_idx=idx)
+
+    def _cb_acc_bigwarmup(self, call):
+        """🚀 Большой прогрев — запустить ~15-30 мин прогрев в фоне (acc_bigwarmup_<idx>)."""
+        cid = call.message.chat.id
+        idx = int(call.data.split("_")[-1])
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        result = self._start_big_warmup(accs[idx])
+        # Результат может быть длинным (многострочным) — шлём сообщением, а не toast.
+        self._send(cid, result)
+        self._cb_acc_detail(call, force_idx=idx)
+
+    def _cb_acc_skipday(self, call):
+        """🌙 Пропустить день — пометить сегодня dead-day (acc_skipday_<idx>)."""
+        cid = call.message.chat.id
+        idx = int(call.data.split("_")[-1])
+        accs = self._accounts()
+        if idx >= len(accs):
+            self._send(cid, "Аккаунт не найден.")
+            return
+        name = accs[idx]["name"]
+        from account_state import account_state as _astate
+
+        _astate.force_dead_day(name)
+        self.bot.answer_callback_query(call.id, "😴 Dead-day: пропуск до завтра")
         self._cb_acc_detail(call, force_idx=idx)
 
     def _cb_acc_del_confirm(self, call):
@@ -1729,6 +1853,37 @@ class TelegramController:
         finally:
             self._big_warmup_running.discard(name)
 
+    def _start_big_warmup(self, account: dict) -> str:
+        """T12: запустить большой прогрев аккаунта в фоне; вернуть текст-результат.
+
+        Выделено из _cmd_bigwarmup для переиспользования кнопкой «🚀 Большой
+        прогрев» в карточке аккаунта (_cb_acc_bigwarmup). Делает все проверки
+        (уже идёт / аккаунт в основном цикле) и атомарный add под локом.
+        """
+        name = account["name"]
+        if name in self._big_warmup_running:
+            return f"⚠️ Прогрев '{name}' уже идёт."
+        if _is_account_thread_alive(name):
+            return (
+                f"⚠️ Аккаунт '{name}' сейчас работает в основном цикле бота. "
+                f"Останови бота и запусти прогрев заново."
+            )
+        # Атомарная проверка+add под локом — убираем TOCTOU
+        with self._big_warmup_lock:
+            if name in self._big_warmup_running:
+                return f"⚠️ Прогрев '{name}' уже идёт."
+            self._big_warmup_running.add(name)
+        threading.Thread(
+            target=self._run_big_warmup,
+            args=(account,),
+            daemon=True,
+            name=f"tg-bigwarmup-{name}",
+        ).start()
+        return (
+            f"🔥 Большой прогрев для '{name}' запущен в фоне (~15-30 минут).\n"
+            f"Уведомлю по завершении."
+        )
+
     def _cmd_bigwarmup(self, message):
         """T12: /bigwarmup <name> — запустить большой прогрев в фоне."""
         if not self._allowed(message.from_user.id):
@@ -1750,48 +1905,11 @@ class TelegramController:
         if account is None:
             self.bot.reply_to(message, f"Аккаунт '{name}' не найден.")
             return
-        if name in self._big_warmup_running:
-            self.bot.reply_to(message, f"⚠️ Прогрев '{name}' уже идёт.")
-            return
-        if _is_account_thread_alive(name):
-            self.bot.reply_to(
-                message,
-                f"⚠️ Аккаунт '{name}' сейчас работает в основном цикле бота. "
-                f"Останови бота и запусти прогрев заново.",
-            )
-            return
-        # Атомарная проверка+add под локом — убираем TOCTOU
-        with self._big_warmup_lock:
-            if name in self._big_warmup_running:
-                self.bot.reply_to(message, f"⚠️ Прогрев '{name}' уже идёт.")
-                return
-            self._big_warmup_running.add(name)
-        self.bot.reply_to(
-            message,
-            (
-                f"🔥 Большой прогрев для '{name}' запущен в фоне (~15-30 минут).\n"
-                f"Уведомлю по завершении."
-            ),
-        )
-        threading.Thread(
-            target=self._run_big_warmup,
-            args=(account,),
-            daemon=True,
-            name=f"tg-bigwarmup-{name}",
-        ).start()
+        self.bot.reply_to(message, self._start_big_warmup(account))
 
     # ── Прокси ──────────────────────────────────────────────────────────────
 
     # ── Настройки (открывают dialog-state, далее _handle_dialog) ──────────
-
-    def _cb_set_url(self, call):
-        cid = call.message.chat.id
-        self._set_dialog(cid, "set_url")
-        cfg = self._cfg()
-        self._send(
-            cid,
-            f"Текущий URL:\n{cfg.get('target_url', '—')}\n\nОтправь новую ссылку на объявление:",
-        )
 
     def _cb_set_openai_key(self, call):
         cid = call.message.chat.id
@@ -1840,6 +1958,9 @@ class TelegramController:
             ("acc_persona_", self._cb_acc_persona),
             ("acc_captcha_cd_", self._cb_acc_captcha_cd),
             ("acc_toggle_", self._cb_acc_toggle),
+            ("acc_warmup_", self._cb_acc_warmup),
+            ("acc_bigwarmup_", self._cb_acc_bigwarmup),
+            ("acc_skipday_", self._cb_acc_skipday),
             ("acc_proxy_", self._cb_acc_proxy),
             ("acc_budget_listings_", self._cb_acc_budget_listings),
             ("acc_budget_messages_", self._cb_acc_budget_messages),
@@ -1862,12 +1983,15 @@ class TelegramController:
             # Управление
             "run": self._cb_run,
             "stop": self._cb_stop,
+            # Статистика
             "report": self._cb_report,
+            "budget": self._cb_budget,
+            "health": self._cb_health,
+            "lastcaptcha": self._cb_lastcaptcha,
             "logs": self._cb_logs,
             # Аккаунты
             "acc_add": self._cb_acc_add,
             # Настройки
-            "set_url": self._cb_set_url,
             "set_openai_key": self._cb_set_openai_key,
             "set_openai_model": self._cb_set_openai_model,
         }

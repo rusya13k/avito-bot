@@ -79,24 +79,24 @@ def test_handle_dialog_dispatches_by_state(tg_ctrl, monkeypatch):
     called = {"name": None, "data": None}
 
     def fake_handler(message, data):
-        called["name"] = "set_url"
+        called["name"] = "set_openai_model"
         called["data"] = data
 
-    monkeypatch.setattr(tg_ctrl, "_dialog_set_url", fake_handler)
+    monkeypatch.setattr(tg_ctrl, "_dialog_set_openai_model", fake_handler)
 
-    tg_ctrl._state[123] = {"state": "set_url", "data": {"x": 1}}
-    tg_ctrl._handle_dialog(_make_message(text="https://avito.ru/123"))
+    tg_ctrl._state[123] = {"state": "set_openai_model", "data": {"x": 1}}
+    tg_ctrl._handle_dialog(_make_message(text="deepseek-v4-flash"))
 
-    assert called["name"] == "set_url"
+    assert called["name"] == "set_openai_model"
     assert called["data"] == {"x": 1}
 
 
 def test_handle_dialog_blocks_when_not_allowed(tg_ctrl, monkeypatch):
     """_allowed=False → handler НЕ вызывается."""
     called = []
-    monkeypatch.setattr(tg_ctrl, "_dialog_set_url", lambda m, d: called.append("called"))
+    monkeypatch.setattr(tg_ctrl, "_dialog_set_openai_model", lambda m, d: called.append("called"))
 
-    tg_ctrl._state[123] = {"state": "set_url", "data": {}}
+    tg_ctrl._state[123] = {"state": "set_openai_model", "data": {}}
     msg = _make_message(user_id=999)  # not admin_id=42
     tg_ctrl._handle_dialog(msg)
 
@@ -193,3 +193,68 @@ def test_on_callback_b1_res_routed_to_special_handler(tg_ctrl, monkeypatch):
 
     tg_ctrl._on_callback(_make_call(callback_data="b1_res_abc123_c"))
     assert received == ["b1_res_abc123_c"]
+
+
+# ── Контракт «ни одна кнопка не висит» ───────────────────────────────────────
+# Собираем callback_data прямо из клавиатур и прогоняем через реальный
+# _on_callback, замокав ВСЕ _cb_* как спаи. Так гарантируем, что каждая кнопка
+# меню резолвится ровно в один обработчик (после переработки меню: добавлены
+# budget/health/lastcaptcha + per-account warmup/bigwarmup/skipday, убран
+# set_url и дубль acc_add из главного меню).
+
+
+def _spy_all_cb_handlers(tg_ctrl, monkeypatch):
+    """Замокать все методы _cb_* спаями. Возвращает список (имя) дёрнутых."""
+    routed = []
+    for name in dir(tg_ctrl):
+        if name.startswith("_cb_"):
+            monkeypatch.setattr(
+                tg_ctrl, name, (lambda n: lambda call: routed.append(n))(name)
+            )
+    return routed
+
+
+def _kb_datas(markup):
+    """Все callback_data из InlineKeyboardMarkup."""
+    return [btn.callback_data for row in markup.keyboard for btn in row]
+
+
+def test_every_main_menu_button_is_routed(tg_ctrl, monkeypatch):
+    """Каждая кнопка главного меню → ровно один _cb_ обработчик."""
+    import tg_bot as m
+
+    routed = _spy_all_cb_handlers(tg_ctrl, monkeypatch)
+    for data in _kb_datas(m.kb_main()):
+        routed.clear()
+        tg_ctrl._on_callback(_make_call(callback_data=data))
+        assert len(routed) == 1, f"кнопка {data!r} не сроутилась однозначно: {routed}"
+
+
+def test_account_detail_buttons_are_routed(tg_ctrl, monkeypatch):
+    """Каждая кнопка карточки аккаунта (вкл. новые warmup/bigwarmup/skipday) →
+    ровно один _cb_ обработчик. idx=3 проверяет суффикс-парсинг."""
+    import tg_bot as m
+
+    routed = _spy_all_cb_handlers(tg_ctrl, monkeypatch)
+    for data in _kb_datas(m.kb_account_detail(3)):
+        routed.clear()
+        tg_ctrl._on_callback(_make_call(callback_data=data))
+        assert len(routed) == 1, f"кнопка {data!r} не сроутилась однозначно: {routed}"
+
+
+def test_new_stat_buttons_present_in_main_menu():
+    """Регресс: budget/health/lastcaptcha есть в главном меню, set_url/acc_add — нет."""
+    import tg_bot as m
+
+    datas = set(_kb_datas(m.kb_main()))
+    assert {"budget", "health", "lastcaptcha"} <= datas
+    assert "acc_add" not in datas  # дубль убран (есть в подменю «Аккаунты»)
+    assert "set_url" not in set(_kb_datas(m.kb_settings()))
+
+
+def test_per_account_action_buttons_present():
+    """Регресс: в карточке аккаунта есть warmup/bigwarmup/skipday с верным idx."""
+    import tg_bot as m
+
+    datas = set(_kb_datas(m.kb_account_detail(7)))
+    assert {"acc_warmup_7", "acc_bigwarmup_7", "acc_skipday_7"} <= datas
